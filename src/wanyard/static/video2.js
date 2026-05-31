@@ -389,6 +389,102 @@ function classColor(cls) {
   return EVENT_PALETTE[Math.abs(hash) % EVENT_PALETTE.length];
 }
 
+function planTimeAxis(from, to, left, right, ctx, opts = {}) {
+  const d3 = window.d3;
+  const width = Math.max(1, right - left);
+  const span = Math.max(1, to - from);
+  const minLabelPx = opts.minLabelPx ?? 84;
+  const minGridPx = opts.minGridPx ?? 52;
+  const maxLabels = Math.max(2, Math.floor(width / minLabelPx));
+  const maxGrid = Math.max(maxLabels, Math.floor(width / minGridPx));
+  if (!d3?.scaleTime) return fallbackTimeAxis(from, to, left, right, ctx, { minLabelPx });
+
+  const scale = d3.scaleTime()
+    .domain([new Date(from * 1000), new Date(to * 1000)])
+    .range([left, right]);
+  const fmt = tickFormatter(span);
+  const makeTick = d => ({
+    ts: d.getTime() / 1000,
+    x: scale(d),
+    label: fmt(d),
+    major: isMajorTimeTick(d, span),
+  });
+  const labels = filterTickCollisions(scale.ticks(maxLabels).map(makeTick), ctx, minLabelPx);
+  const grid = scale.ticks(maxGrid).map(makeTick);
+  return { grid, labels };
+}
+
+function fallbackTimeAxis(from, to, left, right, ctx, opts = {}) {
+  const span = Math.max(1, to - from);
+  const interval = fallbackTickInterval(span, Math.max(2, Math.floor((right - left) / (opts.minLabelPx ?? 84))));
+  const fmt = tickFormatter(span);
+  const ticks = [];
+  for (let t = Math.ceil(from / interval) * interval; t <= to; t += interval) {
+    const d = new Date(t * 1000);
+    ticks.push({
+      ts: t,
+      x: left + ((t - from) / span) * Math.max(1, right - left),
+      label: fmt(d),
+      major: isMajorTimeTick(d, span),
+    });
+  }
+  return { grid: ticks, labels: filterTickCollisions(ticks, ctx, opts.minLabelPx ?? 84) };
+}
+
+function filterTickCollisions(ticks, ctx, minLabelPx) {
+  const out = [];
+  let lastRight = -Infinity;
+  for (const tick of ticks) {
+    const measured = ctx?.measureText ? ctx.measureText(tick.label).width : minLabelPx;
+    const half = Math.max(measured + 12, minLabelPx) / 2;
+    if (tick.x - half <= lastRight + 8) continue;
+    out.push(tick);
+    lastRight = tick.x + half;
+  }
+  return out;
+}
+
+function tickFormatter(span) {
+  const d3 = window.d3;
+  const f = d3?.timeFormat;
+  if (!f) {
+    return d => span > 36 * 3600
+      ? d.toLocaleDateString(undefined, { day: "2-digit", month: "short" })
+      : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
+  const second = f("%H:%M:%S");
+  const minute = f("%H:%M");
+  const dayTime = f("%a %H:%M");
+  const date = f("%d %b");
+  const month = f("%b %Y");
+  if (span > 90 * 86400) return month;
+  if (span > 7 * 86400) return date;
+  if (span > 36 * 3600) {
+    return d => (d.getHours() === 0 && d.getMinutes() === 0) ? date(d) : minute(d);
+  }
+  if (span > 18 * 3600) return dayTime;
+  if (span > 10 * 60) return minute;
+  return second;
+}
+
+function isMajorTimeTick(d, span) {
+  if (span > 90 * 86400) return d.getDate() === 1;
+  if (span > 36 * 3600) return d.getHours() === 0 && d.getMinutes() === 0;
+  if (span > 3 * 3600) return d.getMinutes() === 0;
+  return d.getMinutes() % 15 === 0 && d.getSeconds() === 0;
+}
+
+function fallbackTickInterval(span, targetCount) {
+  const target = span / Math.max(1, targetCount);
+  const steps = [
+    1, 5, 15, 30,
+    60, 5 * 60, 15 * 60, 30 * 60,
+    3600, 2 * 3600, 3 * 3600, 6 * 3600, 12 * 3600,
+    86400, 2 * 86400, 7 * 86400, 30 * 86400, 90 * 86400,
+  ];
+  return steps.find(s => s >= target) ?? steps[steps.length - 1];
+}
+
 class V2Timeline {
   #c; #ctx;
   #segs = []; #evts = []; #srcNames = {};
@@ -567,27 +663,23 @@ class V2Timeline {
       });
     }
 
-    const interval = this.#labelInterval();
-    const multiDay = span > 20 * 3600;
-    let t0 = Math.ceil(this.#from / interval) * interval;
     ctx.font = "400 9px 'IBM Plex Mono',monospace";
     ctx.textBaseline = "alphabetic";
-    while (t0 <= this.#to) {
-      const x = this.#tsToX(t0);
-      if (x >= SRC_W && x <= W) {
-        const d = new Date(t0 * 1000);
-        const time = d.toLocaleTimeString(undefined, { hour:"2-digit", minute:"2-digit" });
-        const label = multiDay
-          ? `${d.toLocaleDateString(undefined, { day:"2-digit", month:"short" })} ${time}`
-          : time;
-        ctx.fillStyle = "rgba(255,255,255,0.08)";
-        ctx.fillRect(x, 0, 1, H - LABEL_H);
-        ctx.fillStyle = "rgba(166,174,190,0.78)";
-        ctx.textAlign = "center";
-        ctx.fillText(label, x, H - 4);
-      }
-      t0 += interval;
-    }
+    const axis = planTimeAxis(this.#from, this.#to, SRC_W, W, ctx, {
+      minLabelPx: span > 7 * 86400 ? 92 : 78,
+      minGridPx: 54,
+    });
+    axis.grid.forEach(tick => {
+      if (tick.x < SRC_W || tick.x > W) return;
+      ctx.fillStyle = tick.major ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.055)";
+      ctx.fillRect(tick.x, 0, 1, H - LABEL_H);
+    });
+    axis.labels.forEach(tick => {
+      if (tick.x < SRC_W || tick.x > W) return;
+      ctx.fillStyle = tick.major ? "rgba(230,235,244,0.9)" : "rgba(166,174,190,0.78)";
+      ctx.textAlign = "center";
+      ctx.fillText(tick.label, tick.x, H - 4);
+    });
 
     const fromDate = new Date(this.#from * 1000);
     const toDate = new Date(this.#to * 1000);
@@ -687,14 +779,6 @@ class V2Timeline {
       ...this.#evts.map(e => e.source_id),
     ]);
     return ids.filter(id => visible.has(id));
-  }
-  #labelInterval() {
-    const span = this.#to - this.#from;
-    if (span > 20 * 3600) return 4 * 3600;
-    if (span > 8 * 3600) return 2 * 3600;
-    if (span > 3 * 3600) return 3600;
-    if (span > 90 * 60) return 30 * 60;
-    return 15 * 60;
   }
 }
 
@@ -979,18 +1063,21 @@ function renderRuler() {
   }
   const span = st.window.to - st.window.from;
   if (span <= 0) return;
-  const interval = span > 20 * 3600 ? 3 * 3600 : span > 8 * 3600 ? 2 * 3600 : 3600;
   const width = el.ruler.clientWidth || 1;
   const labelW = timeline.labelWidth;
-  let t = Math.ceil(st.window.from / interval) * interval;
-  while (t <= st.window.to) {
+  const ctx = renderRuler._measure ??= document.createElement("canvas").getContext("2d");
+  ctx.font = "400 10px 'IBM Plex Mono', monospace";
+  const axis = planTimeAxis(st.window.from, st.window.to, labelW, width - 16, ctx, {
+    minLabelPx: span > 7 * 86400 ? 96 : 74,
+    minGridPx: 48,
+  });
+  axis.labels.forEach(mark => {
     const tick = document.createElement("span");
-    tick.className = "tick";
-    tick.style.left = `${labelW + ((t - st.window.from) / span) * Math.max(1, width - labelW)}px`;
-    tick.textContent = new Date(t * 1000).toLocaleTimeString(undefined, { hour:"2-digit", minute:"2-digit" });
+    tick.className = "tick" + (mark.major ? " major" : "");
+    tick.style.left = `${mark.x}px`;
+    tick.textContent = mark.label;
     el.ruler.appendChild(tick);
-    t += interval;
-  }
+  });
 }
 
 function setTimelineWindow(from, to) {

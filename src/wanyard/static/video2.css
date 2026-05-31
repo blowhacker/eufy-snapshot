@@ -797,6 +797,10 @@ body {
   transform: translateX(-50%);
   white-space: nowrap;
 }
+.ruler .tick.major {
+  color: var(--txt);
+  font-weight: 500;
+}
 .control-row {
   display: flex;
   align-items: center;
