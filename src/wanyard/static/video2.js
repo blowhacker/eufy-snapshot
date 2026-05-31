@@ -708,6 +708,8 @@ const LIVE_DVR_TOLERANCE_SECONDS = 1.5;
 const LIVE_DVR_EDGE_PAD_SECONDS = 0.25;
 const LIVE_TIMELINE_FUTURE_PAD_SECONDS = 600;
 const LIVE_EDGE_RATE_RESET_SECONDS = 4;
+const ZONE_ALL = "all";
+const ZONE_NONE = "none";
 
 // ── DOM ───────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -798,6 +800,15 @@ const st = {
   summary: { total: 0, classes: {} },
 };
 const EVENTS_BUFFER = 3 * 3600;   // load 3h extra on each side of visible window
+
+function selectedZoneParam() {
+  return st.activeZoneId == null ? ZONE_NONE : String(st.activeZoneId);
+}
+
+function appendZoneParam(params) {
+  params.set("zone", selectedZoneParam());
+  return params;
+}
 
 function _eventsRangesClear()   { st.eventsLoaded.ranges = []; }
 function _eventsRangesAdd(from, to) {
@@ -1009,6 +1020,7 @@ async function fetchNearestEvents(classes, around, limit = 20) {
   const p = new URLSearchParams();
   if (st.source !== "all") p.set("source", st.source);
   if (classes.size > 0) p.set("classes", [...classes].join(","));
+  appendZoneParam(p);
   p.set("around", Math.floor(around));
   p.set("limit", String(limit));
   const r = await fetch(`/api/video/events?${p}`, { cache:"no-store" });
@@ -1029,7 +1041,7 @@ async function fetchActivitySummary() {
   const { since, until } = todayRange();
   const p = new URLSearchParams({ since: String(Math.floor(since)), until: String(Math.ceil(until)) });
   if (st.source !== "all") p.set("source", st.source);
-  if (st.source !== "all" && st.activeZoneId != null) p.set("zone", String(st.activeZoneId));
+  appendZoneParam(p);
   const r = await fetch(`/api/video/activity-summary?${p}`, { cache:"no-store" }).catch(() => null);
   if (!r?.ok) {
     const classes = {};
@@ -1463,7 +1475,7 @@ async function load() {
   _loadStart();
   const p = new URLSearchParams();
   if (st.source !== "all") p.set("source", st.source);
-  if (st.source !== "all" && st.activeZoneId != null) p.set("zone", String(st.activeZoneId));
+  appendZoneParam(p);
 
   // Events are loaded for a buffered range (±12h) around the visible window.
   // Only re-fetch if the visible window has moved outside the already-loaded range.
@@ -1562,6 +1574,7 @@ async function _fillNextGap() {
   const nowTs = Date.now() / 1000;
   const p = new URLSearchParams();
   if (st.source !== "all") p.set("source", st.source);
+  appendZoneParam(p);
 
   for (let i = 0; i < ranges.length - 1; i++) {
     const gapFrom = ranges[i].to;
@@ -2217,6 +2230,7 @@ function stopLiveTail(updateMode = true, invalidate = true) {
 async function pollLiveTail() {
   if (!liveTail.active || !liveTail.srcId) return;
   const p = new URLSearchParams({ source: liveTail.srcId });
+  appendZoneParam(p);
   const r = await fetch(`/api/video/live?${p}`, { cache:"no-store" }).catch(() => null);
   if (!r?.ok) return;
   const data = await r.json();
@@ -2560,22 +2574,28 @@ function _filterBoxes(boxes) {
   let b = boxes || [];
   if (st.xls.size > 0) b = b.filter(x => !st.xls.has(x.cls));
   if (st.cls.size > 0) b = b.filter(x =>  st.cls.has(x.cls));
-  const poly = activeZonePolygon();
-  if (poly) {
+  const polys = activeZonePolygons();
+  if (polys.length) {
     b = b.filter(x => {
       const cx = (Number(x.x1) + Number(x.x2)) / 2;
       const cy = (Number(x.y1) + Number(x.y2)) / 2;
-      return pointInPoly({ x: cx, y: cy }, poly);
+      return polys.some(poly => pointInPoly({ x: cx, y: cy }, poly));
     });
   }
   return b;
 }
 
-function activeZonePolygon() {
-  if (st.activeZoneId == null) return null;
+function activeZonePolygons() {
+  if (st.activeZoneId == null) return [];
+  if (st.activeZoneId === ZONE_ALL) {
+    const sourceId = st.source !== "all" ? st.source : null;
+    return completedActivityZones()
+      .filter(z => !sourceId || z.source_id === sourceId)
+      .map(z => z.polygon);
+  }
   const zone = (st.zones || []).find(z => z.id === st.activeZoneId);
-  if (!zone || !Array.isArray(zone.polygon) || zone.polygon.length < 3) return null;
-  return zone.polygon;
+  if (!zone || !Array.isArray(zone.polygon) || zone.polygon.length < 3) return [];
+  return [zone.polygon];
 }
 
 function drawBoxList(v, boxes) {
@@ -2662,7 +2682,8 @@ function updateZoneControl() {
 }
 
 function activeZoneName() {
-  if (st.activeZoneId == null) return "All";
+  if (st.activeZoneId == null) return "Whole frame";
+  if (st.activeZoneId === ZONE_ALL) return "All activity areas";
   const z = (st.zones || []).find(z => z.id === st.activeZoneId);
   return z?.name || `Area ${st.activeZoneId}`;
 }
@@ -2682,7 +2703,11 @@ function renderZonePicker() {
   if (el.zonePicker) el.zonePicker.hidden = false;
 
   const validIds = new Set(zones.map(z => z.id));
-  if (st.activeZoneId != null && !validIds.has(st.activeZoneId)) {
+  if (st.activeZoneId === ZONE_ALL && (!singleSource || zones.length === 0)) {
+    st.activeZoneId = null;
+    pushState();
+  }
+  if (st.activeZoneId != null && st.activeZoneId !== ZONE_ALL && !validIds.has(st.activeZoneId)) {
     st.activeZoneId = null;
     pushState();
   }
@@ -2693,14 +2718,17 @@ function renderZonePicker() {
   st.sources.forEach(s => srcNames[s.id] = s.name || s.id);
 
   el.zoneMenu.innerHTML = "";
-  const allItem = { id: null, source: null, name: singleSource ? "All areas" : "All cameras" };
-  const items = [allItem, ...zones.map(z => ({
+  const items = [{ id: null, source: null, name: "Whole frame" }];
+  if (singleSource && zones.length > 0) {
+    items.push({ id: ZONE_ALL, source: null, name: "All activity areas" });
+  }
+  items.push(...zones.map(z => ({
     id: z.id,
     source: z.source_id,
     name: singleSource
       ? (z.name || `Area ${z.id}`)
       : `${srcNames[z.source_id] || z.source_id} · ${z.name || `Area ${z.id}`}`,
-  }))];
+  })));
   items.forEach(t => {
     const b = document.createElement("button");
     b.type = "button";
@@ -2889,25 +2917,29 @@ function drawZones() {
   ctx.clearRect(0, 0, c.width, c.height);
 
   if (!st.zoneEdit.active) {
-    const poly = activeZonePolygon();
-    if (!poly) return;
-    const pts = poly.map(normToCanvas).filter(Boolean);
-    if (pts.length < 3) return;
+    const outlines = activeZonePolygons()
+      .map(poly => poly.map(normToCanvas).filter(Boolean))
+      .filter(pts => pts.length >= 3);
+    if (!outlines.length) return;
 
     // dim everything outside the polygon (evenodd: outer rect minus poly)
     ctx.fillStyle = "rgba(0, 0, 0, 0.38)";
     ctx.beginPath();
     ctx.rect(0, 0, c.width, c.height);
-    ctx.moveTo(pts[0].x, pts[0].y);
-    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-    ctx.closePath();
+    outlines.forEach(pts => {
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.closePath();
+    });
     ctx.fill("evenodd");
 
     // dark halo under the bright stroke so it reads against any background
     const drawOutline = () => {
       ctx.beginPath();
-      pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
-      ctx.closePath();
+      outlines.forEach(pts => {
+        pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+        ctx.closePath();
+      });
       ctx.stroke();
     };
     ctx.setLineDash([]);
@@ -3132,7 +3164,7 @@ function pushState() {
   }
   if (st.cls.size > 0)        p.set("cls",  [...st.cls].join(","));
   if (st.xls.size > 0)        p.set("xcls", [...st.xls].join(","));
-  if (st.activeZoneId != null) p.set("zone", String(st.activeZoneId));
+  p.set("zone", selectedZoneParam());
   history.replaceState(null, "", `${location.pathname}${p.size ? "?" + p : ""}`);
 }
 
@@ -3143,8 +3175,14 @@ function readState() {
   if (p.has("xcls")) p.get("xcls").split(",").filter(Boolean).forEach(c => st.xls.add(c));
   if (p.has("zone")) {
     const z = p.get("zone");
-    const n = parseInt(z, 10);
-    st.activeZoneId = Number.isFinite(n) ? n : null;
+    if (z === ZONE_ALL) {
+      st.activeZoneId = ZONE_ALL;
+    } else if (z === ZONE_NONE || z === "frame" || z === "whole-frame") {
+      st.activeZoneId = null;
+    } else {
+      const n = parseInt(z, 10);
+      st.activeZoneId = Number.isFinite(n) ? n : null;
+    }
   }
   return { ts: p.has("ts") ? parseFloat(p.get("ts")) : null, live: p.get("live") === "1" };
 }

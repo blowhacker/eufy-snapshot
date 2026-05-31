@@ -358,8 +358,9 @@ class VideoSegmentDB:
 
     def zone_polygons(self, source_id: str | None,
                       zone_id) -> list[list[dict]]:
-        """Polygons to filter by. If zone_id is a valid id, restrict to that
-        zone alone; otherwise fall back to all enabled activity areas."""
+        """Polygons to filter by. zone=none means whole frame."""
+        if _zone_filter_disabled(zone_id):
+            return []
         if source_id and source_id != "all" and zone_id is not None and str(zone_id) != "all":
             try:
                 z_id = int(zone_id)
@@ -474,11 +475,11 @@ class VideoSegmentDB:
 
     def nearest_object_events(self, around: float, source_id: str | None = None,
                               classes: list[str] | None = None,
-                              limit: int = 20) -> list[dict]:
+                              limit: int = 20, zone_id=None) -> list[dict]:
         if classes and len(classes) > 1:
             rows: list[dict] = []
             for cls in classes:
-                rows.extend(self.nearest_object_events(around, source_id, [cls], limit))
+                rows.extend(self.nearest_object_events(around, source_id, [cls], limit, zone_id))
             by_id = {r["id"]: r for r in rows}
             rows = list(by_id.values())
             rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
@@ -498,7 +499,8 @@ class VideoSegmentDB:
             " FROM object_events e LEFT JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
-        query_limit = max(limit * 20, 200) if self.has_activity_areas(source_id) else limit
+        polygons = self.zone_polygons(source_id, zone_id)
+        query_limit = max(limit * 20, 200) if polygons else limit
         with self._connect() as conn:
             before = conn.execute(
                 f"{select} AND e.abs_ts<=? ORDER BY e.abs_ts DESC LIMIT ?",
@@ -508,7 +510,7 @@ class VideoSegmentDB:
                 f"{select} AND e.abs_ts>? ORDER BY e.abs_ts ASC LIMIT ?",
                 (*params, around, query_limit),
             ).fetchall()
-        rows = self.filter_events_by_areas([dict(r) for r in before] + [dict(r) for r in after])
+        rows = _filter_with_polygons([dict(r) for r in before] + [dict(r) for r in after], polygons)
         rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
         return [_public_object_event(r) for r in rows[:limit]]
 
@@ -721,14 +723,14 @@ class VideoSegmentDB:
 
     def nearest_events(self, around: float, source_id: str | None = None,
                        classes: list[str] | None = None,
-                       limit: int = 20) -> list[dict]:
+                       limit: int = 20, zone_id=None) -> list[dict]:
         if self.object_events_available(source_id):
-            return self.nearest_object_events(around, source_id, classes, limit)
+            return self.nearest_object_events(around, source_id, classes, limit, zone_id)
 
         if classes and len(classes) > 1:
             rows: list[dict] = []
             for cls in classes:
-                rows.extend(self.nearest_events(around, source_id, [cls], limit))
+                rows.extend(self.nearest_events(around, source_id, [cls], limit, zone_id))
             by_id = {r["id"]: r for r in rows}
             rows = list(by_id.values())
             rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
@@ -748,9 +750,8 @@ class VideoSegmentDB:
             " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
-        query_limit = limit
-        if self.has_activity_areas(source_id):
-            query_limit = max(limit * 20, 200)
+        polygons = self.zone_polygons(source_id, zone_id)
+        query_limit = max(limit * 20, 200) if polygons else limit
         with self._connect() as conn:
             before = conn.execute(
                 f"{select} AND e.abs_ts<=? ORDER BY e.abs_ts DESC LIMIT ?",
@@ -760,7 +761,7 @@ class VideoSegmentDB:
                 f"{select} AND e.abs_ts>? ORDER BY e.abs_ts ASC LIMIT ?",
                 (*params, around, query_limit),
             ).fetchall()
-        rows = self.filter_events_by_areas([dict(r) for r in before] + [dict(r) for r in after])
+        rows = _filter_with_polygons([dict(r) for r in before] + [dict(r) for r in after], polygons)
         rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
         return rows[:limit]
 
@@ -1058,7 +1059,7 @@ class VideoSegmentDB:
                 (abs_ts, abs_ts, source_id, abs_ts, abs_ts),
             )
 
-    def live_status(self, source_id: str | None = None) -> dict:
+    def live_status(self, source_id: str | None = None, zone_id=None) -> dict:
         with self._connect() as conn:
             where, params = [
                 "s.end_ts IS NULL",
@@ -1146,7 +1147,7 @@ class VideoSegmentDB:
         return {
             "segments": segs,
             "recent_detections": recent,
-            "events": self.provisional_events(source_id),
+            "events": self.provisional_events(source_id, zone_id=zone_id),
             "detections": list(latest.values()),
         }
 
@@ -1581,6 +1582,10 @@ def _event_allowed_by_areas(event: dict, areas: list[list[dict]]) -> bool:
         return False
     cx, cy = _box_center(box)
     return _point_in_any_polygon(cx, cy, areas)
+
+
+def _zone_filter_disabled(zone_id) -> bool:
+    return zone_id is not None and str(zone_id).lower() in {"none", "off", "frame", "whole-frame"}
 
 
 def _filter_with_polygons(events: list[dict], polygons: list[list[dict]]) -> list[dict]:

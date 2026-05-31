@@ -518,10 +518,10 @@ def make_app(
                 classes = [c for c in classes_raw.split(",") if c and c != "all"]
             elif cls and cls != "all":
                 classes = [cls]
-            events = await asyncio.to_thread(
-                video_db.nearest_events, float(around_raw), source_id, classes, limit
-            )
             zone_id_around = request.query_params.get("zone") or None
+            events = await asyncio.to_thread(
+                video_db.nearest_events, float(around_raw), source_id, classes, limit, zone_id_around
+            )
             provisional = await asyncio.to_thread(
                 video_db.provisional_events, source_id, None, zone_id_around
             )
@@ -674,7 +674,8 @@ def make_app(
         if not video_db:
             return JSONResponse({"segments": [], "events": [], "detections": []})
         source_id = request.query_params.get("source") or None
-        status = await asyncio.to_thread(video_db.live_status, source_id)
+        zone_id = request.query_params.get("zone") or None
+        status = await asyncio.to_thread(video_db.live_status, source_id, zone_id)
         return JSONResponse(status)
 
     async def api_video_live_window(request: Request) -> JSONResponse:
