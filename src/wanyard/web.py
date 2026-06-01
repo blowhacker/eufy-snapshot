@@ -708,6 +708,15 @@ def make_app(
             h = ((h << 5) - h + ord(ch)) & 0xffffffff
         return palette[abs(h) % len(palette)]
 
+    def _drawtext_escape(text: str) -> str:
+        return (
+            text
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace(":", "\\:")
+            .replace(",", "\\,")
+        )
+
     def _clip_box_filter(seg: dict, clip_start: float, clip_end: float,
                          include_classes: set[str], exclude_classes: set[str]) -> str | None:
         if not video_db:
@@ -721,7 +730,7 @@ def make_app(
 
         duration = max(0.0, clip_end - clip_start)
         seg_start = float(seg["start_ts"])
-        samples: list[tuple[float, list[tuple[str, float, float, float, float]]]] = []
+        samples: list[tuple[float, list[tuple[str, float, float, float, float, float]]]] = []
         for det in dets:
             try:
                 rel = seg_start + float(det.get("ts_offset") or 0.0) - clip_start
@@ -743,11 +752,12 @@ def make_app(
                     y1 = max(0.0, min(1.0, float(box["y1"])))
                     x2 = max(0.0, min(1.0, float(box["x2"])))
                     y2 = max(0.0, min(1.0, float(box["y2"])))
+                    conf = float(box.get("conf") or 0.0)
                 except (KeyError, TypeError, ValueError):
                     continue
                 if x2 <= x1 or y2 <= y1:
                     continue
-                boxes.append((cls, x1, y1, x2, y2))
+                boxes.append((cls, conf, x1, y1, x2, y2))
             if boxes:
                 samples.append((rel, boxes))
 
@@ -766,12 +776,26 @@ def make_app(
             if end <= start:
                 continue
             enable = f"between(t\\,{start:.3f}\\,{end:.3f})"
-            for cls, x1, y1, x2, y2 in boxes:
+            for cls, conf, x1, y1, x2, y2 in boxes:
+                color = _box_color(cls)
+                label = cls
+                if conf > 0:
+                    label = f"{cls} {round(conf * 100)}%"
+                label_y = f"ih*{y1:.6f}-30" if y1 > 0.03 else f"ih*{y2:.6f}+2"
                 filters.append(
                     "drawbox="
                     f"x=iw*{x1:.6f}:y=ih*{y1:.6f}:"
                     f"w=iw*{(x2 - x1):.6f}:h=ih*{(y2 - y1):.6f}:"
-                    f"color={_box_color(cls)}@0.95:t=3:enable='{enable}'"
+                    f"color={color}@0.95:t=3:enable='{enable}'"
+                )
+                filters.append(
+                    "drawtext="
+                    "expansion=none:"
+                    f"text='{_drawtext_escape(label)}':"
+                    f"x=iw*{x1:.6f}:y={label_y}:"
+                    "fontcolor=0x050709:fontsize=24:"
+                    f"box=1:boxcolor={color}@0.95:boxborderw=5:"
+                    f"enable='{enable}'"
                 )
                 if len(filters) >= 2500:
                     return ",".join(filters)
