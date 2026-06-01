@@ -490,6 +490,7 @@ class V2Timeline {
   #segs = []; #evts = []; #srcNames = {};
   #from = 0; #to = 0;
   #head = null;
+  #clip = null;
   #SRC_W = 78;
   #eventsRanges = [];
   #fetchFrom = 0; #fetchTo = 0;
@@ -531,10 +532,34 @@ class V2Timeline {
     this.draw();
   }
 
+  setClipRange(range) {
+    this.#clip = range;
+    this.draw();
+  }
+
   extendBack(hours) {
     this.#from -= hours * 3600;
     this.draw();
     return this.#from;
+  }
+
+  tsToX(ts) { return this.#tsToX(ts); }
+  xToTs(x) { return this.#xToTs(x); }
+
+  clipHit(x, y) {
+    if (!this.#clip?.active) return null;
+    const W = this.#c.clientWidth, H = this.#c.clientHeight;
+    if (x < this.labelWidth || x > W || y < 0 || y > H - 18) return null;
+    const lane = this.#laneForSource(this.#clip.source_id);
+    if (!lane || y < lane.top || y > lane.bot) return null;
+    const x1 = this.#tsToX(this.#clip.start);
+    const x2 = this.#tsToX(this.#clip.end);
+    const minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
+    const HANDLE = 9;
+    if (Math.abs(x - minX) <= HANDLE) return { part: "start" };
+    if (Math.abs(x - maxX) <= HANDLE) return { part: "end" };
+    if (x > minX && x < maxX) return { part: "move", ts: this.#xToTs(x) };
+    return null;
   }
 
   // ── Pure decode — returns null or {ts, srcId, snapEvent} ─
@@ -636,6 +661,40 @@ class V2Timeline {
           ctx.fillRect(x - 3, top + 3, 6, Math.max(3, bot - top - 6));
           ctx.globalAlpha = 1;
         });
+
+        if (this.#clip?.active && this.#clip.source_id === srcId) {
+          const x1 = Math.max(SRC_W, Math.min(W, this.#tsToX(this.#clip.start)));
+          const x2 = Math.max(SRC_W, Math.min(W, this.#tsToX(this.#clip.end)));
+          const left = Math.min(x1, x2);
+          const right = Math.max(x1, x2);
+          if (right > SRC_W && left < W && right - left >= 1) {
+            const y1 = top + 1;
+            const h = Math.max(8, bot - top - 2);
+            ctx.fillStyle = "rgba(232, 165, 88, 0.22)";
+            ctx.fillRect(left, y1, right - left, h);
+            ctx.strokeStyle = "rgba(232, 165, 88, 0.9)";
+            ctx.lineWidth = 1;
+            ctx.strokeRect(left + 0.5, y1 + 0.5, Math.max(0, right - left - 1), Math.max(0, h - 1));
+            [left, right].forEach(x => {
+              ctx.fillStyle = "#e8a558";
+              ctx.fillRect(x - 3, y1 - 1, 6, h + 2);
+              ctx.fillStyle = "rgba(8, 10, 14, 0.8)";
+              ctx.fillRect(x - 1, y1 + 5, 2, Math.max(1, h - 10));
+            });
+            if (right - left > 58) {
+              const label = formatClipDuration(this.#clip.end - this.#clip.start);
+              ctx.font = "600 10px 'IBM Plex Mono',monospace";
+              ctx.textAlign = "center";
+              ctx.textBaseline = "middle";
+              const cx = (left + right) / 2;
+              const tw = ctx.measureText(label).width + 10;
+              ctx.fillStyle = "rgba(8, 10, 14, 0.82)";
+              ctx.fillRect(cx - tw / 2, mid - 9, tw, 18);
+              ctx.fillStyle = "#f3b46a";
+              ctx.fillText(label, cx, mid);
+            }
+          }
+        }
 
         const srcEvts = this.#evts.filter(e => e.source_id === srcId);
         const nBefore = srcEvts.filter(e => e.abs_ts < this.#from).length;
@@ -780,6 +839,17 @@ class V2Timeline {
     ]);
     return ids.filter(id => visible.has(id));
   }
+  #laneForSource(sourceId) {
+    const srcIds = this.#uniqueSrcs();
+    const idx = srcIds.indexOf(sourceId);
+    if (idx < 0) return null;
+    const H = this.#c.clientHeight;
+    const LABEL_H = 18;
+    const laneH = (H - LABEL_H) / Math.max(1, srcIds.length);
+    const top = idx * laneH + 2;
+    const bot = top + laneH - 4;
+    return { top, bot, mid: (top + bot) / 2 };
+  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -794,6 +864,10 @@ const LIVE_TIMELINE_FUTURE_PAD_SECONDS = 600;
 const LIVE_EDGE_RATE_RESET_SECONDS = 4;
 const ZONE_ALL = "all";
 const ZONE_NONE = "none";
+const CLIP_DEFAULT_BEFORE = 30;
+const CLIP_DEFAULT_AFTER = 30;
+const CLIP_MIN_DURATION = 1;
+const CLIP_MAX_DURATION = 10 * 60;
 
 // ── DOM ───────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -841,6 +915,10 @@ const el = {
   fullscreen:$("v2Fullscreen"),
   download: $("v2DownloadClip"),
   downloadFrame: $("v2DownloadFrame"),
+  clipToolbar: $("v2ClipToolbar"),
+  clipRange: $("v2ClipRange"),
+  clipDownload: $("v2ClipDownload"),
+  clipCancel: $("v2ClipCancel"),
   status:  $("v2Status"),
   liveBtn: $("v2LiveBtn"),
   stage:   document.querySelector(".v2-stage"),
@@ -869,6 +947,13 @@ const st = {
     dragPoint: null,
     dragPoly: false,
     last: null,
+  },
+  clip: {
+    active: false,
+    start: null,
+    end: null,
+    sourceId: null,
+    drag: null,
   },
   source:   "all",
   cls:      new Set(),   // included classes (amber)
@@ -1033,6 +1118,13 @@ function formatClock(ts) {
     { hour:"2-digit", minute:"2-digit", second:"2-digit" });
 }
 
+function formatClipDuration(seconds) {
+  const s = Math.max(0, Math.round(seconds || 0));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, "0")}`;
+}
+
 function formatDateChip(ts) {
   const d = new Date(ts * 1000);
   const date = d.toLocaleDateString(undefined, { year:"numeric", month:"2-digit", day:"2-digit" });
@@ -1085,6 +1177,7 @@ function setTimelineWindow(from, to) {
   st.window.to = to;
   timeline.setWindow(from, to);
   renderRuler();
+  syncClipSelection();
   // Events only exist in the past — cap check at now so the live-gap
   // (window.to = nowTs + LIVE_TIMELINE_FUTURE_PAD_SECONDS) never triggers perpetual re-loads.
   const nowTs = Date.now() / 1000;
@@ -1720,6 +1813,7 @@ function renderSrcCtrl() {
       if (st.source === s.id) return;
       const wasLive = liveTail.active;
       cancelZoneEditor();
+      cancelClipSelection();
       stopLiveTail(false);
       st.source = s.id; st.initDone = false;
       st.events = []; st.zones = []; st.zonesSource = null; st.activeZoneId = null; _eventsRangesClear();
@@ -1784,14 +1878,180 @@ function renderClsCtrl() {
   });
 }
 
+// ── Clip range selection ──────────────────────────────
+function currentClipAnchor() {
+  const ts = liveTail.active ? liveTailCurrentTs() : player.reliableTs;
+  const sourceId = liveTail.active
+    ? liveTail.srcId
+    : (player.currentSeg?.source_id ?? (st.source !== "all" ? st.source : null));
+  return ts && sourceId ? { ts, sourceId } : null;
+}
+
+function sourceClosedBounds(sourceId) {
+  const segs = st.segments
+    .filter(s => s.source_id === sourceId && s.end_ts != null)
+    .sort((a, b) => a.start_ts - b.start_ts);
+  if (!segs.length) return null;
+  return { from: segs[0].start_ts, to: Math.max(...segs.map(s => s.end_ts)) };
+}
+
+function normalizeClipRange(start, end, sourceId, fixed = null) {
+  let a = Math.min(start, end);
+  let b = Math.max(start, end);
+  const bounds = sourceClosedBounds(sourceId);
+  if (bounds) {
+    a = Math.max(bounds.from, Math.min(bounds.to, a));
+    b = Math.max(bounds.from, Math.min(bounds.to, b));
+  }
+  if (b - a < CLIP_MIN_DURATION) {
+    if (fixed === "start") b = a + CLIP_MIN_DURATION;
+    else if (fixed === "end") a = b - CLIP_MIN_DURATION;
+    else {
+      const mid = (a + b) / 2;
+      a = mid - CLIP_MIN_DURATION / 2;
+      b = mid + CLIP_MIN_DURATION / 2;
+    }
+  }
+  if (b - a > CLIP_MAX_DURATION) {
+    if (fixed === "start") b = a + CLIP_MAX_DURATION;
+    else if (fixed === "end") a = b - CLIP_MAX_DURATION;
+    else {
+      const mid = (a + b) / 2;
+      a = mid - CLIP_MAX_DURATION / 2;
+      b = mid + CLIP_MAX_DURATION / 2;
+    }
+  }
+  if (bounds) {
+    const dur = b - a;
+    if (a < bounds.from) { a = bounds.from; b = Math.min(bounds.to, a + dur); }
+    if (b > bounds.to) { b = bounds.to; a = Math.max(bounds.from, b - dur); }
+  }
+  return { start: a, end: b };
+}
+
+function startClipSelection() {
+  const anchor = currentClipAnchor();
+  if (!anchor) {
+    setStatus("NONE");
+    return;
+  }
+  const range = normalizeClipRange(
+    anchor.ts - CLIP_DEFAULT_BEFORE,
+    anchor.ts + CLIP_DEFAULT_AFTER,
+    anchor.sourceId,
+  );
+  st.clip.active = true;
+  st.clip.start = range.start;
+  st.clip.end = range.end;
+  st.clip.sourceId = anchor.sourceId;
+  st.clip.drag = null;
+  syncClipSelection();
+}
+
+function cancelClipSelection() {
+  st.clip.active = false;
+  st.clip.start = null;
+  st.clip.end = null;
+  st.clip.sourceId = null;
+  st.clip.drag = null;
+  syncClipSelection();
+}
+
+function setClipRange(start, end, fixed = null) {
+  if (!st.clip.active || !st.clip.sourceId) return;
+  const range = normalizeClipRange(start, end, st.clip.sourceId, fixed);
+  st.clip.start = range.start;
+  st.clip.end = range.end;
+  syncClipSelection();
+}
+
+function syncClipSelection() {
+  const active = st.clip.active && st.clip.start != null && st.clip.end != null && st.clip.sourceId;
+  timeline.setClipRange(active ? {
+    active: true,
+    start: st.clip.start,
+    end: st.clip.end,
+    source_id: st.clip.sourceId,
+  } : null);
+  el.download?.classList.toggle("clip-active", !!active);
+  if (el.clipToolbar) el.clipToolbar.hidden = !active;
+  if (!active) return;
+
+  const mid = (st.clip.start + st.clip.end) / 2;
+  if (el.clipRange) {
+    el.clipRange.textContent = `${formatClock(st.clip.start)} - ${formatClock(st.clip.end)} · ${formatClipDuration(st.clip.end - st.clip.start)}`;
+  }
+  if (el.clipToolbar && el.tlCanvas) {
+    const canvasW = el.tlCanvas.clientWidth || 1;
+    const toolbarW = el.clipToolbar.offsetWidth || 240;
+    const x = Math.max(toolbarW / 2, Math.min(canvasW - toolbarW / 2, timeline.tsToX(mid)));
+    el.clipToolbar.style.left = `${x}px`;
+  }
+}
+
+function downloadSelectedClip() {
+  if (!st.clip.active || !st.clip.sourceId || st.clip.start == null || st.clip.end == null) {
+    startClipSelection();
+    return;
+  }
+  const start = Math.min(st.clip.start, st.clip.end);
+  const end = Math.max(st.clip.start, st.clip.end);
+  const ts = (start + end) / 2;
+  const p = new URLSearchParams({
+    source: st.clip.sourceId,
+    ts: ts.toFixed(3),
+    before: (ts - start).toFixed(3),
+    after: (end - ts).toFixed(3),
+  });
+  el.download?.classList.add("loading");
+  const a = document.createElement("a");
+  a.href = `/api/video/clip?${p}`;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => el.download?.classList.remove("loading"), 1200);
+}
+
 // ── Timeline drag-to-scroll ───────────────────────────
 let _drag = null, _wasDrag = false;
+let _clipSuppressClick = false;
 el.tlCanvas.addEventListener("mousedown", e => {
   if (e.button !== 0) return;
+  if (st.clip.active) {
+    const rect = el.tlCanvas.getBoundingClientRect();
+    const hit = timeline.clipHit(e.clientX - rect.left, e.clientY - rect.top);
+    if (hit) {
+      st.clip.drag = {
+        part: hit.part,
+        x: e.clientX - rect.left,
+        start: st.clip.start,
+        end: st.clip.end,
+        ts: hit.ts ?? timeline.xToTs(e.clientX - rect.left),
+      };
+      el.tlCanvas.style.cursor = hit.part === "move" ? "grabbing" : "ew-resize";
+      _clipSuppressClick = true;
+      return;
+    }
+  }
   _drag = { startX: e.clientX, fromSnap: st.window.from, toSnap: st.window.to, moved: false };
   el.tlCanvas.style.cursor = "grabbing";
 });
 window.addEventListener("mousemove", e => {
+  if (st.clip.drag) {
+    const rect = el.tlCanvas.getBoundingClientRect();
+    const ts = timeline.xToTs(e.clientX - rect.left);
+    const part = st.clip.drag.part;
+    if (part === "start") {
+      setClipRange(ts, st.clip.drag.end, "end");
+    } else if (part === "end") {
+      setClipRange(st.clip.drag.start, ts, "start");
+    } else {
+      const delta = ts - st.clip.drag.ts;
+      setClipRange(st.clip.drag.start + delta, st.clip.drag.end + delta);
+    }
+    return;
+  }
   if (!_drag) return;
   const dx = e.clientX - _drag.startX;
   if (Math.abs(dx) > 4) _drag.moved = true;
@@ -1812,6 +2072,11 @@ window.addEventListener("mousemove", e => {
   setTimelineWindow(nf, nt);
 });
 window.addEventListener("mouseup", e => {
+  if (st.clip.drag) {
+    st.clip.drag = null;
+    el.tlCanvas.style.cursor = "";
+    return;
+  }
   if (!_drag) return;
   el.tlCanvas.style.cursor = "";
   _wasDrag = _drag.moved;
@@ -1825,6 +2090,7 @@ window.addEventListener("mouseup", e => {
 // ── Timeline interactions ─────────────────────────────
 let _clickTimer = null;
 el.tlCanvas.addEventListener("click", e => {
+  if (_clipSuppressClick) { _clipSuppressClick = false; return; }
   if (_wasDrag) { _wasDrag = false; return; }
   const rect = el.tlCanvas.getBoundingClientRect();
   const hit  = timeline.decode(e.clientX - rect.left, e.clientY - rect.top);
@@ -1976,6 +2242,11 @@ el.tlCanvas.addEventListener("dblclick", e => {
 let hoverTimer = null;
 el.tlCanvas.addEventListener("mousemove", e => {
   const rect = el.tlCanvas.getBoundingClientRect();
+  if (st.clip.active && !st.clip.drag && !_drag) {
+    const clipHit = timeline.clipHit(e.clientX - rect.left, e.clientY - rect.top);
+    if (clipHit) el.tlCanvas.style.cursor = clipHit.part === "move" ? "grab" : "ew-resize";
+    else el.tlCanvas.style.cursor = "";
+  }
   const hit  = timeline.decode(e.clientX - rect.left, e.clientY - rect.top);
   clearTimeout(hoverTimer);
   if (!hit) { el.thumb.hidden = true; return; }
@@ -1996,7 +2267,11 @@ el.tlCanvas.addEventListener("mousemove", e => {
     el.thumb.hidden = false;
   }, 80);
 });
-el.tlCanvas.addEventListener("mouseleave", () => { clearTimeout(hoverTimer); el.thumb.hidden = true; });
+el.tlCanvas.addEventListener("mouseleave", () => {
+  clearTimeout(hoverTimer);
+  el.thumb.hidden = true;
+  if (!st.clip.drag && !_drag) el.tlCanvas.style.cursor = "";
+});
 
 // ── Event navigation ──────────────────────────────────
 function scrollTimelineToTs(ts) {
@@ -2402,21 +2677,8 @@ function toggleFullscreen() {
 }
 
 function downloadCurrentClip() {
-  const ts = liveTail.active ? liveTailCurrentTs() : player.reliableTs;
-  const src = liveTail.active ? liveTail.srcId : (player.currentSeg?.source_id ?? (st.source !== "all" ? st.source : null));
-  if (!ts || !src) {
-    setStatus("NONE");
-    return;
-  }
-  const p = new URLSearchParams({ source: src, ts: String(Math.floor(ts)), before: "30", after: "30" });
-  el.download?.classList.add("loading");
-  const a = document.createElement("a");
-  a.href = `/api/video/clip?${p}`;
-  a.download = "";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => el.download?.classList.remove("loading"), 1200);
+  if (st.clip.active) downloadSelectedClip();
+  else startClipSelection();
 }
 function downloadCurrentFrame() {
   const v = liveTail.active ? el.liveVideo : el.video;
@@ -2451,6 +2713,8 @@ function downloadCurrentFrame() {
 }
 el.fullscreen?.addEventListener("click", toggleFullscreen);
 el.download?.addEventListener("click", downloadCurrentClip);
+el.clipDownload?.addEventListener("click", downloadSelectedClip);
+el.clipCancel?.addEventListener("click", cancelClipSelection);
 el.downloadFrame?.addEventListener("click", downloadCurrentFrame);
 
 // Speed pills

@@ -896,6 +896,48 @@ body {
   height: 100%;
   cursor: crosshair;
 }
+.v2-clip-toolbar {
+  position: absolute;
+  top: -40px;
+  left: 50%;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px;
+  border: 1px solid rgba(232, 165, 88, 0.42);
+  border-radius: var(--r-sm);
+  background: rgba(13, 15, 20, 0.96);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32);
+  transform: translateX(-50%);
+}
+.v2-clip-range {
+  min-width: 176px;
+  padding: 0 6px;
+  color: var(--txt);
+  font: 500 10px var(--font-mono);
+  white-space: nowrap;
+}
+.v2-clip-action {
+  height: 24px !important;
+  padding: 0 8px !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 4px !important;
+  background: transparent !important;
+  color: var(--txt-2);
+  font: 500 11px var(--font-ui);
+  white-space: nowrap;
+}
+.v2-clip-action.primary {
+  border-color: var(--amber) !important;
+  background: var(--amber) !important;
+  color: #1a1408 !important;
+}
+.st-btn.clip-active {
+  border-color: rgba(232, 165, 88, 0.7) !important;
+  background: var(--amber-soft) !important;
+  color: var(--amber) !important;
+}
 .toggle-grp {
   display: flex;
   flex: 0 0 auto;
