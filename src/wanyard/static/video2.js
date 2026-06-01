@@ -950,6 +950,7 @@ const st = {
   },
   clip: {
     active: false,
+    toolbarOpen: false,
     start: null,
     end: null,
     sourceId: null,
@@ -1929,7 +1930,7 @@ function normalizeClipRange(start, end, sourceId, fixed = null) {
   return { start: a, end: b };
 }
 
-function startClipSelection() {
+function startClipSelection({ showToolbar = false } = {}) {
   const anchor = currentClipAnchor();
   if (!anchor) {
     setStatus("NONE");
@@ -1941,6 +1942,7 @@ function startClipSelection() {
     anchor.sourceId,
   );
   st.clip.active = true;
+  st.clip.toolbarOpen = showToolbar;
   st.clip.start = range.start;
   st.clip.end = range.end;
   st.clip.sourceId = anchor.sourceId;
@@ -1950,6 +1952,7 @@ function startClipSelection() {
 
 function cancelClipSelection() {
   st.clip.active = false;
+  st.clip.toolbarOpen = false;
   st.clip.start = null;
   st.clip.end = null;
   st.clip.sourceId = null;
@@ -1974,14 +1977,15 @@ function syncClipSelection() {
     source_id: st.clip.sourceId,
   } : null);
   el.download?.classList.toggle("clip-active", !!active);
-  if (el.clipToolbar) el.clipToolbar.hidden = !active;
+  const showToolbar = active && st.clip.toolbarOpen;
+  if (el.clipToolbar) el.clipToolbar.hidden = !showToolbar;
   if (!active) return;
 
   const mid = (st.clip.start + st.clip.end) / 2;
-  if (el.clipRange) {
+  if (showToolbar && el.clipRange) {
     el.clipRange.textContent = `${formatClock(st.clip.start)} - ${formatClock(st.clip.end)} · ${formatClipDuration(st.clip.end - st.clip.start)}`;
   }
-  if (el.clipToolbar && el.tlCanvas) {
+  if (showToolbar && el.clipToolbar && el.tlCanvas) {
     const canvasW = el.tlCanvas.clientWidth || 1;
     const toolbarW = el.clipToolbar.offsetWidth || 240;
     const x = Math.max(toolbarW / 2, Math.min(canvasW - toolbarW / 2, timeline.tsToX(mid)));
@@ -1991,7 +1995,7 @@ function syncClipSelection() {
 
 function downloadSelectedClip() {
   if (!st.clip.active || !st.clip.sourceId || st.clip.start == null || st.clip.end == null) {
-    startClipSelection();
+    startClipSelection({ showToolbar: true });
     return;
   }
   const start = Math.min(st.clip.start, st.clip.end);
@@ -2003,6 +2007,9 @@ function downloadSelectedClip() {
     before: (ts - start).toFixed(3),
     after: (end - ts).toFixed(3),
   });
+  if (st.showBoxes) p.set("boxes", "1");
+  if (st.cls.size > 0) p.set("classes", [...st.cls].join(","));
+  if (st.xls.size > 0) p.set("exclude_classes", [...st.xls].join(","));
   el.download?.classList.add("loading");
   const a = document.createElement("a");
   a.href = `/api/video/clip?${p}`;
@@ -2676,9 +2683,13 @@ function toggleFullscreen() {
   document.fullscreenElement ? document.exitFullscreen() : s.requestFullscreen().catch(()=>{});
 }
 
-function downloadCurrentClip() {
-  if (st.clip.active) downloadSelectedClip();
-  else startClipSelection();
+function openClipDownloadToolbar() {
+  if (st.clip.active) {
+    st.clip.toolbarOpen = true;
+    syncClipSelection();
+  } else {
+    startClipSelection({ showToolbar: true });
+  }
 }
 function downloadCurrentFrame() {
   const v = liveTail.active ? el.liveVideo : el.video;
@@ -2712,7 +2723,7 @@ function downloadCurrentFrame() {
   a.remove();
 }
 el.fullscreen?.addEventListener("click", toggleFullscreen);
-el.download?.addEventListener("click", downloadCurrentClip);
+el.download?.addEventListener("click", openClipDownloadToolbar);
 el.clipDownload?.addEventListener("click", downloadSelectedClip);
 el.clipCancel?.addEventListener("click", cancelClipSelection);
 el.downloadFrame?.addEventListener("click", downloadCurrentFrame);

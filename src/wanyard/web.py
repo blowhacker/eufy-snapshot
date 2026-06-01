@@ -683,8 +683,105 @@ def make_app(
         window = await asyncio.to_thread(_read_live_hls_window, video_dir, source_id)
         return JSONResponse({"window": window})
 
+    def _class_filter(raw: str | None) -> set[str]:
+        if not raw:
+            return set()
+        return {c.strip() for c in raw.split(",") if c.strip()}
+
+    def _box_color(cls: str) -> str:
+        colors = {
+            "person": "0x4ec98a",
+            "bird": "0x78b7ff",
+            "cat": "0x78b7ff",
+            "dog": "0x78b7ff",
+            "car": "0xe8a558",
+            "truck": "0xf1788a",
+            "bus": "0xcc9bff",
+            "motorcycle": "0x7bd7c4",
+            "bicycle": "0xd6ca72",
+        }
+        if cls in colors:
+            return colors[cls]
+        palette = ["0x78b7ff", "0x4ec98a", "0xe8a558", "0xcc9bff", "0xf1788a", "0x7bd7c4", "0xd6ca72"]
+        h = 0
+        for ch in cls:
+            h = ((h << 5) - h + ord(ch)) & 0xffffffff
+        return palette[abs(h) % len(palette)]
+
+    def _clip_box_filter(seg: dict, clip_start: float, clip_end: float,
+                         include_classes: set[str], exclude_classes: set[str]) -> str | None:
+        if not video_db:
+            return None
+        try:
+            dets = video_db.detections_for_segment(int(seg["id"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not dets:
+            return None
+
+        duration = max(0.0, clip_end - clip_start)
+        seg_start = float(seg["start_ts"])
+        samples: list[tuple[float, list[tuple[str, float, float, float, float]]]] = []
+        for det in dets:
+            try:
+                rel = seg_start + float(det.get("ts_offset") or 0.0) - clip_start
+            except (TypeError, ValueError):
+                continue
+            if rel < -1.5 or rel > duration + 1.5:
+                continue
+            boxes = []
+            for box in det.get("boxes") or []:
+                if not isinstance(box, dict):
+                    continue
+                cls = str(box.get("cls") or "")
+                if include_classes and cls not in include_classes:
+                    continue
+                if exclude_classes and cls in exclude_classes:
+                    continue
+                try:
+                    x1 = max(0.0, min(1.0, float(box["x1"])))
+                    y1 = max(0.0, min(1.0, float(box["y1"])))
+                    x2 = max(0.0, min(1.0, float(box["x2"])))
+                    y2 = max(0.0, min(1.0, float(box["y2"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                boxes.append((cls, x1, y1, x2, y2))
+            if boxes:
+                samples.append((rel, boxes))
+
+        if not samples:
+            return None
+        samples.sort(key=lambda item: item[0])
+
+        filters = []
+        for i, (rel, boxes) in enumerate(samples):
+            prev_rel = samples[i - 1][0] if i > 0 else None
+            next_rel = samples[i + 1][0] if i + 1 < len(samples) else None
+            start = rel - min(1.5, (rel - prev_rel) / 2) if prev_rel is not None else rel - 1.5
+            end = rel + min(1.5, (next_rel - rel) / 2) if next_rel is not None else rel + 1.5
+            start = max(0.0, start)
+            end = min(duration, end)
+            if end <= start:
+                continue
+            enable = f"between(t\\,{start:.3f}\\,{end:.3f})"
+            for cls, x1, y1, x2, y2 in boxes:
+                filters.append(
+                    "drawbox="
+                    f"x=iw*{x1:.6f}:y=ih*{y1:.6f}:"
+                    f"w=iw*{(x2 - x1):.6f}:h=ih*{(y2 - y1):.6f}:"
+                    f"color={_box_color(cls)}@0.95:t=3:enable='{enable}'"
+                )
+                if len(filters) >= 2500:
+                    return ",".join(filters)
+        return ",".join(filters) if filters else None
+
     def _export_clip(source_id: str | None, ts: float,
-                     before: float, after: float) -> tuple[Path | None, Path | None, str | None]:
+                     before: float, after: float, *,
+                     overlay_boxes: bool = False,
+                     include_classes: set[str] | None = None,
+                     exclude_classes: set[str] | None = None) -> tuple[Path | None, Path | None, str | None]:
         if not video_dir or not video_db:
             return None, None, "video is not configured"
         ffmpeg = shutil.which("ffmpeg")
@@ -711,12 +808,20 @@ def make_app(
             if clip_end <= clip_start:
                 continue
             out = tmpdir / f"part_{i:03d}.mp4"
+            vf = (
+                _clip_box_filter(seg, clip_start, clip_end, include_classes or set(), exclude_classes or set())
+                if overlay_boxes else None
+            )
             cmd = [
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                 "-ss", f"{max(0.0, clip_start - float(seg['start_ts'])):.3f}",
                 "-i", str(seg_path),
                 "-t", f"{clip_end - clip_start:.3f}",
                 "-map", "0:v:0?", "-map", "0:a:0?",
+            ]
+            if vf:
+                cmd += ["-vf", vf]
+            cmd += [
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                 "-c:a", "aac", "-movflags", "+faststart",
                 str(out),
@@ -753,7 +858,15 @@ def make_app(
         except (KeyError, ValueError):
             return JSONResponse({"error": "ts is required"}, status_code=400)
         source_id = request.query_params.get("source") or None
-        path, tmpdir, error = await asyncio.to_thread(_export_clip, source_id, ts, before, after)
+        overlay_boxes = request.query_params.get("boxes") in {"1", "true", "yes", "on"}
+        include_classes = _class_filter(request.query_params.get("classes"))
+        exclude_classes = _class_filter(request.query_params.get("exclude_classes"))
+        path, tmpdir, error = await asyncio.to_thread(
+            _export_clip, source_id, ts, before, after,
+            overlay_boxes=overlay_boxes,
+            include_classes=include_classes,
+            exclude_classes=exclude_classes,
+        )
         if error or not path or not tmpdir:
             return JSONResponse({"error": error or "could not export clip"}, status_code=404)
         stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts))

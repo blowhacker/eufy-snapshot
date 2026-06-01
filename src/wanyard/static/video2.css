@@ -911,6 +911,9 @@ body {
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32);
   transform: translateX(-50%);
 }
+.v2-clip-toolbar[hidden] {
+  display: none;
+}
 .v2-clip-range {
   min-width: 176px;
   padding: 0 6px;
