@@ -781,7 +781,7 @@ def make_app(
                 label = cls
                 if conf > 0:
                     label = f"{cls} {round(conf * 100)}%"
-                label_y = f"ih*{y1:.6f}-30" if y1 > 0.03 else f"ih*{y2:.6f}+2"
+                label_y = f"h*{y1:.6f}-30" if y1 > 0.03 else f"h*{y2:.6f}+2"
                 filters.append(
                     "drawbox="
                     f"x=iw*{x1:.6f}:y=ih*{y1:.6f}:"
@@ -792,7 +792,7 @@ def make_app(
                     "drawtext="
                     "expansion=none:"
                     f"text='{_drawtext_escape(label)}':"
-                    f"x=iw*{x1:.6f}:y={label_y}:"
+                    f"x=w*{x1:.6f}:y={label_y}:"
                     "fontcolor=0x050709:fontsize=24:"
                     f"box=1:boxcolor={color}@0.95:boxborderw=5:"
                     f"enable='{enable}'"
