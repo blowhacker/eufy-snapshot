@@ -1006,7 +1006,20 @@ class VideoSegmentDB:
                        until: float | None = None,
                        zone_id=None) -> list[dict]:
         cutoff = time.time() - _PROVISIONAL_GRACE_SECONDS
-        where, params = ["abs_ts>=?"], [cutoff]
+        live_cutoff = time.time() - _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS
+        where, params = [
+            "abs_ts>=?",
+            "("
+            "abs_ts>=?"
+            " OR EXISTS ("
+            "SELECT 1 FROM segments s"
+            " WHERE s.source_id=hls_events.source_id"
+            " AND s.end_ts IS NOT NULL"
+            " AND s.start_ts<=hls_events.abs_ts"
+            " AND s.end_ts>hls_events.abs_ts"
+            ")"
+            ")",
+        ], [cutoff, live_cutoff]
         if source_id and source_id != "all":
             where.append("source_id=?"); params.append(source_id)
         if since is not None:
