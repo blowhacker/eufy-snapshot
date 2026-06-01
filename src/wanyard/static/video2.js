@@ -1456,24 +1456,48 @@ function eventSeekTs(evt) {
   return Math.max(start, evt.abs_ts - 1);
 }
 
+function segmentCoversEvent(seg, evt) {
+  return Boolean(
+    seg && evt &&
+    seg.end_ts != null &&
+    seg.source_id === evt.source_id &&
+    seg.start_ts <= evt.abs_ts &&
+    seg.end_ts >= evt.abs_ts
+  );
+}
+
 function recordedSegmentForEvent(evt) {
   if (!evt) return null;
   if (evt.segment_id != null) {
-    const byId = st.segments.find(s => String(s.id) === String(evt.segment_id) && s.end_ts != null);
+    const byId = st.segments.find(s => String(s.id) === String(evt.segment_id) && segmentCoversEvent(s, evt));
     if (byId) return byId;
   }
-  return st.segments.find(s =>
-    s.source_id === evt.source_id &&
-    s.end_ts != null &&
-    s.start_ts <= evt.abs_ts &&
-    s.end_ts >= evt.abs_ts
-  ) || null;
+  return st.segments.find(s => segmentCoversEvent(s, evt)) || null;
+}
+
+async function fetchRecordedSegmentForEvent(evt) {
+  if (!evt?.source_id || !Number.isFinite(evt.abs_ts)) return null;
+  const p = new URLSearchParams({
+    source: evt.source_id,
+    ts: String(evt.abs_ts),
+  });
+  const r = await fetch(`/api/video/segment-at?${p}`, { cache: "no-store" }).catch(() => null);
+  if (!r?.ok) return null;
+  const { segment } = await r.json().catch(() => ({}));
+  if (!segmentCoversEvent(segment, evt)) return null;
+  mergeSegments([segment]);
+  timeline.setData(allSegsForSrc(), filteredEvts());
+  return segment;
 }
 
 async function seekToEvent(evt, { scroll = true } = {}) {
   if (!evt) return false;
-  const recorded = recordedSegmentForEvent(evt);
-  if (recorded || !evt.provisional) {
+  let recorded = recordedSegmentForEvent(evt);
+  if (!recorded) {
+    setStatus("BUFFERING");
+    recorded = await fetchRecordedSegmentForEvent(evt);
+  }
+  if (recorded) {
     stopLiveTail(false);
     mode.seekTo(eventSeekTs(evt), evt.source_id);
     pushState();
@@ -1482,8 +1506,15 @@ async function seekToEvent(evt, { scroll = true } = {}) {
     el.video.style.display = "block";
     return true;
   }
+  if (!evt.provisional) {
+    setStatus("NONE");
+    return false;
+  }
   const ok = await seekLiveTail(evt.source_id, evt.abs_ts);
-  if (!ok) startLiveTail(evt.source_id);
+  if (!ok) {
+    setStatus("NONE");
+    return false;
+  }
   if (scroll) scrollTimelineToTs(evt.abs_ts);
   return ok;
 }
