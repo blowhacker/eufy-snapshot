@@ -951,6 +951,8 @@ const st = {
   clip: {
     active: false,
     toolbarOpen: false,
+    downloading: false,
+    downloadTimer: null,
     start: null,
     end: null,
     sourceId: null,
@@ -1413,9 +1415,7 @@ async function handleClassSelectionChanged(classes) {
   if (target.provisional) {
     centerWindowOn(target.abs_ts);
     timeline.setData(allSegsForSrc(), filteredEvts());
-    scrollTimelineToTs(target.abs_ts);
-    seekLiveTail(target.source_id, target.abs_ts).then(ok => { if (!ok) startLiveTail(target.source_id); });
-    setStatus("LIVE");
+    seekToEvent(target);
     return;
   }
 
@@ -1451,14 +1451,50 @@ function sourceLabel(srcId) {
 }
 
 function eventSeekTs(evt) {
-  const seg = st.segments.find(s => s.id === evt.segment_id);
+  const seg = recordedSegmentForEvent(evt);
   const start = seg?.start_ts ?? evt.seg_start_ts ?? evt.abs_ts;
   return Math.max(start, evt.abs_ts - 1);
+}
+
+function recordedSegmentForEvent(evt) {
+  if (!evt) return null;
+  if (evt.segment_id != null) {
+    const byId = st.segments.find(s => String(s.id) === String(evt.segment_id) && s.end_ts != null);
+    if (byId) return byId;
+  }
+  return st.segments.find(s =>
+    s.source_id === evt.source_id &&
+    s.end_ts != null &&
+    s.start_ts <= evt.abs_ts &&
+    s.end_ts >= evt.abs_ts
+  ) || null;
+}
+
+async function seekToEvent(evt, { scroll = true } = {}) {
+  if (!evt) return false;
+  const recorded = recordedSegmentForEvent(evt);
+  if (recorded || !evt.provisional) {
+    stopLiveTail(false);
+    mode.seekTo(eventSeekTs(evt), evt.source_id);
+    pushState();
+    if (scroll) scrollTimelineToTs(evt.abs_ts);
+    el.empty.style.display = "none";
+    el.video.style.display = "block";
+    return true;
+  }
+  const ok = await seekLiveTail(evt.source_id, evt.abs_ts);
+  if (!ok) startLiveTail(evt.source_id);
+  if (scroll) scrollTimelineToTs(evt.abs_ts);
+  return ok;
 }
 
 function isEventActive(evt, ts) {
   if (ts == null) return false;
   if (evt.provisional) {
+    const recorded = recordedSegmentForEvent(evt);
+    if (recorded && player.currentSeg?.id === recorded.id) {
+      return ts >= evt.abs_ts - 1 && ts <= evt.abs_ts + Math.max(1, evt.end_off ?? 1) + 1;
+    }
     return liveTail.active && liveTail.srcId === evt.source_id && Math.abs(ts - evt.abs_ts) <= 3;
   }
   if (player.currentSeg?.id !== evt.segment_id) return false;
@@ -1536,14 +1572,7 @@ function _makeThumbNode(evt, baseTs) {
   btn.dataset.eventId = String(evt.id);
   btn.title = `${evt.class} ${eventLocalTime(evt.abs_ts)} ${sourceLabel(evt.source_id)}`;
   btn.addEventListener("click", () => {
-    if (evt.provisional) {
-      seekLiveTail(evt.source_id, evt.abs_ts).then(ok => { if (!ok) startLiveTail(evt.source_id); });
-      scrollTimelineToTs(evt.abs_ts);
-      return;
-    }
-    stopLiveTail();
-    mode.seekTo(eventSeekTs(evt), evt.source_id); pushState();
-    scrollTimelineToTs(evt.abs_ts);
+    seekToEvent(evt);
   });
 
   const thumb = document.createElement("div");
@@ -1993,7 +2022,57 @@ function syncClipSelection() {
   }
 }
 
+function clipDownloadToken() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function clipDownloadStarted(token) {
+  return document.cookie
+    .split(";")
+    .map(c => c.trim())
+    .some(c => c === `wanyard_clip_download=${encodeURIComponent(token)}`);
+}
+
+function clearClipDownloadCookie() {
+  document.cookie = "wanyard_clip_download=; Max-Age=0; path=/; SameSite=Lax";
+}
+
+function setClipDownloadBusy(busy) {
+  st.clip.downloading = busy;
+  if (st.clip.downloadTimer) {
+    clearTimeout(st.clip.downloadTimer);
+    st.clip.downloadTimer = null;
+  }
+  el.download?.classList.toggle("loading", busy);
+  if (!el.clipDownload) return;
+  if (!el.clipDownload.dataset.idleText) {
+    el.clipDownload.dataset.idleText = el.clipDownload.textContent || "Download";
+  }
+  el.clipDownload.classList.toggle("loading", busy);
+  el.clipDownload.disabled = busy;
+  el.clipDownload.textContent = busy ? "Preparing..." : el.clipDownload.dataset.idleText;
+}
+
+function waitForClipDownloadStart(token) {
+  const startedAt = Date.now();
+  const poll = () => {
+    if (clipDownloadStarted(token)) {
+      clearClipDownloadCookie();
+      setClipDownloadBusy(false);
+      return;
+    }
+    if (Date.now() - startedAt > 90000) {
+      setClipDownloadBusy(false);
+      setStatus("NONE");
+      return;
+    }
+    st.clip.downloadTimer = setTimeout(poll, 400);
+  };
+  st.clip.downloadTimer = setTimeout(poll, 400);
+}
+
 function downloadSelectedClip() {
+  if (st.clip.downloading) return;
   if (!st.clip.active || !st.clip.sourceId || st.clip.start == null || st.clip.end == null) {
     startClipSelection({ showToolbar: true });
     return;
@@ -2010,14 +2089,17 @@ function downloadSelectedClip() {
   if (st.showBoxes) p.set("boxes", "1");
   if (st.cls.size > 0) p.set("classes", [...st.cls].join(","));
   if (st.xls.size > 0) p.set("exclude_classes", [...st.xls].join(","));
-  el.download?.classList.add("loading");
+  const token = clipDownloadToken();
+  p.set("download_token", token);
+  clearClipDownloadCookie();
+  setClipDownloadBusy(true);
   const a = document.createElement("a");
   a.href = `/api/video/clip?${p}`;
   a.download = "";
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => el.download?.classList.remove("loading"), 1200);
+  waitForClipDownloadStart(token);
 }
 
 // ── Timeline drag-to-scroll ───────────────────────────
@@ -2106,14 +2188,8 @@ el.tlCanvas.addEventListener("click", e => {
   clearTimeout(_clickTimer);
   _clickTimer = setTimeout(async () => {
     if (hit.snapEvent) {
-      if (hit.snapEvent.provisional) {
-        const ok = await seekLiveTail(hit.snapEvent.source_id, hit.snapEvent.abs_ts);
-        if (!ok) startLiveTail(hit.snapEvent.source_id);
-        scrollTimelineToTs(hit.snapEvent.abs_ts);
-        return;
-      }
-      stopLiveTail(false);
-      mode.seekTo(hit.snapEvent.abs_ts, hit.snapEvent.source_id); pushState();
+      await seekToEvent(hit.snapEvent, { scroll: false });
+      return;
     } else {
       const nowTs = Date.now() / 1000;
       const srcSegs = st.segments.filter(s => s.source_id === hit.srcId && s.end_ts != null);
@@ -2296,14 +2372,7 @@ function navPrev() {
   const evts = filteredEvts().filter(e => e.abs_ts < ts - 1).sort((a,b) => b.abs_ts - a.abs_ts);
   const evt  = evts[0];
   if (evt) {
-    if (evt.provisional) {
-      seekLiveTail(evt.source_id, evt.abs_ts).then(ok => { if (!ok) startLiveTail(evt.source_id); });
-      scrollTimelineToTs(evt.abs_ts);
-      return;
-    }
-    stopLiveTail(false);
-    mode.seekTo(evt.abs_ts, evt.source_id); pushState();
-    scrollTimelineToTs(evt.abs_ts);
+    seekToEvent(evt);
   } else if (_eventsLoadedBounds().from > 0 && ts > _eventsLoadedBounds().from + 300) {
     // Shift window left and re-fetch to find earlier events (one retry only)
     const span = st.window.to - st.window.from;
@@ -2314,14 +2383,7 @@ function navPrev() {
     load().then(() => {
       const e2 = filteredEvts().filter(e => e.abs_ts < ts - 1).sort((a,b) => b.abs_ts - a.abs_ts)[0];
       if (!e2) return;
-      if (e2.provisional) {
-        seekLiveTail(e2.source_id, e2.abs_ts).then(ok => { if (!ok) startLiveTail(e2.source_id); });
-        scrollTimelineToTs(e2.abs_ts);
-        return;
-      }
-      stopLiveTail(false);
-      mode.seekTo(e2.abs_ts, e2.source_id); pushState();
-      scrollTimelineToTs(e2.abs_ts);
+      seekToEvent(e2);
     });
   }
 }
@@ -2332,14 +2394,7 @@ function navNext() {
   const evts = filteredEvts().filter(e => e.abs_ts > ts + 1).sort((a,b) => a.abs_ts - b.abs_ts);
   const evt  = evts[0];
   if (evt) {
-    if (evt.provisional) {
-      seekLiveTail(evt.source_id, evt.abs_ts).then(ok => { if (!ok) startLiveTail(evt.source_id); });
-      scrollTimelineToTs(evt.abs_ts);
-      return;
-    }
-    stopLiveTail(false);
-    mode.seekTo(evt.abs_ts, evt.source_id); pushState();
-    scrollTimelineToTs(evt.abs_ts);
+    seekToEvent(evt);
   } else if (_eventsLoadedBounds().to > 0 && ts < _eventsLoadedBounds().to - 300) {
     // Shift window right and re-fetch to find later events (one retry only)
     const span = st.window.to - st.window.from;
@@ -2350,14 +2405,7 @@ function navNext() {
     load().then(() => {
       const e2 = filteredEvts().filter(e => e.abs_ts > ts + 1).sort((a,b) => a.abs_ts - b.abs_ts)[0];
       if (!e2) return;
-      if (e2.provisional) {
-        seekLiveTail(e2.source_id, e2.abs_ts).then(ok => { if (!ok) startLiveTail(e2.source_id); });
-        scrollTimelineToTs(e2.abs_ts);
-        return;
-      }
-      stopLiveTail(false);
-      mode.seekTo(e2.abs_ts, e2.source_id); pushState();
-      scrollTimelineToTs(e2.abs_ts);
+      seekToEvent(e2);
     });
   }
 }

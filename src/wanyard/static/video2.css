@@ -936,6 +936,11 @@ body {
   background: var(--amber) !important;
   color: #1a1408 !important;
 }
+.v2-clip-action.loading,
+.v2-clip-action:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
 .st-btn.clip-active {
   border-color: rgba(232, 165, 88, 0.7) !important;
   background: var(--amber-soft) !important;

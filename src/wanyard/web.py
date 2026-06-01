@@ -895,13 +895,23 @@ def make_app(
             return JSONResponse({"error": error or "could not export clip"}, status_code=404)
         stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts))
         filename = f"cam-viewer-{source_id or 'all'}-{stamp}.mp4"
-        return FileResponse(
+        response = FileResponse(
             path,
             media_type="video/mp4",
             filename=filename,
             background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
             headers={"Cache-Control": "no-store"},
         )
+        token = request.query_params.get("download_token")
+        if token:
+            response.set_cookie(
+                "wanyard_clip_download",
+                token,
+                max_age=60,
+                path="/",
+                samesite="lax",
+            )
+        return response
 
     async def serve_video_file(request: Request) -> Response:
         if not video_dir:
