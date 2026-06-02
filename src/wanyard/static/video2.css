@@ -1306,19 +1306,19 @@ body {
     align-content: center;
     align-items: center;
     column-gap: 8px;
-    row-gap: 7px;
+    row-gap: 4px;
     overflow: visible;
-    padding: 7px 10px 9px;
+    padding: 6px 10px;
   }
   .transport {
     grid-area: transport;
   }
   .t-btn {
-    width: 36px !important;
-    height: 36px !important;
+    width: 30px !important;
+    height: 30px !important;
   }
   .t-btn.primary {
-    width: 44px !important;
+    width: 36px !important;
   }
   .time-readout {
     grid-area: time;
@@ -1337,7 +1337,7 @@ body {
   }
   .speed-pill {
     min-width: 36px !important;
-    padding: 6px 7px !important;
+    padding: 5px 7px !important;
   }
   .toggle-grp {
     grid-area: toggles;
@@ -1345,14 +1345,14 @@ body {
     margin-left: 0;
   }
   .toggle {
-    min-height: 32px !important;
-    padding: 6px 8px !important;
+    min-height: 30px !important;
+    padding: 5px 8px !important;
   }
   .tl-bg {
     grid-area: timeline;
     width: 100%;
     min-width: 0;
-    height: 56px;
+    height: 48px;
   }
   .v2-clip-toolbar {
     position: fixed;
@@ -1390,10 +1390,10 @@ body {
 
 @media (max-width: 380px) {
   .t-btn {
-    width: 34px !important;
+    width: 28px !important;
   }
   .t-btn.primary {
-    width: 40px !important;
+    width: 34px !important;
   }
   .speed-pill {
     min-width: 32px !important;
