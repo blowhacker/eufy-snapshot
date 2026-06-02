@@ -555,7 +555,7 @@ class V2Timeline {
     const x1 = this.#tsToX(this.#clip.start);
     const x2 = this.#tsToX(this.#clip.end);
     const minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
-    const HANDLE = 9;
+    const HANDLE = window.matchMedia?.("(pointer: coarse)").matches ? 16 : 9;
     if (Math.abs(x - minX) <= HANDLE) return { part: "start" };
     if (Math.abs(x - maxX) <= HANDLE) return { part: "end" };
     if (x > minX && x < maxX) return { part: "move", ts: this.#xToTs(x) };
@@ -899,6 +899,10 @@ const el = {
   timeDisp:$("v2TimeDisp"),
   boxes:   $("v2Boxes"),
   zones:   $("v2Zones"),
+  viewer:  document.querySelector(".v2-viewer"),
+  activityToggle: $("v2ActivityToggle"),
+  activityBackdrop: $("v2ActivityBackdrop"),
+  activityPanel: $("v2ActivityPanel"),
   zoneBar: $("v2ZoneBar"),
   zoneName: $("v2ZoneName"),
   zoneTriggerLabel: $("v2ZoneTriggerLabel"),
@@ -970,6 +974,7 @@ const st = {
   initDone: false,
   classSearchSeq: 0,
   summary: { total: 0, classes: {} },
+  activityOpen: false,
 };
 const EVENTS_BUFFER = 3 * 3600;   // load 3h extra on each side of visible window
 
@@ -1249,6 +1254,39 @@ function updateActivityCount() {
   if (!el.eventCount) return;
   const n = st.summary.total || 0;
   el.eventCount.textContent = `${n} today`;
+  if (el.activityToggle) {
+    el.activityToggle.title = `Activity (${n} today)`;
+    el.activityToggle.setAttribute("aria-label", st.activityOpen ? "Close activity" : `Open activity (${n} today)`);
+  }
+}
+
+const activityDrawerMq = window.matchMedia?.("(max-width: 760px), (max-height: 480px)");
+
+function isActivityDrawerLayout() {
+  return !!activityDrawerMq?.matches;
+}
+
+function setActivityOpen(open) {
+  const next = !!open && isActivityDrawerLayout();
+  st.activityOpen = next;
+  el.viewer?.classList.toggle("activity-open", next);
+  el.activityToggle?.setAttribute("aria-expanded", next ? "true" : "false");
+  if (el.activityToggle) {
+    const n = st.summary.total || 0;
+    el.activityToggle.setAttribute("aria-label", next ? "Close activity" : `Open activity (${n} today)`);
+  }
+  if (el.activityBackdrop) el.activityBackdrop.hidden = !next;
+  if (el.activityPanel) {
+    el.activityPanel.setAttribute("aria-hidden", isActivityDrawerLayout() && !next ? "true" : "false");
+  }
+}
+
+function syncActivityDrawerMode() {
+  setActivityOpen(st.activityOpen);
+}
+
+function closeActivityAfterMobilePick() {
+  if (isActivityDrawerLayout()) setActivityOpen(false);
 }
 
 async function fetchSourceStatus() {
@@ -1602,8 +1640,9 @@ function _makeThumbNode(evt, baseTs) {
     + (isEventActive(evt, baseTs) ? " active" : "");
   btn.dataset.eventId = String(evt.id);
   btn.title = `${evt.class} ${eventLocalTime(evt.abs_ts)} ${sourceLabel(evt.source_id)}`;
-  btn.addEventListener("click", () => {
-    seekToEvent(evt);
+  btn.addEventListener("click", async () => {
+    await seekToEvent(evt);
+    closeActivityAfterMobilePick();
   });
 
   const thumb = document.createElement("div");
@@ -2136,31 +2175,56 @@ function downloadSelectedClip() {
 // ── Timeline drag-to-scroll ───────────────────────────
 let _drag = null, _wasDrag = false;
 let _clipSuppressClick = false;
-el.tlCanvas.addEventListener("mousedown", e => {
-  if (e.button !== 0) return;
+let _timelinePointerId = null;
+
+function timelineLocalPoint(e) {
+  const rect = el.tlCanvas.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top, rect };
+}
+
+function captureTimelinePointer(e) {
+  if (e.pointerId == null) return;
+  try { el.tlCanvas.setPointerCapture?.(e.pointerId); } catch {}
+}
+
+function releaseTimelinePointer(e) {
+  if (e?.pointerId == null) return;
+  try { el.tlCanvas.releasePointerCapture?.(e.pointerId); } catch {}
+}
+
+function beginTimelineDrag(e) {
+  if (e.button != null && e.button !== 0) return;
+  const pt = timelineLocalPoint(e);
   if (st.clip.active) {
-    const rect = el.tlCanvas.getBoundingClientRect();
-    const hit = timeline.clipHit(e.clientX - rect.left, e.clientY - rect.top);
+    const hit = timeline.clipHit(pt.x, pt.y);
     if (hit) {
       st.clip.drag = {
         part: hit.part,
-        x: e.clientX - rect.left,
+        x: pt.x,
         start: st.clip.start,
         end: st.clip.end,
-        ts: hit.ts ?? timeline.xToTs(e.clientX - rect.left),
+        ts: hit.ts ?? timeline.xToTs(pt.x),
       };
       el.tlCanvas.style.cursor = hit.part === "move" ? "grabbing" : "ew-resize";
       _clipSuppressClick = true;
+      _timelinePointerId = e.pointerId ?? null;
+      captureTimelinePointer(e);
+      e.preventDefault();
       return;
     }
   }
   _drag = { startX: e.clientX, fromSnap: st.window.from, toSnap: st.window.to, moved: false };
   el.tlCanvas.style.cursor = "grabbing";
-});
-window.addEventListener("mousemove", e => {
+  _timelinePointerId = e.pointerId ?? null;
+  captureTimelinePointer(e);
+  e.preventDefault();
+}
+
+function moveTimelineDrag(e) {
+  if (_timelinePointerId != null && e.pointerId != null && e.pointerId !== _timelinePointerId) return;
   if (st.clip.drag) {
-    const rect = el.tlCanvas.getBoundingClientRect();
-    const ts = timeline.xToTs(e.clientX - rect.left);
+    const pt = timelineLocalPoint(e);
+    const ts = timeline.xToTs(pt.x);
     const part = st.clip.drag.part;
     if (part === "start") {
       setClipRange(ts, st.clip.drag.end, "end");
@@ -2170,6 +2234,7 @@ window.addEventListener("mousemove", e => {
       const delta = ts - st.clip.drag.ts;
       setClipRange(st.clip.drag.start + delta, st.clip.drag.end + delta);
     }
+    e.preventDefault();
     return;
   }
   if (!_drag) return;
@@ -2190,8 +2255,13 @@ window.addEventListener("mousemove", e => {
   if (nf < oldest) nf = oldest;
   st.window.from = nf; st.window.to = nt;
   setTimelineWindow(nf, nt);
-});
-window.addEventListener("mouseup", e => {
+  e.preventDefault();
+}
+
+function endTimelineDrag(e) {
+  if (_timelinePointerId != null && e.pointerId != null && e.pointerId !== _timelinePointerId) return;
+  releaseTimelinePointer(e);
+  _timelinePointerId = null;
   if (st.clip.drag) {
     st.clip.drag = null;
     el.tlCanvas.style.cursor = "";
@@ -2205,7 +2275,18 @@ window.addEventListener("mouseup", e => {
     _fetchDebounce = setTimeout(() => load(), 400);
   }
   _drag = null;
-});
+}
+
+if (window.PointerEvent) {
+  el.tlCanvas.addEventListener("pointerdown", beginTimelineDrag);
+  el.tlCanvas.addEventListener("pointermove", moveTimelineDrag);
+  el.tlCanvas.addEventListener("pointerup", endTimelineDrag);
+  el.tlCanvas.addEventListener("pointercancel", endTimelineDrag);
+} else {
+  el.tlCanvas.addEventListener("mousedown", beginTimelineDrag);
+  window.addEventListener("mousemove", moveTimelineDrag);
+  window.addEventListener("mouseup", endTimelineDrag);
+}
 
 // ── Timeline interactions ─────────────────────────────
 let _clickTimer = null;
@@ -2806,6 +2887,18 @@ el.download?.addEventListener("click", openClipDownloadToolbar);
 el.clipDownload?.addEventListener("click", downloadSelectedClip);
 el.clipCancel?.addEventListener("click", cancelClipSelection);
 el.downloadFrame?.addEventListener("click", downloadCurrentFrame);
+el.activityToggle?.addEventListener("click", () => {
+  setActivityOpen(!st.activityOpen);
+});
+el.activityBackdrop?.addEventListener("click", () => {
+  setActivityOpen(false);
+});
+if (activityDrawerMq?.addEventListener) {
+  activityDrawerMq.addEventListener("change", syncActivityDrawerMode);
+} else if (activityDrawerMq?.addListener) {
+  activityDrawerMq.addListener(syncActivityDrawerMode);
+}
+syncActivityDrawerMode();
 
 // Speed pills
 function buildSpeedPills() {
@@ -2866,6 +2959,7 @@ document.addEventListener("click", (e) => {
   closeZoneMenu();
 });
 document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && st.activityOpen) setActivityOpen(false);
   if (e.key === "Escape" && el.zoneMenu && !el.zoneMenu.hidden) closeZoneMenu();
 });
 el.zonePrev?.addEventListener("click", () => selectZone(st.zoneEdit.selected - 1));
