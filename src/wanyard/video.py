@@ -499,9 +499,13 @@ class VideoSegmentDB:
                     (rule["id"],),
                 ).fetchone()
                 last_sent = float(last_row[0]) if last_row and last_row[0] is not None else None
-                since = now - max(60.0, float(lookback_seconds))
+                base_since = max(
+                    now - max(60.0, float(lookback_seconds)),
+                    float(rule.get("created_at") or 0),
+                )
+                since = base_since
                 if last_sent is not None:
-                    since = max(since, last_sent - max(0, rule["cooldown_seconds"]))
+                    since = max(base_since, last_sent - max(0, rule["cooldown_seconds"]))
                 candidates = _notification_candidate_events(
                     conn, rule, since, now, limit_per_rule
                 )
@@ -535,17 +539,18 @@ class VideoSegmentDB:
         unread_only: bool = False,
         include_dismissed: bool = False,
     ) -> list[dict]:
-        where, params = ["1"], []
+        where, params = ["n.event_ts>=r.created_at"], []
         if unread_only:
-            where.append("read_at IS NULL")
+            where.append("n.read_at IS NULL")
         if not include_dismissed:
-            where.append("dismissed_at IS NULL")
+            where.append("n.dismissed_at IS NULL")
         limit = max(1, min(200, int(limit)))
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM notification_events"
+                "SELECT n.* FROM notification_events n"
+                " JOIN notification_rules r ON r.id=n.rule_id"
                 f" WHERE {' AND '.join(where)}"
-                " ORDER BY event_ts DESC, id DESC LIMIT ?",
+                " ORDER BY n.event_ts DESC, n.id DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
         return [_notification_event_from_row(row) for row in rows]
@@ -553,8 +558,10 @@ class VideoSegmentDB:
     def unread_notification_count(self) -> int:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) FROM notification_events"
-                " WHERE read_at IS NULL AND dismissed_at IS NULL"
+                "SELECT COUNT(*) FROM notification_events n"
+                " JOIN notification_rules r ON r.id=n.rule_id"
+                " WHERE n.event_ts>=r.created_at"
+                " AND n.read_at IS NULL AND n.dismissed_at IS NULL"
             ).fetchone()
         return int(row[0] if row else 0)
 
