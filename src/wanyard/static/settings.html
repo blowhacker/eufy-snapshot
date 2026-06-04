@@ -13,7 +13,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/app.css">
-  <link rel="stylesheet" href="/settings.css?v=zone-notify-1">
+  <link rel="stylesheet" href="/settings.css?v=web-notify-2">
 </head>
 <body>
 
@@ -44,7 +44,7 @@
         Cameras &amp; system
       </a>
       <a href="#notifications" class="s-side-link">
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M4 5.8a3 3 0 0 1 6 0v2.8l1 1.4H3l1-1.4V5.8Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M5.6 11.2a1.5 1.5 0 0 0 2.8 0" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3 4h8M3 7h8M3 10h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="1.8" cy="4" r=".65" fill="currentColor"/><circle cx="1.8" cy="7" r=".65" fill="currentColor"/><circle cx="1.8" cy="10" r=".65" fill="currentColor"/></svg>
         Notifications
       </a>
       <a href="#storage" class="s-side-link">
@@ -131,7 +131,7 @@
         <div class="s-sec-head s-sec-head-row">
           <div>
             <h2 class="s-sec-title">Notifications</h2>
-            <p class="s-sec-sub">Zone-scoped rules. Delivery is not configured yet.</p>
+            <p class="s-sec-sub">Zone-scoped rules create items in the monitor bell. External channels can be added later.</p>
           </div>
           <button id="showNotifyBtn" class="s-btn-outline" type="button">+ Add rule</button>
         </div>
@@ -140,7 +140,7 @@
           <div class="s-rule-summary">
             <div>
               <div class="s-card-section-head">Rules</div>
-              <div class="s-rule-summary-sub">Saved rules are listed here before delivery channels are wired in.</div>
+              <div class="s-rule-summary-sub">Matching events appear in the monitor notification panel.</div>
             </div>
             <span id="notificationCount" class="s-rule-count">--</span>
           </div>
@@ -257,6 +257,6 @@
     </main>
   </div>
 
-  <script src="/settings.js?v=zone-notify-1"></script>
+  <script src="/settings.js?v=web-notify-2"></script>
 </body>
 </html>

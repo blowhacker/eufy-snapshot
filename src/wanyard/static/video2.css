@@ -275,6 +275,22 @@ body {
 }
 .v2-notify-list {
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.v2-notify-list::-webkit-scrollbar {
+  width: 9px;
+}
+.v2-notify-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+.v2-notify-list::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border: 3px solid var(--surf);
+  border-radius: 8px;
+}
+.v2-notify-list::-webkit-scrollbar-thumb:hover {
+  background: var(--txt-3);
 }
 .v2-notify-empty {
   padding: 28px 16px;

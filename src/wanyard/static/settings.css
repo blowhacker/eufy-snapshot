@@ -101,6 +101,7 @@
   display: flex;
   align-items: center;
   gap: 9px;
+  min-height: 34px;
   padding: 8px 10px;
   border-radius: var(--r);
   color: var(--txt-2);
@@ -108,7 +109,12 @@
   font-size: 13.5px;
   transition: background 100ms, color 100ms;
 }
-.s-side-link svg { opacity: 0.55; flex-shrink: 0; }
+.s-side-link svg {
+  width: 14px;
+  height: 14px;
+  opacity: 0.55;
+  flex: 0 0 14px;
+}
 .s-side-link:hover { background: var(--surf); color: var(--txt); }
 .s-side-link.active {
   background: var(--surf);
@@ -326,7 +332,7 @@
   background: rgba(232, 165, 88, 0.07);
   color: var(--amber);
 }
-.s-rule-pill.pending {
+.s-rule-pill.web {
   border-color: var(--line);
   background: transparent;
   color: var(--txt-3);

@@ -326,8 +326,8 @@ function renderNotificationRules() {
     state.className = 's-rule-pill' + (rule.enabled ? '' : ' paused');
     state.textContent = rule.enabled ? 'Enabled' : 'Paused';
     const delivery = document.createElement('span');
-    delivery.className = 's-rule-pill pending';
-    delivery.textContent = 'Delivery pending';
+    delivery.className = 's-rule-pill web';
+    delivery.textContent = 'Web';
     title.append(name, state, delivery);
 
     const meta = document.createElement('div');
