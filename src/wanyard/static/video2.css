@@ -206,18 +206,21 @@ body {
 }
 .v2-notify-badge {
   position: absolute;
-  top: 2px;
-  right: 1px;
-  min-width: 15px;
-  height: 15px;
+  top: 1px;
+  right: -1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
   padding: 0 4px;
-  border: 1px solid var(--bg);
-  border-radius: 8px;
+  border: 2px solid var(--bg);
+  border-radius: 999px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.28);
   background: var(--red);
   color: #fff;
-  font: 600 9px var(--font-mono);
-  line-height: 13px;
-  text-align: center;
+  font: 700 10px/1 var(--font-ui);
+  letter-spacing: 0;
 }
 .v2-notify-panel {
   position: fixed;
