@@ -1969,6 +1969,8 @@ def _notification_event_from_row(row: sqlite3.Row | None) -> dict:
     thumb_url = row["thumb_url"]
     if "thumb_jpeg" in row.keys() and row["thumb_jpeg"]:
         thumb_url = f"/api/notifications/{row['id']}/thumb"
+    elif metadata.get("event_kind") == "hls":
+        thumb_url = None
     return {
         "id": row["id"],
         "rule_id": row["rule_id"],
