@@ -3247,6 +3247,8 @@ function completedActivityZones() {
 
 function normalizeDraftZone(zone, idx) {
   return {
+    id: zone?.id,
+    uid: zone?.uid,
     name: zone?.name || `Area ${idx + 1}`,
     type: "activity_area",
     enabled: zone?.enabled !== false,
@@ -3671,6 +3673,8 @@ async function saveZoneEditor() {
   const zones = st.zoneEdit.zones
     .filter(z => (z.polygon || []).length >= 3)
     .map((z, idx) => ({
+      id: z.id,
+      uid: z.uid,
       name: z.name || `Area ${idx + 1}`,
       type: "activity_area",
       enabled: true,

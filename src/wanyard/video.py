@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -132,6 +133,7 @@ CREATE TABLE IF NOT EXISTS object_derivations (
 
 CREATE TABLE IF NOT EXISTS video_zones (
     id           INTEGER PRIMARY KEY,
+    uid          TEXT,
     source_id    TEXT    NOT NULL,
     name         TEXT    NOT NULL,
     zone_type    TEXT    NOT NULL DEFAULT 'activity_area',
@@ -147,6 +149,20 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS notification_rules (
+    id               INTEGER PRIMARY KEY,
+    name             TEXT    NOT NULL,
+    source_id        TEXT    NOT NULL,
+    zone_ref         TEXT    NOT NULL DEFAULT 'whole_frame',
+    classes_json     TEXT    NOT NULL DEFAULT '[]',
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    cooldown_seconds INTEGER NOT NULL DEFAULT 60,
+    created_at       REAL    NOT NULL DEFAULT (unixepoch('now')),
+    updated_at       REAL    NOT NULL DEFAULT (unixepoch('now'))
+);
+CREATE INDEX IF NOT EXISTS nrule_source_zone
+    ON notification_rules(source_id, zone_ref, enabled);
 
 -- Real-time detections from HLS .ts segments, pending MP4 backfill.
 -- Rows here make events appear in the UI within seconds of detection.
@@ -186,11 +202,23 @@ class VideoSegmentDB:
                 "ALTER TABLE segments  ADD COLUMN actual_start_ts REAL",
                 "ALTER TABLE video_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'detection'",
                 "ALTER TABLE video_events ADD COLUMN track_id TEXT",
+                "ALTER TABLE video_zones ADD COLUMN uid TEXT",
             ]:
                 try:
                     conn.execute(migration)
                 except Exception:
                     pass
+            for row in conn.execute(
+                "SELECT id FROM video_zones WHERE uid IS NULL OR uid=''"
+            ).fetchall():
+                conn.execute(
+                    "UPDATE video_zones SET uid=? WHERE id=?",
+                    (_new_zone_uid(), row["id"]),
+                )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS vzone_source_uid"
+                " ON video_zones(source_id, uid)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._path), timeout=10)
@@ -298,6 +326,7 @@ class VideoSegmentDB:
                 polygon = []
             zones.append({
                 "id": row["id"],
+                "uid": row["uid"],
                 "source_id": row["source_id"],
                 "name": row["name"],
                 "type": row["zone_type"],
@@ -311,14 +340,35 @@ class VideoSegmentDB:
     def replace_zones(self, source_id: str, zones: list[dict]) -> list[dict]:
         if not source_id or source_id == "all":
             raise ValueError("source_id is required")
-        sanitized = [_sanitize_zone(source_id, z) for z in zones]
         now = time.time()
         with self._connect() as conn:
+            existing_by_id = {
+                row["id"]: row["uid"]
+                for row in conn.execute(
+                    "SELECT id, uid FROM video_zones WHERE source_id=?", (source_id,)
+                ).fetchall()
+            }
+            sanitized = []
+            seen_uids: set[str] = set()
+            for z in zones:
+                item = _sanitize_zone(source_id, z)
+                uid = _normalize_zone_uid(z.get("uid"))
+                try:
+                    zone_id = int(z.get("id"))
+                except (TypeError, ValueError):
+                    zone_id = None
+                if not uid and zone_id in existing_by_id:
+                    uid = _normalize_zone_uid(existing_by_id[zone_id])
+                if not uid or uid in seen_uids:
+                    uid = _new_zone_uid()
+                seen_uids.add(uid)
+                item["uid"] = uid
+                sanitized.append(item)
             conn.execute("DELETE FROM video_zones WHERE source_id=?", (source_id,))
             conn.executemany(
                 "INSERT INTO video_zones"
-                " (source_id, name, zone_type, polygon_json, enabled, created_at, updated_at)"
-                " VALUES(:source_id,:name,:zone_type,:polygon_json,:enabled,:created_at,:updated_at)",
+                " (uid, source_id, name, zone_type, polygon_json, enabled, created_at, updated_at)"
+                " VALUES(:uid,:source_id,:name,:zone_type,:polygon_json,:enabled,:created_at,:updated_at)",
                 [
                     {
                         **z,
@@ -329,6 +379,79 @@ class VideoSegmentDB:
                 ],
             )
         return self.list_zones(source_id)
+
+    def list_notification_rules(self, source_id: str | None = None) -> list[dict]:
+        where, params = ["1"], []
+        if source_id and source_id != "all":
+            where.append("source_id=?")
+            params.append(source_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM notification_rules"
+                f" WHERE {' AND '.join(where)}"
+                " ORDER BY source_id, enabled DESC, name COLLATE NOCASE, id",
+                params,
+            ).fetchall()
+        return [_notification_rule_from_row(row) for row in rows]
+
+    def create_notification_rule(self, data: dict) -> dict:
+        rule = _sanitize_notification_rule(data)
+        now = time.time()
+        with self._connect() as conn:
+            _validate_notification_zone_ref(conn, rule["source_id"], rule["zone_ref"])
+            cur = conn.execute(
+                "INSERT INTO notification_rules"
+                " (name, source_id, zone_ref, classes_json, enabled,"
+                " cooldown_seconds, created_at, updated_at)"
+                " VALUES(:name,:source_id,:zone_ref,:classes_json,:enabled,"
+                " :cooldown_seconds,:created_at,:updated_at)",
+                {
+                    **rule,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            row = conn.execute(
+                "SELECT * FROM notification_rules WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+        return _notification_rule_from_row(row)
+
+    def update_notification_rule(self, rule_id: int, data: dict) -> dict | None:
+        if not isinstance(data, dict):
+            raise ValueError("rule must be an object")
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT * FROM notification_rules WHERE id=?", (rule_id,)
+            ).fetchone()
+            if current is None:
+                return None
+            merged = _notification_rule_from_row(current)
+            merged.update(data)
+            rule = _sanitize_notification_rule(merged)
+            _validate_notification_zone_ref(conn, rule["source_id"], rule["zone_ref"])
+            conn.execute(
+                "UPDATE notification_rules SET"
+                " name=:name, source_id=:source_id, zone_ref=:zone_ref,"
+                " classes_json=:classes_json, enabled=:enabled,"
+                " cooldown_seconds=:cooldown_seconds, updated_at=:updated_at"
+                " WHERE id=:id",
+                {
+                    **rule,
+                    "id": rule_id,
+                    "updated_at": time.time(),
+                },
+            )
+            row = conn.execute(
+                "SELECT * FROM notification_rules WHERE id=?", (rule_id,)
+            ).fetchone()
+        return _notification_rule_from_row(row)
+
+    def delete_notification_rule(self, rule_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM notification_rules WHERE id=?", (rule_id,)
+            )
+        return cur.rowcount > 0
 
     def activity_areas(self, source_id: str) -> list[list[dict]]:
         return [
@@ -1567,6 +1690,128 @@ def _sanitize_zone(source_id: str, zone: dict) -> dict:
         "polygon_json": json.dumps(polygon, separators=(",", ":")),
         "enabled": 1 if zone.get("enabled", True) else 0,
     }
+
+
+def _new_zone_uid() -> str:
+    return uuid.uuid4().hex
+
+
+def _normalize_zone_uid(raw) -> str | None:
+    uid = str(raw or "").strip()
+    if not uid or len(uid) > 80:
+        return None
+    if any(not (ch.isalnum() or ch in {"-", "_"}) for ch in uid):
+        return None
+    return uid
+
+
+def _notification_rule_from_row(row: sqlite3.Row | None) -> dict:
+    if row is None:
+        raise ValueError("notification rule row is required")
+    try:
+        classes = json.loads(row["classes_json"]) if row["classes_json"] else []
+    except (TypeError, json.JSONDecodeError):
+        classes = []
+    if not isinstance(classes, list):
+        classes = []
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "source_id": row["source_id"],
+        "zone_ref": row["zone_ref"],
+        "classes": [str(c) for c in classes if str(c).strip()],
+        "enabled": bool(row["enabled"]),
+        "cooldown_seconds": int(row["cooldown_seconds"] or 0),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _sanitize_notification_rule(data: dict) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("rule must be an object")
+    source_id = str(data.get("source_id") or "").strip()
+    if not source_id or source_id == "all":
+        raise ValueError("source_id is required")
+    name = str(data.get("name") or "Notification rule").strip()[:120]
+    if not name:
+        name = "Notification rule"
+
+    raw_ref = str(data.get("zone_ref") or data.get("zone") or "whole_frame").strip()
+    aliases = {
+        "frame": "whole_frame",
+        "whole-frame": "whole_frame",
+        "whole_frame": "whole_frame",
+        "none": "whole_frame",
+        "off": "whole_frame",
+        "all": "all_activity_areas",
+        "all_zones": "all_activity_areas",
+        "all_activity_areas": "all_activity_areas",
+    }
+    if raw_ref.startswith("zone:"):
+        uid = _normalize_zone_uid(raw_ref.split(":", 1)[1])
+        if not uid:
+            raise ValueError("zone_ref is invalid")
+        zone_ref = f"zone:{uid}"
+    else:
+        zone_ref = aliases.get(raw_ref)
+        if not zone_ref:
+            raise ValueError("zone_ref is invalid")
+
+    try:
+        cooldown = int(float(data.get("cooldown_seconds", 60)))
+    except (TypeError, ValueError):
+        cooldown = 60
+    cooldown = max(0, min(86400, cooldown))
+
+    enabled_raw = data.get("enabled", True)
+    if isinstance(enabled_raw, str):
+        enabled = enabled_raw.strip().lower() not in {"0", "false", "no", "off", "paused"}
+    else:
+        enabled = bool(enabled_raw)
+
+    return {
+        "name": name,
+        "source_id": source_id,
+        "zone_ref": zone_ref,
+        "classes_json": json.dumps(
+            _sanitize_notification_classes(data), separators=(",", ":")
+        ),
+        "enabled": 1 if enabled else 0,
+        "cooldown_seconds": cooldown,
+    }
+
+
+def _sanitize_notification_classes(data: dict) -> list[str]:
+    raw = data.get("classes")
+    if raw is None and data.get("classes_json"):
+        try:
+            raw = json.loads(data["classes_json"])
+        except (TypeError, json.JSONDecodeError):
+            raw = []
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+
+    classes: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        cls = str(item).strip().lower()[:64]
+        if not cls or cls in seen:
+            continue
+        seen.add(cls)
+        classes.append(cls)
+    return classes
+
+
+def _validate_notification_zone_ref(
+    _conn: sqlite3.Connection, _source_id: str, zone_ref: str
+) -> None:
+    if zone_ref.startswith("zone:") and not _normalize_zone_uid(zone_ref.split(":", 1)[1]):
+        raise ValueError("zone_ref is invalid")
 
 
 def _normalize_polygon(raw) -> list[dict]:

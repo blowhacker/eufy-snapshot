@@ -13,7 +13,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/app.css">
-  <link rel="stylesheet" href="/settings.css">
+  <link rel="stylesheet" href="/settings.css?v=zone-notify-1">
 </head>
 <body>
 
@@ -42,6 +42,10 @@
       <a href="#system" class="s-side-link active">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="1.5" y="1.5" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="8" y="1.5" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="1.5" y="8" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="8" y="8" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/></svg>
         Cameras &amp; system
+      </a>
+      <a href="#notifications" class="s-side-link">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M4 5.8a3 3 0 0 1 6 0v2.8l1 1.4H3l1-1.4V5.8Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M5.6 11.2a1.5 1.5 0 0 0 2.8 0" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+        Notifications
       </a>
       <a href="#storage" class="s-side-link">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="1.5" y="4" width="11" height="6.5" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M4.5 7h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><path d="M3 4V3a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v1" stroke="currentColor" stroke-width="1.2"/></svg>
@@ -122,6 +126,73 @@
         </div>
       </section>
 
+      <!-- Notifications -->
+      <section class="s-sec" id="notifications">
+        <div class="s-sec-head s-sec-head-row">
+          <div>
+            <h2 class="s-sec-title">Notifications</h2>
+            <p class="s-sec-sub">Zone-scoped rules. Delivery is not configured yet.</p>
+          </div>
+          <button id="showNotifyBtn" class="s-btn-outline" type="button">+ Add rule</button>
+        </div>
+
+        <div class="s-card">
+          <div class="s-rule-summary">
+            <div>
+              <div class="s-card-section-head">Rules</div>
+              <div class="s-rule-summary-sub">Saved rules are listed here before delivery channels are wired in.</div>
+            </div>
+            <span id="notificationCount" class="s-rule-count">--</span>
+          </div>
+
+          <div id="notificationRules" class="s-rule-list"></div>
+
+          <div id="notificationDrawer" class="s-drawer" hidden>
+            <div class="s-drawer-head" id="notificationDrawerTitle">New rule</div>
+            <div class="s-drawer-body">
+              <div class="s-field-row">
+                <label for="notifyName">Name</label>
+                <input id="notifyName" type="text" placeholder="Garden person" autocomplete="off">
+                <span class="s-field-hint">Shown in the rule list.</span>
+              </div>
+              <div class="s-field-row">
+                <label for="notifySource">Camera</label>
+                <select id="notifySource"></select>
+                <span class="s-field-hint"></span>
+              </div>
+              <div class="s-field-row">
+                <label for="notifyZone">Area</label>
+                <select id="notifyZone"></select>
+                <span class="s-field-hint"></span>
+              </div>
+              <div class="s-field-row">
+                <label for="notifyClasses">Objects</label>
+                <input id="notifyClasses" type="text" placeholder="person, car" autocomplete="off">
+                <span class="s-field-hint">Blank means all classes.</span>
+              </div>
+              <div class="s-field-row">
+                <label for="notifyCooldown">Cooldown</label>
+                <input id="notifyCooldown" type="number" min="0" max="86400" step="10" value="60">
+                <span class="s-field-hint">Seconds between repeats.</span>
+              </div>
+              <div class="s-field-row">
+                <label for="notifyEnabled">State</label>
+                <select id="notifyEnabled">
+                  <option value="1">Enabled</option>
+                  <option value="0">Paused</option>
+                </select>
+                <span class="s-field-hint"></span>
+              </div>
+              <div class="s-card-footer">
+                <button id="cancelNotifyBtn" class="s-btn" type="button">Cancel</button>
+                <button id="saveNotifyBtn" class="s-btn s-btn-primary" type="button">Save rule</button>
+                <span id="notifyMsg" class="s-save-msg"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- Storage -->
       <section class="s-sec" id="storage">
         <div class="s-sec-head">
@@ -186,6 +257,6 @@
     </main>
   </div>
 
-  <script src="/settings.js"></script>
+  <script src="/settings.js?v=zone-notify-1"></script>
 </body>
 </html>

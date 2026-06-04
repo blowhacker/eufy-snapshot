@@ -605,6 +605,55 @@ def make_app(
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"zones": saved})
 
+    async def api_notification_rules(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({"error": "video db not configured"}, status_code=501)
+
+        if request.method == "GET":
+            source_id = request.query_params.get("source") or None
+            rules = await asyncio.to_thread(video_db.list_notification_rules, source_id)
+            return JSONResponse({"rules": rules})
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+        try:
+            rule = await asyncio.to_thread(video_db.create_notification_rule, body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"rule": rule}, status_code=201)
+
+    async def api_notification_rule(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({"error": "video db not configured"}, status_code=501)
+        try:
+            rule_id = int(request.path_params["rule_id"])
+        except (KeyError, ValueError):
+            return JSONResponse({"error": "invalid rule id"}, status_code=400)
+
+        if request.method == "DELETE":
+            deleted = await asyncio.to_thread(video_db.delete_notification_rule, rule_id)
+            if not deleted:
+                return JSONResponse({"error": "rule not found"}, status_code=404)
+            return JSONResponse({"ok": True})
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+        try:
+            rule = await asyncio.to_thread(video_db.update_notification_rule, rule_id, body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if rule is None:
+            return JSONResponse({"error": "rule not found"}, status_code=404)
+        return JSONResponse({"rule": rule})
+
     def _source_statuses() -> dict:
         sources = _sources_list(config, source_db)
         now = time.time()
@@ -1142,6 +1191,8 @@ def make_app(
         Route("/api/video/classes",         api_video_class_counts),
         Route("/api/video/activity-summary", api_video_activity_summary),
         Route("/api/video/zones",           api_video_zones, methods=["GET", "PUT"]),
+        Route("/api/notifications/rules",   api_notification_rules, methods=["GET", "POST"]),
+        Route("/api/notifications/rules/{rule_id}", api_notification_rule, methods=["PUT", "DELETE"]),
         Route("/api/video/segments",        api_video_segments),
         Route("/api/video/detections",      api_video_detections),
         Route("/api/video/live",            api_video_live_status),
