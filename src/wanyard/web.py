@@ -654,6 +654,56 @@ def make_app(
             return JSONResponse({"error": "rule not found"}, status_code=404)
         return JSONResponse({"rule": rule})
 
+    async def api_notifications(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({"notifications": [], "unread_count": 0})
+        try:
+            limit = int(request.query_params.get("limit", 30))
+        except ValueError:
+            limit = 30
+        unread_only = request.query_params.get("unread") in {"1", "true", "yes"}
+        await asyncio.to_thread(video_db.materialize_notifications)
+        notifications = await asyncio.to_thread(
+            video_db.list_notifications, limit, unread_only
+        )
+        unread_count = await asyncio.to_thread(video_db.unread_notification_count)
+        return JSONResponse({
+            "notifications": notifications,
+            "unread_count": unread_count,
+        })
+
+    async def api_notifications_unread_count(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({"unread_count": 0})
+        await asyncio.to_thread(video_db.materialize_notifications)
+        unread_count = await asyncio.to_thread(video_db.unread_notification_count)
+        return JSONResponse({"unread_count": unread_count})
+
+    async def api_notification_read(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({"error": "video db not configured"}, status_code=501)
+        try:
+            notification_id = int(request.path_params["notification_id"])
+        except (KeyError, ValueError):
+            return JSONResponse({"error": "invalid notification id"}, status_code=400)
+        notification = await asyncio.to_thread(
+            video_db.mark_notification_read, notification_id
+        )
+        if notification is None:
+            return JSONResponse({"error": "notification not found"}, status_code=404)
+        unread_count = await asyncio.to_thread(video_db.unread_notification_count)
+        return JSONResponse({
+            "notification": notification,
+            "unread_count": unread_count,
+        })
+
+    async def api_notifications_read_all(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({"error": "video db not configured"}, status_code=501)
+        updated = await asyncio.to_thread(video_db.mark_all_notifications_read)
+        unread_count = await asyncio.to_thread(video_db.unread_notification_count)
+        return JSONResponse({"updated": updated, "unread_count": unread_count})
+
     def _source_statuses() -> dict:
         sources = _sources_list(config, source_db)
         now = time.time()
@@ -1191,6 +1241,10 @@ def make_app(
         Route("/api/video/classes",         api_video_class_counts),
         Route("/api/video/activity-summary", api_video_activity_summary),
         Route("/api/video/zones",           api_video_zones, methods=["GET", "PUT"]),
+        Route("/api/notifications",         api_notifications),
+        Route("/api/notifications/unread-count", api_notifications_unread_count),
+        Route("/api/notifications/read-all", api_notifications_read_all, methods=["POST"]),
+        Route("/api/notifications/{notification_id}/read", api_notification_read, methods=["POST"]),
         Route("/api/notifications/rules",   api_notification_rules, methods=["GET", "POST"]),
         Route("/api/notifications/rules/{rule_id}", api_notification_rule, methods=["PUT", "DELETE"]),
         Route("/api/video/segments",        api_video_segments),

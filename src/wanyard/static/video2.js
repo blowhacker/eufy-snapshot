@@ -916,6 +916,12 @@ const el = {
   activityToggle: $("v2ActivityToggle"),
   activityBackdrop: $("v2ActivityBackdrop"),
   activityPanel: $("v2ActivityPanel"),
+  notifyToggle: $("v2NotificationsToggle"),
+  notifyBadge: $("v2NotificationsBadge"),
+  notifyPanel: $("v2NotificationsPanel"),
+  notifySub: $("v2NotificationsSub"),
+  notifyList: $("v2NotificationsList"),
+  notifyReadAll: $("v2NotificationsReadAll"),
   zoneBar: $("v2ZoneBar"),
   zoneName: $("v2ZoneName"),
   zoneTriggerLabel: $("v2ZoneTriggerLabel"),
@@ -996,6 +1002,9 @@ const st = {
   classSearchSeq: 0,
   summary: { total: 0, classes: {} },
   activityOpen: false,
+  notificationsOpen: false,
+  notifications: [],
+  unreadNotifications: 0,
 };
 const EVENTS_BUFFER = 3 * 3600;   // load 3h extra on each side of visible window
 
@@ -1508,6 +1517,130 @@ function eventLocalTime(ts) {
 
 function sourceLabel(srcId) {
   return st.sources.find(s => s.id === srcId)?.name || srcId;
+}
+
+function notificationAge(ts) {
+  const delta = Math.max(0, Math.round(Date.now() / 1000 - Number(ts || 0)));
+  if (delta < 60) return "now";
+  if (delta < 3600) return `${Math.floor(delta / 60)}m`;
+  if (delta < 86400) return `${Math.floor(delta / 3600)}h`;
+  return `${Math.floor(delta / 86400)}d`;
+}
+
+function updateNotificationBadge() {
+  if (!el.notifyBadge) return;
+  const n = st.unreadNotifications || 0;
+  el.notifyBadge.hidden = n <= 0;
+  el.notifyBadge.textContent = n > 99 ? "99+" : String(n);
+}
+
+function setNotificationsOpen(open) {
+  const next = !!open;
+  st.notificationsOpen = next;
+  if (el.notifyPanel) el.notifyPanel.hidden = !next;
+  el.notifyToggle?.setAttribute("aria-expanded", next ? "true" : "false");
+  el.notifyToggle?.setAttribute("aria-label", next ? "Close notifications" : "Open notifications");
+  if (next) loadNotifications();
+}
+
+async function loadNotifications() {
+  const r = await fetch("/api/notifications?limit=20", { cache:"no-store" }).catch(() => null);
+  if (!r?.ok) return;
+  const data = await r.json().catch(() => ({}));
+  st.notifications = data.notifications || [];
+  st.unreadNotifications = data.unread_count || 0;
+  updateNotificationBadge();
+  renderNotifications();
+}
+
+async function refreshNotificationCount() {
+  const r = await fetch("/api/notifications/unread-count", { cache:"no-store" }).catch(() => null);
+  if (!r?.ok) return;
+  const data = await r.json().catch(() => ({}));
+  st.unreadNotifications = data.unread_count || 0;
+  updateNotificationBadge();
+}
+
+function renderNotifications() {
+  if (!el.notifyList) return;
+  el.notifyList.innerHTML = "";
+  const unread = st.unreadNotifications || 0;
+  if (el.notifySub) {
+    el.notifySub.textContent = unread
+      ? `${unread} unread`
+      : `${st.notifications.length} recent`;
+  }
+  if (el.notifyReadAll) el.notifyReadAll.disabled = unread <= 0;
+  if (!st.notifications.length) {
+    const empty = document.createElement("div");
+    empty.className = "v2-notify-empty";
+    empty.textContent = "No notifications";
+    el.notifyList.appendChild(empty);
+    return;
+  }
+  st.notifications.forEach(n => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "v2-notify-row" + (n.read ? "" : " unread");
+
+    const thumb = document.createElement("div");
+    thumb.className = "v2-notify-thumb";
+    if (n.thumb_url) {
+      const img = document.createElement("img");
+      img.src = n.thumb_url;
+      img.alt = "";
+      img.loading = "lazy";
+      thumb.appendChild(img);
+    } else {
+      const fallback = document.createElement("div");
+      fallback.className = "v2-notify-thumb-fallback";
+      fallback.textContent = "EVT";
+      thumb.appendChild(fallback);
+    }
+
+    const main = document.createElement("div");
+    main.className = "v2-notify-main";
+
+    const title = document.createElement("div");
+    title.className = "v2-notify-row-title";
+    const name = document.createElement("div");
+    name.className = "v2-notify-name";
+    name.textContent = n.title || "Notification";
+    const time = document.createElement("div");
+    time.className = "v2-notify-time";
+    time.textContent = notificationAge(n.event_ts || n.created_at);
+    title.append(name, time);
+
+    const body = document.createElement("div");
+    body.className = "v2-notify-body";
+    body.textContent = n.body || n.rule_name || "";
+
+    const meta = document.createElement("div");
+    meta.className = "v2-notify-meta";
+    meta.textContent = `${sourceLabel(n.source_id)} · ${n.class || "object"}`;
+
+    main.append(title, body, meta);
+    row.append(thumb, main);
+    row.addEventListener("click", () => openNotification(n));
+    el.notifyList.appendChild(row);
+  });
+}
+
+async function openNotification(notification) {
+  if (!notification.read) {
+    fetch(`/api/notifications/${notification.id}/read`, { method:"POST" }).catch(() => {});
+  }
+  const target = notification.target_url || "/";
+  location.assign(target);
+}
+
+async function markAllNotificationsRead() {
+  const r = await fetch("/api/notifications/read-all", { method:"POST" }).catch(() => null);
+  if (!r?.ok) return;
+  st.notifications = st.notifications.map(n => ({ ...n, read: true, read_at: n.read_at || Date.now() / 1000 }));
+  st.unreadNotifications = 0;
+  updateNotificationBadge();
+  renderNotifications();
 }
 
 function eventSeekTs(evt) {
@@ -2956,6 +3089,14 @@ el.activityToggle?.addEventListener("click", () => {
 el.activityBackdrop?.addEventListener("click", () => {
   setActivityOpen(false);
 });
+el.notifyToggle?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  setNotificationsOpen(!st.notificationsOpen);
+});
+el.notifyPanel?.addEventListener("click", e => {
+  e.stopPropagation();
+});
+el.notifyReadAll?.addEventListener("click", markAllNotificationsRead);
 if (activityDrawerMq?.addEventListener) {
   activityDrawerMq.addEventListener("change", syncActivityDrawerMode);
 } else if (activityDrawerMq?.addListener) {
@@ -3017,12 +3158,16 @@ el.zones?.addEventListener("click", (e) => {
   toggleZoneMenu();
 });
 document.addEventListener("click", (e) => {
+  if (st.notificationsOpen && !el.notifyPanel?.contains(e.target) && !el.notifyToggle?.contains(e.target)) {
+    setNotificationsOpen(false);
+  }
   if (!el.zoneMenu || el.zoneMenu.hidden) return;
   if (el.zonePicker?.contains(e.target)) return;
   closeZoneMenu();
 });
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && st.activityOpen) setActivityOpen(false);
+  if (e.key === "Escape" && st.notificationsOpen) setNotificationsOpen(false);
   if (e.key === "Escape" && el.zoneMenu && !el.zoneMenu.hidden) closeZoneMenu();
 });
 el.zonePrev?.addEventListener("click", () => selectZone(st.zoneEdit.selected - 1));
@@ -3794,6 +3939,11 @@ async function init() {
   const r = await fetch("/api/sources", { cache:"no-store" });
   if (r.ok) st.sources = (await r.json()).sources || [];
   await fetchSourceStatus();
+  refreshNotificationCount();
+  setInterval(() => {
+    if (st.notificationsOpen) loadNotifications();
+    else refreshNotificationCount();
+  }, 15000);
   if (!V2_SPEEDS[st.speed]) st.speed = 1;
   buildSpeedPills();
   player.setRate(selectedPlaybackRate());

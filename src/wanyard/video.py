@@ -13,6 +13,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
 LOG = logging.getLogger(__name__)
 
@@ -163,6 +164,33 @@ CREATE TABLE IF NOT EXISTS notification_rules (
 );
 CREATE INDEX IF NOT EXISTS nrule_source_zone
     ON notification_rules(source_id, zone_ref, enabled);
+
+CREATE TABLE IF NOT EXISTS notification_events (
+    id            INTEGER PRIMARY KEY,
+    rule_id       INTEGER NOT NULL REFERENCES notification_rules(id) ON DELETE CASCADE,
+    rule_name     TEXT    NOT NULL,
+    source_id     TEXT    NOT NULL,
+    zone_ref      TEXT    NOT NULL,
+    event_ref     TEXT    NOT NULL,
+    event_ts      REAL    NOT NULL,
+    class         TEXT    NOT NULL,
+    confidence    REAL    NOT NULL DEFAULT 0,
+    title         TEXT    NOT NULL,
+    body          TEXT    NOT NULL,
+    thumb_url     TEXT,
+    target_url    TEXT,
+    read_at       REAL,
+    dismissed_at  REAL,
+    created_at    REAL    NOT NULL DEFAULT (unixepoch('now')),
+    metadata_json TEXT    NOT NULL DEFAULT '{}',
+    UNIQUE(rule_id, event_ref)
+);
+CREATE INDEX IF NOT EXISTS nevt_created
+    ON notification_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS nevt_unread
+    ON notification_events(read_at, dismissed_at, created_at);
+CREATE INDEX IF NOT EXISTS nevt_rule_ts
+    ON notification_events(rule_id, event_ts);
 
 -- Real-time detections from HLS .ts segments, pending MP4 backfill.
 -- Rows here make events appear in the UI within seconds of detection.
@@ -452,6 +480,104 @@ class VideoSegmentDB:
                 "DELETE FROM notification_rules WHERE id=?", (rule_id,)
             )
         return cur.rowcount > 0
+
+    def materialize_notifications(
+        self,
+        lookback_seconds: float = 24 * 60 * 60,
+        limit_per_rule: int = 300,
+    ) -> int:
+        now = time.time()
+        inserted = 0
+        with self._connect() as conn:
+            rules = conn.execute(
+                "SELECT * FROM notification_rules WHERE enabled=1 ORDER BY id"
+            ).fetchall()
+            for rule_row in rules:
+                rule = _notification_rule_from_row(rule_row)
+                last_row = conn.execute(
+                    "SELECT MAX(event_ts) FROM notification_events WHERE rule_id=?",
+                    (rule["id"],),
+                ).fetchone()
+                last_sent = float(last_row[0]) if last_row and last_row[0] is not None else None
+                since = now - max(60.0, float(lookback_seconds))
+                if last_sent is not None:
+                    since = max(since, last_sent - max(0, rule["cooldown_seconds"]))
+                candidates = _notification_candidate_events(
+                    conn, rule, since, now, limit_per_rule
+                )
+                if not candidates:
+                    continue
+                cooldown = max(0, int(rule["cooldown_seconds"]))
+                cursor_ts = last_sent
+                for event in sorted(candidates, key=lambda e: e["abs_ts"]):
+                    event_ts = float(event["abs_ts"])
+                    if cursor_ts is not None and event_ts < cursor_ts + cooldown:
+                        continue
+                    row = _build_notification_event(conn, rule, event, now)
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO notification_events"
+                        " (rule_id, rule_name, source_id, zone_ref, event_ref,"
+                        " event_ts, class, confidence, title, body, thumb_url,"
+                        " target_url, created_at, metadata_json)"
+                        " VALUES(:rule_id,:rule_name,:source_id,:zone_ref,:event_ref,"
+                        " :event_ts,:class,:confidence,:title,:body,:thumb_url,"
+                        " :target_url,:created_at,:metadata_json)",
+                        row,
+                    )
+                    cursor_ts = event_ts
+                    if cur.rowcount:
+                        inserted += 1
+        return inserted
+
+    def list_notifications(
+        self,
+        limit: int = 30,
+        unread_only: bool = False,
+        include_dismissed: bool = False,
+    ) -> list[dict]:
+        where, params = ["1"], []
+        if unread_only:
+            where.append("read_at IS NULL")
+        if not include_dismissed:
+            where.append("dismissed_at IS NULL")
+        limit = max(1, min(200, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM notification_events"
+                f" WHERE {' AND '.join(where)}"
+                " ORDER BY event_ts DESC, id DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [_notification_event_from_row(row) for row in rows]
+
+    def unread_notification_count(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM notification_events"
+                " WHERE read_at IS NULL AND dismissed_at IS NULL"
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def mark_notification_read(self, notification_id: int) -> dict | None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE notification_events SET read_at=COALESCE(read_at, ?)"
+                " WHERE id=?",
+                (time.time(), notification_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM notification_events WHERE id=?", (notification_id,)
+            ).fetchone()
+        return _notification_event_from_row(row) if row else None
+
+    def mark_all_notifications_read(self) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE notification_events SET read_at=COALESCE(read_at, ?)"
+                " WHERE read_at IS NULL AND dismissed_at IS NULL",
+                (time.time(),),
+            )
+        return cur.rowcount
 
     def activity_areas(self, source_id: str) -> list[list[dict]]:
         return [
@@ -1812,6 +1938,247 @@ def _validate_notification_zone_ref(
 ) -> None:
     if zone_ref.startswith("zone:") and not _normalize_zone_uid(zone_ref.split(":", 1)[1]):
         raise ValueError("zone_ref is invalid")
+
+
+def _notification_event_from_row(row: sqlite3.Row | None) -> dict:
+    if row is None:
+        raise ValueError("notification event row is required")
+    try:
+        metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+    except (TypeError, json.JSONDecodeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "id": row["id"],
+        "rule_id": row["rule_id"],
+        "rule_name": row["rule_name"],
+        "source_id": row["source_id"],
+        "zone_ref": row["zone_ref"],
+        "event_ref": row["event_ref"],
+        "event_ts": row["event_ts"],
+        "class": row["class"],
+        "confidence": row["confidence"],
+        "title": row["title"],
+        "body": row["body"],
+        "thumb_url": row["thumb_url"],
+        "target_url": row["target_url"],
+        "read_at": row["read_at"],
+        "dismissed_at": row["dismissed_at"],
+        "created_at": row["created_at"],
+        "read": row["read_at"] is not None,
+        "metadata": metadata,
+    }
+
+
+def _notification_candidate_events(
+    conn: sqlite3.Connection,
+    rule: dict,
+    since: float,
+    until: float,
+    limit: int,
+) -> list[dict]:
+    source_id = rule["source_id"]
+    polygons = _notification_zone_polygons(conn, source_id, rule["zone_ref"])
+    if polygons is None:
+        return []
+
+    classes = set(rule.get("classes") or [])
+    table = _notification_event_table(conn, source_id, since, until)
+    where, params = ["source_id=?", "abs_ts>=?", "abs_ts<=?"], [source_id, since, until]
+    if table == "object_events":
+        where.append("event_type='appeared'")
+    if classes:
+        placeholders = ",".join("?" for _ in classes)
+        where.append(f"class IN ({placeholders})")
+        params.extend(sorted(classes))
+    rows = conn.execute(
+        "SELECT id, source_id, abs_ts, class, confidence, boxes_json"
+        f" FROM {table}"
+        f" WHERE {' AND '.join(where)}"
+        " ORDER BY abs_ts ASC LIMIT ?",
+        (*params, max(1, int(limit))),
+    ).fetchall()
+    kind = "object" if table == "object_events" else "event"
+    events = [{**dict(r), "_kind": kind} for r in rows]
+
+    hls_since = max(since, until - _PROVISIONAL_GRACE_SECONDS)
+    hls_where, hls_params = ["source_id=?", "abs_ts>=?", "abs_ts<=?"], [source_id, hls_since, until]
+    if classes:
+        placeholders = ",".join("?" for _ in classes)
+        hls_where.append(f"class IN ({placeholders})")
+        hls_params.extend(sorted(classes))
+    hls_rows = conn.execute(
+        "SELECT id, source_id, abs_ts, class, confidence, boxes_json"
+        " FROM hls_events"
+        f" WHERE {' AND '.join(hls_where)}"
+        " ORDER BY abs_ts ASC LIMIT ?",
+        (*hls_params, max(1, int(limit))),
+    ).fetchall()
+    events.extend({**dict(r), "_kind": "hls"} for r in hls_rows)
+    if polygons:
+        events = _filter_with_polygons(events, polygons)
+    events.sort(key=lambda e: e["abs_ts"])
+    return events[: max(1, int(limit))]
+
+
+def _notification_event_table(
+    conn: sqlite3.Connection,
+    source_id: str,
+    since: float,
+    until: float,
+) -> str:
+    row = conn.execute(
+        "SELECT 1 FROM object_events"
+        " WHERE source_id=? AND abs_ts>=? AND abs_ts<=? LIMIT 1",
+        (source_id, since, until),
+    ).fetchone()
+    return "object_events" if row else "video_events"
+
+
+def _notification_zone_polygons(
+    conn: sqlite3.Connection,
+    source_id: str,
+    zone_ref: str,
+) -> list[list[dict]] | None:
+    if zone_ref == "whole_frame":
+        return []
+    if zone_ref == "all_activity_areas":
+        zones = _notification_activity_zones(conn, source_id)
+        return [z["polygon"] for z in zones] if zones else None
+    if zone_ref.startswith("zone:"):
+        uid = zone_ref.split(":", 1)[1]
+        zone = _notification_zone_by_uid(conn, source_id, uid)
+        if not zone:
+            return None
+        return [zone["polygon"]]
+    return None
+
+
+def _notification_activity_zones(
+    conn: sqlite3.Connection,
+    source_id: str,
+) -> list[dict]:
+    rows = conn.execute(
+        "SELECT id, uid, name, polygon_json FROM video_zones"
+        " WHERE source_id=? AND zone_type='activity_area' AND enabled=1"
+        " ORDER BY id",
+        (source_id,),
+    ).fetchall()
+    zones = []
+    for row in rows:
+        try:
+            polygon = json.loads(row["polygon_json"])
+        except (TypeError, json.JSONDecodeError):
+            polygon = []
+        if isinstance(polygon, list) and len(polygon) >= 3:
+            zones.append({
+                "id": row["id"],
+                "uid": row["uid"],
+                "name": row["name"],
+                "polygon": polygon,
+            })
+    return zones
+
+
+def _notification_zone_by_uid(
+    conn: sqlite3.Connection,
+    source_id: str,
+    uid: str,
+) -> dict | None:
+    row = conn.execute(
+        "SELECT id, uid, name, polygon_json FROM video_zones"
+        " WHERE source_id=? AND uid=? AND enabled=1 LIMIT 1",
+        (source_id, uid),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        polygon = json.loads(row["polygon_json"])
+    except (TypeError, json.JSONDecodeError):
+        polygon = []
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        return None
+    return {
+        "id": row["id"],
+        "uid": row["uid"],
+        "name": row["name"],
+        "polygon": polygon,
+    }
+
+
+def _notification_zone_label_and_param(
+    conn: sqlite3.Connection,
+    source_id: str,
+    zone_ref: str,
+) -> tuple[str, str]:
+    if zone_ref == "whole_frame":
+        return "Whole frame", "none"
+    if zone_ref == "all_activity_areas":
+        return "All activity areas", "all"
+    if zone_ref.startswith("zone:"):
+        zone = _notification_zone_by_uid(conn, source_id, zone_ref.split(":", 1)[1])
+        if zone:
+            return zone["name"] or f"Area {zone['id']}", str(zone["id"])
+        return "Missing area", "none"
+    return zone_ref, "none"
+
+
+def _build_notification_event(
+    conn: sqlite3.Connection,
+    rule: dict,
+    event: dict,
+    created_at: float,
+) -> dict:
+    zone_label, zone_param = _notification_zone_label_and_param(
+        conn, rule["source_id"], rule["zone_ref"]
+    )
+    cls = str(event["class"])
+    pretty_cls = cls.replace("_", " ").strip().title() or "Object"
+    event_ref = _notification_event_ref(event)
+    params = {
+        "source": rule["source_id"],
+        "ts": str(int(float(event["abs_ts"]))),
+        "cls": cls,
+        "zone": zone_param,
+    }
+    thumb_url = _notification_thumb_url(event, event_ref)
+    metadata = {
+        "zone_label": zone_label,
+        "zone_param": zone_param,
+        "event_kind": event.get("_kind", "event"),
+    }
+    return {
+        "rule_id": rule["id"],
+        "rule_name": rule["name"],
+        "source_id": rule["source_id"],
+        "zone_ref": rule["zone_ref"],
+        "event_ref": event_ref,
+        "event_ts": float(event["abs_ts"]),
+        "class": cls,
+        "confidence": float(event.get("confidence") or 0),
+        "title": f"{pretty_cls} detected",
+        "body": f"{rule['name']} · {zone_label}",
+        "thumb_url": thumb_url,
+        "target_url": f"/?{urlencode(params)}",
+        "created_at": created_at,
+        "metadata_json": json.dumps(metadata, separators=(",", ":")),
+    }
+
+
+def _notification_event_ref(event: dict) -> str:
+    kind = event.get("_kind")
+    if kind == "object":
+        return f"o:{event['id']}"
+    if kind == "hls":
+        return f"h:{event['id']}"
+    return str(event["id"])
+
+
+def _notification_thumb_url(event: dict, event_ref: str) -> str:
+    if event.get("_kind") == "hls":
+        return f"/api/video/hls-thumb/{event['id']}"
+    return f"/api/video/event-thumb/{event_ref}"
 
 
 def _normalize_polygon(raw) -> list[dict]:

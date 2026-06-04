@@ -201,6 +201,179 @@ body {
   background: var(--surf);
   color: var(--txt);
 }
+.v2-notify-toggle {
+  position: relative;
+}
+.v2-notify-badge {
+  position: absolute;
+  top: 2px;
+  right: 1px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border: 1px solid var(--bg);
+  border-radius: 8px;
+  background: var(--red);
+  color: #fff;
+  font: 600 9px var(--font-mono);
+  line-height: 13px;
+  text-align: center;
+}
+.v2-notify-panel {
+  position: fixed;
+  top: 42px;
+  right: 14px;
+  z-index: 90;
+  width: min(380px, calc(100vw - 24px));
+  max-height: min(560px, calc(100dvh - 64px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surf);
+  box-shadow: 0 18px 52px rgba(0, 0, 0, 0.48);
+}
+.v2-notify-panel[hidden] {
+  display: none;
+}
+.v2-notify-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 14px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg);
+}
+.v2-notify-title {
+  color: var(--txt);
+  font-size: 13.5px;
+  font-weight: 500;
+}
+.v2-notify-sub {
+  margin-top: 3px;
+  color: var(--txt-3);
+  font-size: 12px;
+}
+.v2-notify-mark {
+  flex: 0 0 auto;
+  height: 26px !important;
+  padding: 0 10px !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--r) !important;
+  color: var(--txt-2);
+  font-size: 12px !important;
+}
+.v2-notify-mark:hover:not(:disabled) {
+  border-color: var(--line) !important;
+  color: var(--txt);
+}
+.v2-notify-mark:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.v2-notify-list {
+  overflow-y: auto;
+}
+.v2-notify-empty {
+  padding: 28px 16px;
+  color: var(--txt-3);
+  font-size: 13px;
+  text-align: center;
+}
+.v2-notify-row {
+  display: grid !important;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 10px;
+  width: 100% !important;
+  padding: 12px 14px !important;
+  border-bottom: 1px solid var(--line-soft) !important;
+  border-radius: 0 !important;
+  text-align: left;
+  color: inherit;
+}
+.v2-notify-row:hover {
+  background: var(--surf-2) !important;
+}
+.v2-notify-row.unread {
+  box-shadow: inset 2px 0 0 var(--amber);
+}
+.v2-notify-thumb {
+  width: 58px;
+  height: 42px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  background: var(--bg-stage);
+}
+.v2-notify-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.v2-notify-thumb-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--txt-3);
+  font: 500 10px var(--font-mono);
+}
+.v2-notify-main {
+  min-width: 0;
+}
+.v2-notify-row-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+.v2-notify-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--txt);
+  font-size: 13px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.v2-notify-time {
+  flex: 0 0 auto;
+  color: var(--txt-3);
+  font: 400 10.5px var(--font-mono);
+}
+.v2-notify-body {
+  overflow: hidden;
+  color: var(--txt-3);
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.v2-notify-meta {
+  margin-top: 4px;
+  color: var(--txt-2);
+  font: 400 10.5px var(--font-mono);
+}
+.v2-notify-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--bg);
+}
+.v2-notify-footer a {
+  color: var(--txt-2);
+  font-size: 12px;
+  text-decoration: none;
+}
+.v2-notify-footer a:hover {
+  color: var(--txt);
+}
 .v2-activity-toggle {
   display: none;
   align-items: center;
@@ -1103,6 +1276,21 @@ body {
   }
   .events {
     padding: 4px 10px 12px;
+  }
+  .v2-notify-panel {
+    left: max(10px, env(safe-area-inset-left));
+    right: max(10px, env(safe-area-inset-right));
+    top: 52px;
+    width: auto;
+    max-height: min(64dvh, 520px);
+  }
+  .v2-notify-row {
+    grid-template-columns: 54px minmax(0, 1fr);
+    padding: 11px 12px !important;
+  }
+  .v2-notify-thumb {
+    width: 54px;
+    height: 40px;
   }
 }
 
