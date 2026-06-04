@@ -836,6 +836,10 @@ def make_app(
                 _clip_box_filter(seg, clip_start, clip_end, include_classes or set(), exclude_classes or set())
                 if overlay_boxes else None
             )
+            filter_file = None
+            if vf:
+                filter_file = tmpdir / f"filters_{i:03d}.txt"
+                filter_file.write_text(vf, encoding="utf-8")
             cmd = [
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                 "-ss", f"{max(0.0, clip_start - float(seg['start_ts'])):.3f}",
@@ -843,14 +847,17 @@ def make_app(
                 "-t", f"{clip_end - clip_start:.3f}",
                 "-map", "0:v:0?", "-map", "0:a:0?",
             ]
-            if vf:
-                cmd += ["-vf", vf]
+            if filter_file:
+                cmd += ["-filter_script:v:0", str(filter_file)]
             cmd += [
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                 "-c:a", "aac", "-movflags", "+faststart",
                 str(out),
             ]
-            r = subprocess.run(cmd, capture_output=True, timeout=90, check=False)
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=90, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
             if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
                 parts.append(out)
 
@@ -863,12 +870,16 @@ def make_app(
         list_file = tmpdir / "parts.txt"
         list_file.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts))
         out = tmpdir / "clip.mp4"
-        r = subprocess.run(
-            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-             "-f", "concat", "-safe", "0", "-i", str(list_file),
-             "-c", "copy", "-movflags", "+faststart", str(out)],
-            capture_output=True, timeout=90, check=False,
-        )
+        try:
+            r = subprocess.run(
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                 "-f", "concat", "-safe", "0", "-i", str(list_file),
+                 "-c", "copy", "-movflags", "+faststart", str(out)],
+                capture_output=True, timeout=90, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return None, None, "could not stitch clip"
         if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
             shutil.rmtree(tmpdir, ignore_errors=True)
             return None, None, "could not stitch clip"
