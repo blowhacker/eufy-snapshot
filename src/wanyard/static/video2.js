@@ -212,8 +212,8 @@ class PlaylistHandle {
 
   async #seekCurrent() {
     if (!this.#active || this.#idx >= this.#clips.length) return;
-    const [start] = this.#clips[this.#idx];
-    const landing = await this.#player.seek(start);
+    const [start, , srcId] = this.#clips[this.#idx];
+    const landing = await this.#player.seek(start, srcId);
     if (!this.#active) return;  // cancelled during seek
     if (!landing) return;
     this.#player.play();
@@ -221,12 +221,12 @@ class PlaylistHandle {
 
   #watchEnd() {
     if (!this.#active) return;
-    const [start, end] = this.#clips[this.#idx] ?? [];
+    const [start, end, srcId] = this.#clips[this.#idx] ?? [];
     const ts = this.#player.currentTs;
     if (end != null && ts != null && ts >= end) { this.#advance(); return; }
 
     if (this.#player.ended && end != null) {
-      const next = this.#player.nextSegment();
+      const next = this.#player.nextSegment(srcId);
       if (next && next.start_ts < end) {
         this.#player.seek(Math.max(next.start_ts, start), next.source_id, "forward")
           .then(landing => { if (this.#active && landing) this.#player.play(); });
@@ -297,8 +297,21 @@ class AppMode {
     this.#mode = "playlist";
     this.onModeChange?.("playlist");
     const POST = 10;
-    const clips = events.map(e => [e.abs_ts, e.abs_ts + (e.end_off - e.start_off) + POST]);
+    const clips = events.map(e => [e.abs_ts, e.abs_ts + (e.end_off - e.start_off) + POST, e.source_id]);
     this.#handle = this.#player.playClips(clips, startIdx);
+    this.#handle.onEnd = () => {
+      if (loop && this.#mode === "playlist") this.#handle.restart();
+      else { this.#mode = "seek"; this.onModeChange?.("seek"); }
+    };
+    return this.#handle;
+  }
+
+  playClipRange(start, end, sourceId, { loop = true } = {}) {
+    if (start == null || end == null || !sourceId || end <= start) return null;
+    this.#cancel();
+    this.#mode = "playlist";
+    this.onModeChange?.("playlist");
+    this.#handle = this.#player.playClips([[start, end, sourceId]], 0);
     this.#handle.onEnd = () => {
       if (loop && this.#mode === "playlist") this.#handle.restart();
       else { this.#mode = "seek"; this.onModeChange?.("seek"); }
@@ -921,6 +934,7 @@ const el = {
   downloadFrame: $("v2DownloadFrame"),
   clipToolbar: $("v2ClipToolbar"),
   clipRange: $("v2ClipRange"),
+  clipPreview: $("v2ClipPreview"),
   clipDownload: $("v2ClipDownload"),
   clipCancel: $("v2ClipCancel"),
   status:  $("v2Status"),
@@ -933,6 +947,12 @@ const el = {
 const player   = new V2Player(el.video);
 const timeline = new V2Timeline(el.tlCanvas);
 const mode     = new AppMode(player);
+mode.onModeChange = next => {
+  if (next !== "playlist" && st?.clip?.previewing) {
+    setClipPreviewing(false);
+    if (next === "seek") setStatus("REPLAY");
+  }
+};
 
 // ── App state ─────────────────────────────────────────
 const st = {
@@ -956,6 +976,7 @@ const st = {
     active: false,
     toolbarOpen: false,
     downloading: false,
+    previewing: false,
     downloadTimer: null,
     start: null,
     end: null,
@@ -1418,6 +1439,7 @@ function mergeClassCounts(events) {
 
 async function handleClassSelectionChanged(classes) {
   const seq = ++st.classSearchSeq;
+  stopClipPreview();
   renderClsCtrl();
   renderNearScope();
   timeline.setData(allSegsForSrc(), filteredEvts());
@@ -2049,7 +2071,25 @@ function startClipSelection({ showToolbar = false } = {}) {
   syncClipSelection();
 }
 
+function setClipPreviewing(previewing) {
+  st.clip.previewing = !!previewing;
+  if (!el.clipPreview) return;
+  if (!el.clipPreview.dataset.idleText) {
+    el.clipPreview.dataset.idleText = el.clipPreview.textContent || "Preview";
+  }
+  el.clipPreview.classList.toggle("previewing", st.clip.previewing);
+  el.clipPreview.textContent = st.clip.previewing ? "Previewing" : el.clipPreview.dataset.idleText;
+}
+
+function stopClipPreview({ pause = false } = {}) {
+  if (!st.clip.previewing) return;
+  setClipPreviewing(false);
+  if (mode.current === "playlist") mode.stop();
+  if (pause) player.pause();
+}
+
 function cancelClipSelection() {
+  stopClipPreview({ pause: true });
   st.clip.active = false;
   st.clip.toolbarOpen = false;
   st.clip.start = null;
@@ -2061,6 +2101,7 @@ function cancelClipSelection() {
 
 function setClipRange(start, end, fixed = null) {
   if (!st.clip.active || !st.clip.sourceId) return;
+  stopClipPreview({ pause: true });
   const range = normalizeClipRange(start, end, st.clip.sourceId, fixed);
   st.clip.start = range.start;
   st.clip.end = range.end;
@@ -2078,6 +2119,10 @@ function syncClipSelection() {
   el.download?.classList.toggle("clip-active", !!active);
   const showToolbar = active && st.clip.toolbarOpen;
   if (el.clipToolbar) el.clipToolbar.hidden = !showToolbar;
+  if (el.clipPreview) {
+    el.clipPreview.disabled = !active;
+    el.clipPreview.classList.toggle("previewing", !!st.clip.previewing);
+  }
   if (!active) return;
 
   const mid = (st.clip.start + st.clip.end) / 2;
@@ -2090,6 +2135,23 @@ function syncClipSelection() {
     const x = Math.max(toolbarW / 2, Math.min(canvasW - toolbarW / 2, timeline.tsToX(mid)));
     el.clipToolbar.style.left = `${x}px`;
   }
+}
+
+function previewSelectedClip() {
+  if (!st.clip.active || !st.clip.sourceId || st.clip.start == null || st.clip.end == null) {
+    startClipSelection({ showToolbar: true });
+    return;
+  }
+  const start = Math.min(st.clip.start, st.clip.end);
+  const end = Math.max(st.clip.start, st.clip.end);
+  if (end <= start) return;
+  stopLiveTail(false);
+  const handle = mode.playClipRange(start, end, st.clip.sourceId, { loop: true });
+  if (!handle) return;
+  setClipPreviewing(true);
+  centerWindowOn(start);
+  scrollTimelineToTs(start);
+  setStatus("PREVIEW");
 }
 
 function clipDownloadToken() {
@@ -2884,6 +2946,7 @@ function downloadCurrentFrame() {
 }
 el.fullscreen?.addEventListener("click", toggleFullscreen);
 el.download?.addEventListener("click", openClipDownloadToolbar);
+el.clipPreview?.addEventListener("click", previewSelectedClip);
 el.clipDownload?.addEventListener("click", downloadSelectedClip);
 el.clipCancel?.addEventListener("click", cancelClipSelection);
 el.downloadFrame?.addEventListener("click", downloadCurrentFrame);

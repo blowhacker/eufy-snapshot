@@ -13,7 +13,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/video2.css?v=mobile-2">
+    <link rel="stylesheet" href="/video2.css?v=clip-preview-1">
   </head>
   <body>
     <div id="v2LoadBar" class="v2-load-bar"></div>
@@ -137,6 +137,7 @@
             <canvas id="v2Timeline" class="v2-timeline"></canvas>
             <div id="v2ClipToolbar" class="v2-clip-toolbar" hidden>
               <span id="v2ClipRange" class="v2-clip-range">--:-- - --:--</span>
+              <button id="v2ClipPreview" class="v2-clip-action" type="button" title="Preview selected range">Preview</button>
               <button id="v2ClipDownload" class="v2-clip-action primary" type="button">Download</button>
               <button id="v2ClipCancel" class="v2-clip-action" type="button">Cancel</button>
             </div>
@@ -154,6 +155,6 @@
       </div>
     </main>
     <script src="/d3.min.js?v=7.9.0"></script>
-    <script src="/video2.js?v=mobile-2"></script>
+    <script src="/video2.js?v=clip-preview-1"></script>
   </body>
 </html>

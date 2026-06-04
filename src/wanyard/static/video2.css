@@ -951,6 +951,11 @@ body {
   background: var(--amber) !important;
   color: #1a1408 !important;
 }
+.v2-clip-action.previewing {
+  border-color: rgba(78, 201, 138, 0.38) !important;
+  background: rgba(78, 201, 138, 0.12) !important;
+  color: var(--green) !important;
+}
 .v2-clip-action.loading,
 .v2-clip-action:disabled {
   cursor: wait;
