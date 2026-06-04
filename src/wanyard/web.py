@@ -697,6 +697,19 @@ def make_app(
             "unread_count": unread_count,
         })
 
+    async def api_notification_thumb(request: Request) -> Response:
+        if not video_db:
+            return Response(status_code=404)
+        try:
+            notification_id = int(request.path_params["notification_id"])
+        except (KeyError, ValueError):
+            return Response(status_code=400)
+        data = await asyncio.to_thread(video_db.get_notification_thumb, notification_id)
+        if not data:
+            return Response(status_code=404)
+        return Response(content=data, media_type="image/jpeg",
+                        headers={"Cache-Control": _IMG_CACHE})
+
     async def api_notifications_read_all(request: Request) -> JSONResponse:
         if not video_db:
             return JSONResponse({"error": "video db not configured"}, status_code=501)
@@ -1244,6 +1257,7 @@ def make_app(
         Route("/api/notifications",         api_notifications),
         Route("/api/notifications/unread-count", api_notifications_unread_count),
         Route("/api/notifications/read-all", api_notifications_read_all, methods=["POST"]),
+        Route("/api/notifications/{notification_id}/thumb", api_notification_thumb),
         Route("/api/notifications/{notification_id}/read", api_notification_read, methods=["POST"]),
         Route("/api/notifications/rules",   api_notification_rules, methods=["GET", "POST"]),
         Route("/api/notifications/rules/{rule_id}", api_notification_rule, methods=["PUT", "DELETE"]),

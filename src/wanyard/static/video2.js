@@ -1590,6 +1590,13 @@ function renderNotifications() {
       img.src = n.thumb_url;
       img.alt = "";
       img.loading = "lazy";
+      img.addEventListener("error", () => {
+        thumb.innerHTML = "";
+        const fallback = document.createElement("div");
+        fallback.className = "v2-notify-thumb-fallback";
+        fallback.textContent = "EVT";
+        thumb.appendChild(fallback);
+      }, { once: true });
       thumb.appendChild(img);
     } else {
       const fallback = document.createElement("div");

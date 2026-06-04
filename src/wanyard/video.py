@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS notification_events (
     title         TEXT    NOT NULL,
     body          TEXT    NOT NULL,
     thumb_url     TEXT,
+    thumb_jpeg    BLOB,
     target_url    TEXT,
     read_at       REAL,
     dismissed_at  REAL,
@@ -231,6 +232,7 @@ class VideoSegmentDB:
                 "ALTER TABLE video_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'detection'",
                 "ALTER TABLE video_events ADD COLUMN track_id TEXT",
                 "ALTER TABLE video_zones ADD COLUMN uid TEXT",
+                "ALTER TABLE notification_events ADD COLUMN thumb_jpeg BLOB",
             ]:
                 try:
                     conn.execute(migration)
@@ -522,10 +524,10 @@ class VideoSegmentDB:
                         "INSERT OR IGNORE INTO notification_events"
                         " (rule_id, rule_name, source_id, zone_ref, event_ref,"
                         " event_ts, class, confidence, title, body, thumb_url,"
-                        " target_url, created_at, metadata_json)"
+                        " thumb_jpeg, target_url, created_at, metadata_json)"
                         " VALUES(:rule_id,:rule_name,:source_id,:zone_ref,:event_ref,"
                         " :event_ts,:class,:confidence,:title,:body,:thumb_url,"
-                        " :target_url,:created_at,:metadata_json)",
+                        " :thumb_jpeg,:target_url,:created_at,:metadata_json)",
                         row,
                     )
                     cursor_ts = event_ts
@@ -585,6 +587,14 @@ class VideoSegmentDB:
                 (time.time(),),
             )
         return cur.rowcount
+
+    def get_notification_thumb(self, notification_id: int) -> bytes | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT thumb_jpeg FROM notification_events WHERE id=?",
+                (notification_id,),
+            ).fetchone()
+        return bytes(row["thumb_jpeg"]) if row and row["thumb_jpeg"] else None
 
     def activity_areas(self, source_id: str) -> list[list[dict]]:
         return [
@@ -1956,6 +1966,9 @@ def _notification_event_from_row(row: sqlite3.Row | None) -> dict:
         metadata = {}
     if not isinstance(metadata, dict):
         metadata = {}
+    thumb_url = row["thumb_url"]
+    if "thumb_jpeg" in row.keys() and row["thumb_jpeg"]:
+        thumb_url = f"/api/notifications/{row['id']}/thumb"
     return {
         "id": row["id"],
         "rule_id": row["rule_id"],
@@ -1968,7 +1981,7 @@ def _notification_event_from_row(row: sqlite3.Row | None) -> dict:
         "confidence": row["confidence"],
         "title": row["title"],
         "body": row["body"],
-        "thumb_url": row["thumb_url"],
+        "thumb_url": thumb_url,
         "target_url": row["target_url"],
         "read_at": row["read_at"],
         "dismissed_at": row["dismissed_at"],
@@ -2016,7 +2029,7 @@ def _notification_candidate_events(
         hls_where.append(f"class IN ({placeholders})")
         hls_params.extend(sorted(classes))
     hls_rows = conn.execute(
-        "SELECT id, source_id, abs_ts, class, confidence, boxes_json"
+        "SELECT id, source_id, abs_ts, class, confidence, boxes_json, thumb_jpeg"
         " FROM hls_events"
         f" WHERE {' AND '.join(hls_where)}"
         " ORDER BY abs_ts ASC LIMIT ?",
@@ -2167,6 +2180,7 @@ def _build_notification_event(
         "title": f"{pretty_cls} detected",
         "body": f"{rule['name']} · {zone_label}",
         "thumb_url": thumb_url,
+        "thumb_jpeg": event.get("thumb_jpeg"),
         "target_url": f"/?{urlencode(params)}",
         "created_at": created_at,
         "metadata_json": json.dumps(metadata, separators=(",", ":")),
