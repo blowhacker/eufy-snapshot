@@ -22,6 +22,13 @@ from pathlib import Path
 LOG = logging.getLogger(__name__)
 
 SOCKET_PATH = os.environ.get("YOLO_SOCKET", "/tmp/yolo.sock")
+_CONFIRMATION_STRATEGY = "yolo1280-crop640-960-v1"
+_CONFIRM_FULL_IMGSZ = 1280
+_CONFIRM_CROP_IMGSZ = (640, 960)
+_CONFIRM_MIN_CONF = 0.25
+_CONFIRM_MIN_IOU = 0.10
+_CONFIRM_MAX_CENTER_DISTANCE = 0.060
+_LIVE_FRAME_SLOP_SECONDS = 0.25
 
 
 # ── Socket server ──────────────────────────────────────────────────────────────
@@ -42,10 +49,11 @@ class _YoloHandler(socketserver.StreamRequestHandler):
 
 
 class YoloSocketServer(socketserver.ThreadingUnixStreamServer):
-    def __init__(self, socket_path: str, model, video_db, video_dir):
+    def __init__(self, socket_path: str, model, video_db, video_dir, predict_lock):
         self.model            = model
         self.video_db         = video_db
         self.video_dir        = video_dir
+        self.predict_lock     = predict_lock
         self._backfill_thread: threading.Thread | None = None
         if Path(socket_path).exists():
             Path(socket_path).unlink()
@@ -61,7 +69,10 @@ class YoloSocketServer(socketserver.ThreadingUnixStreamServer):
             return {"status": "ok",
                     "model": str(getattr(self.model, "model_name", None)),
                     "backfill_alive": bool(bt and bt.is_alive())}
-        # Future: detect_frame for live RTSP
+        if t == "confirm_notification_event":
+            return _confirm_notification_event(
+                self.model, self.predict_lock, self.video_db, self.video_dir, req
+            )
         return {"status": "error", "error": f"unknown type: {t}"}
 
 
@@ -147,9 +158,338 @@ def _crop_thumb(frame, cls_boxes: list, cls: str,
     return buf.tobytes() if ok else None
 
 
+# ── Notification confirmation ─────────────────────────────────────────────────
+
+def _confirm_notification_event(model, predict_lock, video_db, video_dir: Path, req: dict) -> dict:
+    cls = str(req.get("class") or "").strip()
+    cls_id = _cctv_class_id(cls)
+    if cls_id is None:
+        return {"status": "error", "error": f"unsupported class: {cls}"}
+    source_id = str(req.get("source_id") or "").strip()
+    try:
+        abs_ts = float(req.get("abs_ts"))
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "invalid abs_ts"}
+    candidates = _candidate_boxes(req.get("boxes_json"), cls)
+    if not candidates:
+        return {
+            "status": "ok",
+            "strategy_version": _CONFIRMATION_STRATEGY,
+            "confirmed": False,
+            "confidence": 0.0,
+            "reason": "no_candidate_box",
+        }
+
+    frame, frame_source, frame_error = _frame_for_confirmation(
+        video_db, video_dir, source_id, abs_ts, str(req.get("event_kind") or "")
+    )
+    if frame is None:
+        return {
+            "status": "ok",
+            "strategy_version": _CONFIRMATION_STRATEGY,
+            "confirmed": False,
+            "confidence": 0.0,
+            "reason": "frame_unavailable",
+            "frame_source": frame_source,
+            "frame_error": frame_error,
+        }
+
+    timings: dict[str, float] = {}
+    full_boxes, timings["full_1280"] = _predict_boxes(
+        model, predict_lock, frame, cls_id, _CONFIRM_FULL_IMGSZ
+    )
+    full_match = _best_match(full_boxes, candidates)
+    if _match_confirmed(full_match):
+        return {
+            "status": "ok",
+            "strategy_version": _CONFIRMATION_STRATEGY,
+            "confirmed": True,
+            "confidence": full_match["conf"],
+            "reason": "full_1280",
+            "box": _response_box(full_match),
+            "frame_source": frame_source,
+            "full_confidence": full_match["conf"],
+            "crop_confidence": 0.0,
+            "timings_ms": timings,
+        }
+
+    crop_best: dict | None = None
+    for idx, candidate in enumerate(candidates):
+        crop, offset = _crop_for_box(frame, candidate)
+        if crop is None:
+            continue
+        for imgsz in _CONFIRM_CROP_IMGSZ:
+            boxes, ms = _predict_boxes(
+                model,
+                predict_lock,
+                crop,
+                cls_id,
+                imgsz,
+                offset_xy=offset,
+                full_wh=(frame.shape[1], frame.shape[0]),
+            )
+            timings[f"crop{idx}_{imgsz}"] = ms
+            match = _best_match(boxes, [candidate])
+            if match and (crop_best is None or match["conf"] > crop_best["conf"]):
+                crop_best = match
+    if _match_confirmed(crop_best):
+        return {
+            "status": "ok",
+            "strategy_version": _CONFIRMATION_STRATEGY,
+            "confirmed": True,
+            "confidence": crop_best["conf"],
+            "reason": "crop_640_960",
+            "box": _response_box(crop_best),
+            "frame_source": frame_source,
+            "full_confidence": full_match["conf"] if full_match else 0.0,
+            "crop_confidence": crop_best["conf"],
+            "timings_ms": timings,
+        }
+
+    return {
+        "status": "ok",
+        "strategy_version": _CONFIRMATION_STRATEGY,
+        "confirmed": False,
+        "confidence": max(
+            full_match["conf"] if full_match else 0.0,
+            crop_best["conf"] if crop_best else 0.0,
+        ),
+        "reason": "no_high_res_match",
+        "box": _response_box(crop_best or full_match),
+        "frame_source": frame_source,
+        "full_confidence": full_match["conf"] if full_match else 0.0,
+        "crop_confidence": crop_best["conf"] if crop_best else 0.0,
+        "timings_ms": timings,
+    }
+
+
+def _cctv_class_id(cls: str) -> int | None:
+    from .video import _CCTV_CLASSES
+    for cls_id, name in _CCTV_CLASSES.items():
+        if name == cls:
+            return int(cls_id)
+    return None
+
+
+def _candidate_boxes(raw, cls: str) -> list[dict]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            raw = []
+    if not isinstance(raw, list):
+        return []
+    boxes = []
+    for box in raw:
+        if not isinstance(box, dict):
+            continue
+        if str(box.get("cls") or cls) != cls:
+            continue
+        try:
+            x1 = max(0.0, min(1.0, float(box["x1"])))
+            y1 = max(0.0, min(1.0, float(box["y1"])))
+            x2 = max(0.0, min(1.0, float(box["x2"])))
+            y2 = max(0.0, min(1.0, float(box["y2"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        boxes.append({
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "conf": float(box.get("conf") or 0.0),
+            "cls": cls,
+        })
+    boxes.sort(key=lambda b: (b["conf"], _box_area(b)), reverse=True)
+    return boxes
+
+
+def _frame_for_confirmation(video_db, video_dir: Path, source_id: str, abs_ts: float, event_kind: str):
+    prefer_live = event_kind == "hls"
+    readers = (
+        (_read_live_hls_frame, _read_mp4_frame)
+        if prefer_live else
+        (_read_mp4_frame, _read_live_hls_frame)
+    )
+    errors = []
+    for reader in readers:
+        frame, source, err = reader(video_db, video_dir, source_id, abs_ts)
+        if frame is not None:
+            return frame, source, None
+        if err:
+            errors.append(err)
+    return None, None, "; ".join(errors)
+
+
+def _read_mp4_frame(video_db, video_dir: Path, source_id: str, abs_ts: float):
+    import cv2
+    with video_db._connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM segments"
+            " WHERE source_id=? AND start_ts<=?"
+            " AND (end_ts IS NULL OR end_ts>=?)"
+            " ORDER BY start_ts DESC LIMIT 1",
+            (source_id, abs_ts, abs_ts),
+        ).fetchone()
+    if not row:
+        return None, "mp4", "no_segment"
+    seg = dict(row)
+    path = Path(seg["path"])
+    if not path.is_absolute():
+        path = video_dir / path
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return None, "mp4", f"open_failed:{path.name}"
+    base = float(seg["actual_start_ts"] if seg.get("actual_start_ts") is not None else seg["start_ts"])
+    offset = max(0.0, abs_ts - base)
+    cap.set(cv2.CAP_PROP_POS_MSEC, offset * 1000.0)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return None, "mp4", f"read_failed:{path.name}:{offset:.3f}"
+    return frame, "mp4", None
+
+
+def _read_live_hls_frame(_video_db, video_dir: Path, source_id: str, abs_ts: float):
+    import cv2
+    source_dir = video_dir / "live" / source_id
+    m3u8 = source_dir / "live.m3u8"
+    segments = _parse_hls_segments(m3u8)
+    if not segments:
+        return None, "hls", "no_live_playlist"
+    for idx, (filename, start_ts) in enumerate(segments):
+        next_ts = segments[idx + 1][1] if idx + 1 < len(segments) else start_ts + 2.0
+        if abs_ts < start_ts - _LIVE_FRAME_SLOP_SECONDS:
+            continue
+        if abs_ts > next_ts + _LIVE_FRAME_SLOP_SECONDS:
+            continue
+        path = source_dir / filename
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            return None, "hls", f"open_failed:{filename}"
+        offset = max(0.0, abs_ts - start_ts)
+        cap.set(cv2.CAP_PROP_POS_MSEC, offset * 1000.0)
+        ok, frame = cap.read()
+        cap.release()
+        if ok and frame is not None:
+            return frame, "hls", None
+        return None, "hls", f"read_failed:{filename}:{offset:.3f}"
+    return None, "hls", "live_segment_not_found"
+
+
+def _predict_boxes(
+    model,
+    predict_lock,
+    frame,
+    cls_id: int,
+    imgsz: int,
+    *,
+    offset_xy: tuple[int, int] | None = None,
+    full_wh: tuple[int, int] | None = None,
+) -> tuple[list[dict], float]:
+    from .video import _parse_results
+    start = time.perf_counter()
+    with predict_lock:
+        results = model.predict(frame, classes=[cls_id], conf=0.01, imgsz=imgsz, verbose=False)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    _, _, boxes = _parse_results(results)
+    if offset_xy is None or full_wh is None:
+        return boxes, elapsed_ms
+    crop_h, crop_w = frame.shape[:2]
+    full_w, full_h = full_wh
+    off_x, off_y = offset_xy
+    mapped = []
+    for box in boxes:
+        mapped.append({
+            **box,
+            "x1": (off_x + float(box["x1"]) * crop_w) / full_w,
+            "y1": (off_y + float(box["y1"]) * crop_h) / full_h,
+            "x2": (off_x + float(box["x2"]) * crop_w) / full_w,
+            "y2": (off_y + float(box["y2"]) * crop_h) / full_h,
+        })
+    return mapped, elapsed_ms
+
+
+def _crop_for_box(frame, box: dict):
+    h, w = frame.shape[:2]
+    x1 = float(box["x1"]) * w
+    y1 = float(box["y1"]) * h
+    x2 = float(box["x2"]) * w
+    y2 = float(box["y2"]) * h
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    size = max(max(bw, bh) * 3.0, min(w, h) * 0.12)
+    nx1 = max(0, int(round(cx - size / 2)))
+    ny1 = max(0, int(round(cy - size / 2)))
+    nx2 = min(w, int(round(cx + size / 2)))
+    ny2 = min(h, int(round(cy + size / 2)))
+    if nx2 <= nx1 or ny2 <= ny1:
+        return None, None
+    return frame[ny1:ny2, nx1:nx2].copy(), (nx1, ny1)
+
+
+def _best_match(detections: list[dict], candidates: list[dict]) -> dict | None:
+    best = None
+    for det in detections:
+        for candidate in candidates:
+            iou = _box_iou(det, candidate)
+            center_distance = _center_distance(det, candidate)
+            geometry_ok = (
+                iou >= _CONFIRM_MIN_IOU
+                or center_distance <= _CONFIRM_MAX_CENTER_DISTANCE
+            )
+            if not geometry_ok:
+                continue
+            match = {
+                **det,
+                "iou": iou,
+                "center_distance": center_distance,
+            }
+            if best is None or (match["conf"], match["iou"]) > (best["conf"], best["iou"]):
+                best = match
+    return best
+
+
+def _match_confirmed(match: dict | None) -> bool:
+    return bool(match and float(match.get("conf") or 0.0) >= _CONFIRM_MIN_CONF)
+
+
+def _box_iou(a: dict, b: dict) -> float:
+    ix1 = max(float(a["x1"]), float(b["x1"]))
+    iy1 = max(float(a["y1"]), float(b["y1"]))
+    ix2 = min(float(a["x2"]), float(b["x2"]))
+    iy2 = min(float(a["y2"]), float(b["y2"]))
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    intersection = iw * ih
+    union = _box_area(a) + _box_area(b) - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _box_area(box: dict) -> float:
+    return max(0.0, float(box["x2"]) - float(box["x1"])) * \
+        max(0.0, float(box["y2"]) - float(box["y1"]))
+
+
+def _center_distance(a: dict, b: dict) -> float:
+    acx = (float(a["x1"]) + float(a["x2"])) / 2
+    acy = (float(a["y1"]) + float(a["y2"])) / 2
+    bcx = (float(b["x1"]) + float(b["x2"])) / 2
+    bcy = (float(b["y1"]) + float(b["y2"])) / 2
+    return ((acx - bcx) ** 2 + (acy - bcy) ** 2) ** 0.5
+
+
+def _response_box(box: dict | None) -> dict | None:
+    if not box:
+        return None
+    keys = ("x1", "y1", "x2", "y2", "conf", "iou", "center_distance")
+    return {k: round(float(box[k]), 6) for k in keys if k in box}
+
+
 # ── HLS real-time tag loop ──────────────────────────────────────────────────────
 
-def _hls_tag_loop(model, video_db, video_dir: Path, stop_event: threading.Event):
+def _hls_tag_loop(model, video_db, video_dir: Path, stop_event: threading.Event, predict_lock):
     """Tag incoming HLS .ts segments in near-real-time (<5s latency)."""
     import cv2
     from .video import _parse_results, _CCTV_CLASS_IDS, _CONF_THRESHOLD
@@ -219,10 +559,11 @@ def _hls_tag_loop(model, video_db, video_dir: Path, stop_event: threading.Event)
 
                     for sample_abs_ts, frame in frame_samples:
                         try:
-                            results = model.predict(
-                                frame, classes=_CCTV_CLASS_IDS,
-                                conf=_CONF_THRESHOLD, verbose=False,
-                            )
+                            with predict_lock:
+                                results = model.predict(
+                                    frame, classes=_CCTV_CLASS_IDS,
+                                    conf=_CONF_THRESHOLD, verbose=False,
+                                )
                             _, _, boxes = _parse_results(results)
                             if not boxes:
                                 continue
@@ -257,7 +598,7 @@ def _hls_tag_loop(model, video_db, video_dir: Path, stop_event: threading.Event)
 
 # ── Backfill loop ──────────────────────────────────────────────────────────────
 
-def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event):
+def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event, predict_lock):
     from .video import _yolo_tag_video, extract_events
 
     LOG.info("backfill loop started")
@@ -291,7 +632,9 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                 )
                 if hls_evts:
                     if seg_path.exists():
-                        n = _yolo_tag_video(model, seg_path, seg["id"], video_db)
+                        n = _yolo_tag_video(
+                            model, seg_path, seg["id"], video_db, predict_lock
+                        )
                         LOG.info("HLS events + MP4 YOLO (%d frames): %s",
                                  n, seg["path"][-35:])
                         if n == 0:
@@ -308,7 +651,9 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                     continue
 
                 if seg_path.exists():
-                    n = _yolo_tag_video(model, seg_path, seg["id"], video_db)
+                    n = _yolo_tag_video(
+                        model, seg_path, seg["id"], video_db, predict_lock
+                    )
                     LOG.info("tagged %d frames: %s", n, seg["path"][-35:])
                     if n == 0:
                         video_db.replace_detections(seg["id"], _sentinel)
@@ -420,6 +765,7 @@ def run(video_db_path: Path, video_dir: Path):
             return
         LOG.info("DB integrity check passed")
     stop_event = threading.Event()
+    predict_lock = threading.Lock()
 
     def _shutdown(sig, frame):
         LOG.info("shutting down")
@@ -430,14 +776,14 @@ def run(video_db_path: Path, video_dir: Path):
 
     backfill_thread = threading.Thread(
         target=_backfill_loop,
-        args=(model, video_db, video_dir, stop_event),
+        args=(model, video_db, video_dir, stop_event, predict_lock),
         daemon=True, name="backfill"
     )
     backfill_thread.start()
 
     hls_tag_thread = threading.Thread(
         target=_hls_tag_loop,
-        args=(model, video_db, video_dir, stop_event),
+        args=(model, video_db, video_dir, stop_event, predict_lock),
         daemon=True, name="hls-tag"
     )
     hls_tag_thread.start()
@@ -449,7 +795,7 @@ def run(video_db_path: Path, video_dir: Path):
     )
     cleanup_thread.start()
 
-    srv = YoloSocketServer(SOCKET_PATH, model, video_db, video_dir)
+    srv = YoloSocketServer(SOCKET_PATH, model, video_db, video_dir, predict_lock)
     srv._backfill_thread = backfill_thread
     srv.socket.settimeout(1.0)
     LOG.info("YOLO server listening on %s", SOCKET_PATH)

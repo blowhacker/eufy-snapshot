@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import socket
 import shutil
 import signal
 import sqlite3
@@ -38,6 +39,9 @@ _OBJECT_TRACK_LOOKBACK_SECONDS = 2 * 60 * 60.0
 _CLASS_PRIORITY      = ["person", "bird", "cat", "dog",
                          "bus", "truck", "motorcycle", "bicycle", "car",
                          "backpack", "suitcase"]
+_NOTIFICATION_CONFIRMATION_STRATEGY = "yolo1280-crop640-960-v1"
+_NOTIFICATION_CONFIRMATION_RETRY_SECONDS = 30.0
+_NOTIFICATION_CONFIRMATION_TIMEOUT_SECONDS = 8.0
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS segments (
@@ -192,6 +196,26 @@ CREATE INDEX IF NOT EXISTS nevt_unread
     ON notification_events(read_at, dismissed_at, created_at);
 CREATE INDEX IF NOT EXISTS nevt_rule_ts
     ON notification_events(rule_id, event_ts);
+
+CREATE TABLE IF NOT EXISTS notification_confirmations (
+    id               INTEGER PRIMARY KEY,
+    strategy_version TEXT    NOT NULL,
+    event_ref        TEXT    NOT NULL,
+    source_id        TEXT    NOT NULL,
+    event_ts         REAL    NOT NULL,
+    class            TEXT    NOT NULL,
+    status           TEXT    NOT NULL,
+    confirmed        INTEGER NOT NULL DEFAULT 0,
+    confidence       REAL    NOT NULL DEFAULT 0,
+    reason           TEXT,
+    boxes_json       TEXT,
+    metadata_json    TEXT    NOT NULL DEFAULT '{}',
+    created_at       REAL    NOT NULL DEFAULT (unixepoch('now')),
+    updated_at       REAL    NOT NULL DEFAULT (unixepoch('now')),
+    UNIQUE(strategy_version, event_ref)
+);
+CREATE INDEX IF NOT EXISTS nconf_status_updated
+    ON notification_confirmations(status, updated_at);
 
 -- Real-time detections from HLS .ts segments, pending MP4 backfill.
 -- Rows here make events appear in the UI within seconds of detection.
@@ -488,14 +512,16 @@ class VideoSegmentDB:
         lookback_seconds: float = 24 * 60 * 60,
         limit_per_rule: int = 300,
     ) -> int:
-        now = time.time()
         inserted = 0
         with self._connect() as conn:
             rules = conn.execute(
                 "SELECT * FROM notification_rules WHERE enabled=1 ORDER BY id"
             ).fetchall()
-            for rule_row in rules:
-                rule = _notification_rule_from_row(rule_row)
+
+        for rule_row in rules:
+            rule = _notification_rule_from_row(rule_row)
+            now = time.time()
+            with self._connect() as conn:
                 last_row = conn.execute(
                     "SELECT MAX(event_ts) FROM notification_events WHERE rule_id=?",
                     (rule["id"],),
@@ -511,15 +537,30 @@ class VideoSegmentDB:
                 candidates = _notification_candidate_events(
                     conn, rule, since, now, limit_per_rule
                 )
-                if not candidates:
+
+            if not candidates:
+                continue
+
+            cooldown = max(0, int(rule["cooldown_seconds"]))
+            cursor_ts = last_sent
+            for event in sorted(candidates, key=lambda e: e["abs_ts"]):
+                event_ts = float(event["abs_ts"])
+                if cursor_ts is not None and event_ts < cursor_ts + cooldown:
                     continue
-                cooldown = max(0, int(rule["cooldown_seconds"]))
-                cursor_ts = last_sent
-                for event in sorted(candidates, key=lambda e: e["abs_ts"]):
-                    event_ts = float(event["abs_ts"])
-                    if cursor_ts is not None and event_ts < cursor_ts + cooldown:
-                        continue
-                    row = _build_notification_event(conn, rule, event, now)
+
+                event_ref = _notification_event_ref(event)
+                confirmation = self._ensure_notification_confirmation(event, event_ref)
+                if not confirmation.get("confirmed"):
+                    continue
+
+                event_with_confirmation = {
+                    **event,
+                    "_confirmation": confirmation,
+                }
+                with self._connect() as conn:
+                    row = _build_notification_event(
+                        conn, rule, event_with_confirmation, time.time()
+                    )
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO notification_events"
                         " (rule_id, rule_name, source_id, zone_ref, event_ref,"
@@ -530,10 +571,88 @@ class VideoSegmentDB:
                         " :thumb_jpeg,:target_url,:created_at,:metadata_json)",
                         row,
                     )
-                    cursor_ts = event_ts
-                    if cur.rowcount:
-                        inserted += 1
+                cursor_ts = event_ts
+                if cur.rowcount:
+                    inserted += 1
         return inserted
+
+    def _ensure_notification_confirmation(self, event: dict, event_ref: str) -> dict:
+        if not _notification_confirmation_enabled():
+            return {
+                "status": "confirmed",
+                "confirmed": True,
+                "confidence": float(event.get("confidence") or 0.0),
+                "reason": "confirmation_disabled",
+                "strategy_version": _NOTIFICATION_CONFIRMATION_STRATEGY,
+                "metadata": {},
+            }
+
+        now = time.time()
+        cached = self._get_notification_confirmation(event_ref)
+        if cached:
+            status = str(cached.get("status") or "")
+            age = now - float(cached.get("updated_at") or 0.0)
+            if status in {"confirmed", "rejected"}:
+                return cached
+            if age < _NOTIFICATION_CONFIRMATION_RETRY_SECONDS:
+                return cached
+
+        result = _confirm_notification_with_yolo(event, event_ref)
+        self._save_notification_confirmation(event, event_ref, result)
+        return result
+
+    def _get_notification_confirmation(self, event_ref: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM notification_confirmations"
+                " WHERE strategy_version=? AND event_ref=?",
+                (_NOTIFICATION_CONFIRMATION_STRATEGY, event_ref),
+            ).fetchone()
+        return _notification_confirmation_from_row(row)
+
+    def _save_notification_confirmation(
+        self,
+        event: dict,
+        event_ref: str,
+        result: dict,
+    ) -> None:
+        now = time.time()
+        metadata = result.get("metadata") or {}
+        boxes = result.get("boxes") or []
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO notification_confirmations"
+                " (strategy_version, event_ref, source_id, event_ts, class,"
+                " status, confirmed, confidence, reason, boxes_json,"
+                " metadata_json, created_at, updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(strategy_version, event_ref) DO UPDATE SET"
+                " source_id=excluded.source_id,"
+                " event_ts=excluded.event_ts,"
+                " class=excluded.class,"
+                " status=excluded.status,"
+                " confirmed=excluded.confirmed,"
+                " confidence=excluded.confidence,"
+                " reason=excluded.reason,"
+                " boxes_json=excluded.boxes_json,"
+                " metadata_json=excluded.metadata_json,"
+                " updated_at=excluded.updated_at",
+                (
+                    _NOTIFICATION_CONFIRMATION_STRATEGY,
+                    event_ref,
+                    str(event.get("source_id") or ""),
+                    float(event.get("abs_ts") or 0.0),
+                    str(event.get("class") or ""),
+                    str(result.get("status") or "error"),
+                    1 if result.get("confirmed") else 0,
+                    float(result.get("confidence") or 0.0),
+                    str(result.get("reason") or ""),
+                    json.dumps(boxes, separators=(",", ":")),
+                    json.dumps(metadata, separators=(",", ":")),
+                    now,
+                    now,
+                ),
+            )
 
     def list_notifications(
         self,
@@ -1457,8 +1576,13 @@ def _parse_results(results) -> tuple:
     return has_human, top_conf, boxes
 
 
-def _yolo_tag_video(model, seg_path: Path, seg_id: int,
-                    db: VideoSegmentDB) -> int:
+def _yolo_tag_video(
+    model,
+    seg_path: Path,
+    seg_id: int,
+    db: VideoSegmentDB,
+    predict_lock=None,
+) -> int:
     """Read video file at 1fps, run YOLO, store detections with exact timestamps."""
     import cv2
 
@@ -1479,8 +1603,17 @@ def _yolo_tag_video(model, seg_path: Path, seg_id: int,
             ts_ms  = cap.get(cv2.CAP_PROP_POS_MSEC)
             ts_off = ts_ms / 1000.0
             try:
-                results = model.predict(frame, classes=_CCTV_CLASS_IDS,
-                                        conf=_CONF_THRESHOLD, verbose=False)
+                if predict_lock is None:
+                    results = model.predict(
+                        frame, classes=_CCTV_CLASS_IDS,
+                        conf=_CONF_THRESHOLD, verbose=False,
+                    )
+                else:
+                    with predict_lock:
+                        results = model.predict(
+                            frame, classes=_CCTV_CLASS_IDS,
+                            conf=_CONF_THRESHOLD, verbose=False,
+                        )
                 has_human, conf, boxes = _parse_results(results)
                 classes = list({b["cls"] for b in boxes}) if boxes else []
                 detections.append({
@@ -1993,6 +2126,137 @@ def _notification_event_from_row(row: sqlite3.Row | None) -> dict:
     }
 
 
+def _notification_confirmation_enabled() -> bool:
+    raw = os.environ.get("NOTIFICATION_CONFIRM_YOLO", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _notification_confirmation_from_row(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    try:
+        metadata = json.loads(row["metadata_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        metadata = {}
+    try:
+        boxes = json.loads(row["boxes_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        boxes = []
+    return {
+        "status": row["status"],
+        "confirmed": bool(row["confirmed"]),
+        "confidence": float(row["confidence"] or 0.0),
+        "reason": row["reason"] or "",
+        "strategy_version": row["strategy_version"],
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "boxes": boxes if isinstance(boxes, list) else [],
+        "updated_at": float(row["updated_at"] or 0.0),
+    }
+
+
+def _confirm_notification_with_yolo(event: dict, event_ref: str) -> dict:
+    req = {
+        "type": "confirm_notification_event",
+        "strategy_version": _NOTIFICATION_CONFIRMATION_STRATEGY,
+        "event_ref": event_ref,
+        "source_id": str(event.get("source_id") or ""),
+        "abs_ts": float(event.get("abs_ts") or 0.0),
+        "class": str(event.get("class") or ""),
+        "boxes_json": event.get("boxes_json") or "[]",
+        "event_kind": event.get("_kind", "event"),
+    }
+    try:
+        resp = _yolo_socket_request(req, _NOTIFICATION_CONFIRMATION_TIMEOUT_SECONDS)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "confirmed": False,
+            "confidence": 0.0,
+            "reason": f"yolo_socket_error:{type(exc).__name__}",
+            "strategy_version": _NOTIFICATION_CONFIRMATION_STRATEGY,
+            "metadata": {"error": str(exc)[:200]},
+            "boxes": [],
+        }
+    if resp.get("status") != "ok":
+        return {
+            "status": "error",
+            "confirmed": False,
+            "confidence": 0.0,
+            "reason": str(resp.get("error") or "yolo_error")[:160],
+            "strategy_version": _NOTIFICATION_CONFIRMATION_STRATEGY,
+            "metadata": {"response": resp},
+            "boxes": [],
+        }
+    confirmed = bool(resp.get("confirmed"))
+    reason = str(resp.get("reason") or "")
+    if not confirmed and reason == "frame_unavailable":
+        return {
+            "status": "error",
+            "confirmed": False,
+            "confidence": 0.0,
+            "reason": reason,
+            "strategy_version": str(
+                resp.get("strategy_version") or _NOTIFICATION_CONFIRMATION_STRATEGY
+            ),
+            "metadata": _compact_confirmation_metadata(resp),
+            "boxes": [],
+        }
+    return {
+        "status": "confirmed" if confirmed else "rejected",
+        "confirmed": confirmed,
+        "confidence": float(resp.get("confidence") or 0.0),
+        "reason": reason,
+        "strategy_version": str(
+            resp.get("strategy_version") or _NOTIFICATION_CONFIRMATION_STRATEGY
+        ),
+        "metadata": _compact_confirmation_metadata(resp),
+        "boxes": [resp["box"]] if isinstance(resp.get("box"), dict) else [],
+    }
+
+
+def _compact_confirmation_metadata(resp: dict) -> dict:
+    metadata: dict = {
+        "strategy": str(resp.get("strategy_version") or _NOTIFICATION_CONFIRMATION_STRATEGY),
+        "reason": str(resp.get("reason") or ""),
+        "frame_source": resp.get("frame_source"),
+        "full_confidence": _safe_round(resp.get("full_confidence")),
+        "crop_confidence": _safe_round(resp.get("crop_confidence")),
+    }
+    timings = resp.get("timings_ms")
+    if isinstance(timings, dict):
+        metadata["timings_ms"] = {
+            str(k): _safe_round(v, digits=1) for k, v in timings.items()
+        }
+    return {k: v for k, v in metadata.items() if v is not None and v != ""}
+
+
+def _safe_round(value, *, digits: int = 3):
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _yolo_socket_request(req: dict, timeout: float) -> dict:
+    sock_path = os.environ.get("YOLO_SOCKET", "/tmp/yolo.sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(max(0.1, float(timeout)))
+        s.connect(sock_path)
+        s.sendall((json.dumps(req, separators=(",", ":")) + "\n").encode())
+        chunks: list[bytes] = []
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"\n" in chunk:
+                break
+    raw = b"".join(chunks).split(b"\n", 1)[0]
+    if not raw:
+        raise RuntimeError("empty yolo response")
+    return json.loads(raw.decode())
+
+
 def _notification_candidate_events(
     conn: sqlite3.Connection,
     rule: dict,
@@ -2170,6 +2434,15 @@ def _build_notification_event(
         "zone_param": zone_param,
         "event_kind": event.get("_kind", "event"),
     }
+    confirmation = event.get("_confirmation")
+    if isinstance(confirmation, dict):
+        metadata["confirmation"] = {
+            "status": confirmation.get("status"),
+            "strategy": confirmation.get("strategy_version"),
+            "confidence": _safe_round(confirmation.get("confidence")),
+            "reason": confirmation.get("reason"),
+            **(confirmation.get("metadata") or {}),
+        }
     return {
         "rule_id": rule["id"],
         "rule_name": rule["name"],
