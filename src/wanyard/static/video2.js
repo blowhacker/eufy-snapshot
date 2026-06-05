@@ -1007,6 +1007,12 @@ const st = {
   unreadNotifications: 0,
 };
 const EVENTS_BUFFER = 3 * 3600;   // load 3h extra on each side of visible window
+const NOTIFICATION_POLL_MS = 1000;
+let notificationPollTimer = null;
+let notificationPollInFlight = false;
+let notificationPollNeedsRefresh = false;
+let notificationPollSeq = 0;
+let notificationPollStarted = false;
 
 function selectedZoneParam() {
   return st.activeZoneId == null ? ZONE_NONE : String(st.activeZoneId);
@@ -1540,23 +1546,65 @@ function setNotificationsOpen(open) {
   if (el.notifyPanel) el.notifyPanel.hidden = !next;
   el.notifyToggle?.setAttribute("aria-expanded", next ? "true" : "false");
   el.notifyToggle?.setAttribute("aria-label", next ? "Close notifications" : "Open notifications");
-  if (next) loadNotifications();
+  if (next) requestNotificationRefresh();
 }
 
-async function loadNotifications() {
+function scheduleNotificationPoll(delay = NOTIFICATION_POLL_MS) {
+  if (notificationPollTimer != null) {
+    if (delay > 0) return;
+    window.clearTimeout(notificationPollTimer);
+  }
+  notificationPollTimer = window.setTimeout(() => {
+    notificationPollTimer = null;
+    pollNotifications();
+  }, Math.max(0, delay));
+}
+
+function requestNotificationRefresh() {
+  notificationPollNeedsRefresh = true;
+  if (notificationPollInFlight) return;
+  scheduleNotificationPoll(0);
+}
+
+function startNotificationPolling() {
+  if (notificationPollStarted) return;
+  notificationPollStarted = true;
+  requestNotificationRefresh();
+}
+
+async function pollNotifications() {
+  if (notificationPollInFlight) {
+    notificationPollNeedsRefresh = true;
+    return;
+  }
+  notificationPollInFlight = true;
+  notificationPollNeedsRefresh = false;
+  const seq = ++notificationPollSeq;
+  try {
+    if (st.notificationsOpen) await loadNotifications(seq);
+    else await refreshNotificationCount(seq);
+  } finally {
+    notificationPollInFlight = false;
+    scheduleNotificationPoll(notificationPollNeedsRefresh ? 0 : NOTIFICATION_POLL_MS);
+  }
+}
+
+async function loadNotifications(seq = ++notificationPollSeq) {
   const r = await fetch("/api/notifications?limit=20", { cache:"no-store" }).catch(() => null);
   if (!r?.ok) return;
   const data = await r.json().catch(() => ({}));
+  if (seq !== notificationPollSeq) return;
   st.notifications = data.notifications || [];
   st.unreadNotifications = data.unread_count || 0;
   updateNotificationBadge();
   renderNotifications();
 }
 
-async function refreshNotificationCount() {
+async function refreshNotificationCount(seq = ++notificationPollSeq) {
   const r = await fetch("/api/notifications/unread-count", { cache:"no-store" }).catch(() => null);
   if (!r?.ok) return;
   const data = await r.json().catch(() => ({}));
+  if (seq !== notificationPollSeq) return;
   st.unreadNotifications = data.unread_count || 0;
   updateNotificationBadge();
 }
@@ -1644,10 +1692,12 @@ async function openNotification(notification) {
 async function markAllNotificationsRead() {
   const r = await fetch("/api/notifications/read-all", { method:"POST" }).catch(() => null);
   if (!r?.ok) return;
+  notificationPollSeq += 1;
   st.notifications = st.notifications.map(n => ({ ...n, read: true, read_at: n.read_at || Date.now() / 1000 }));
   st.unreadNotifications = 0;
   updateNotificationBadge();
   renderNotifications();
+  requestNotificationRefresh();
 }
 
 function eventSeekTs(evt) {
@@ -3946,11 +3996,7 @@ async function init() {
   const r = await fetch("/api/sources", { cache:"no-store" });
   if (r.ok) st.sources = (await r.json()).sources || [];
   await fetchSourceStatus();
-  refreshNotificationCount();
-  setInterval(() => {
-    if (st.notificationsOpen) loadNotifications();
-    else refreshNotificationCount();
-  }, 15000);
+  startNotificationPolling();
   if (!V2_SPEEDS[st.speed]) st.speed = 1;
   buildSpeedPills();
   player.setRate(selectedPlaybackRate());
