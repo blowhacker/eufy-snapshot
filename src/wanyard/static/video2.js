@@ -875,6 +875,8 @@ const LIVE_DVR_TOLERANCE_SECONDS = 1.5;
 const LIVE_DVR_EDGE_PAD_SECONDS = 0.25;
 const LIVE_TIMELINE_FUTURE_PAD_SECONDS = 600;
 const LIVE_EDGE_RATE_RESET_SECONDS = 4;
+const ABSOLUTE_SEEK_RETRIES = 6;
+const ABSOLUTE_SEEK_RETRY_MS = 750;
 const ZONE_ALL = "all";
 const ZONE_NONE = "none";
 const CLIP_DEFAULT_BEFORE = 30;
@@ -1013,6 +1015,7 @@ let notificationPollInFlight = false;
 let notificationPollNeedsRefresh = false;
 let notificationPollSeq = 0;
 let notificationPollStarted = false;
+let absoluteSeekSeq = 0;
 
 function selectedZoneParam() {
   return st.activeZoneId == null ? ZONE_NONE : String(st.activeZoneId);
@@ -1686,6 +1689,26 @@ async function openNotification(notification) {
     fetch(`/api/notifications/${notification.id}/read`, { method:"POST" }).catch(() => {});
   }
   const target = notification.target_url || "/";
+  const url = new URL(target, location.href);
+  if (url.origin === location.origin && url.pathname === location.pathname) {
+    const { ts, live } = applyQueryState(url.searchParams);
+    st.initDone = true;
+    renderSrcCtrl();
+    renderClsCtrl();
+    renderNearScope();
+    setNotificationsOpen(false);
+    if (ts != null) centerWindowOn(ts);
+    if (live && ts == null) {
+      load();
+      startLiveTail(st.source !== "all" ? st.source : null);
+      return;
+    }
+    if (ts != null) {
+      load();
+      await seekToTimestamp(st.source !== "all" ? st.source : null, ts, { scroll: true });
+      return;
+    }
+  }
   location.assign(target);
 }
 
@@ -1700,20 +1723,39 @@ async function markAllNotificationsRead() {
   requestNotificationRefresh();
 }
 
-function eventSeekTs(evt) {
-  const seg = recordedSegmentForEvent(evt);
-  const start = seg?.start_ts ?? evt.seg_start_ts ?? evt.abs_ts;
-  return Math.max(start, evt.abs_ts - 1);
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizedSourceId(sourceId) {
+  return sourceId && sourceId !== "all" ? sourceId : null;
+}
+
+function segmentCoversTimestamp(seg, sourceId, ts) {
+  const srcId = normalizedSourceId(sourceId);
+  return Boolean(
+    seg &&
+    Number.isFinite(ts) &&
+    seg.end_ts != null &&
+    (!srcId || seg.source_id === srcId) &&
+    Number(seg.start_ts) <= ts &&
+    Number(seg.end_ts) > ts
+  );
 }
 
 function segmentCoversEvent(seg, evt) {
-  return Boolean(
-    seg && evt &&
-    seg.end_ts != null &&
-    seg.source_id === evt.source_id &&
-    seg.start_ts <= evt.abs_ts &&
-    seg.end_ts >= evt.abs_ts
-  );
+  return Boolean(evt && segmentCoversTimestamp(seg, evt.source_id, evt.abs_ts));
+}
+
+function clampTimestampToSegment(ts, seg) {
+  const start = Number(seg.start_ts);
+  const end = Number(seg.end_ts);
+  const maxTs = Number.isFinite(end) ? Math.max(start, end - 0.5) : ts;
+  return Math.max(start, Math.min(maxTs, ts));
+}
+
+function recordedSegmentForTimestamp(sourceId, ts) {
+  return st.segments.find(s => segmentCoversTimestamp(s, sourceId, ts)) || null;
 }
 
 function recordedSegmentForEvent(evt) {
@@ -1725,48 +1767,89 @@ function recordedSegmentForEvent(evt) {
   return st.segments.find(s => segmentCoversEvent(s, evt)) || null;
 }
 
-async function fetchRecordedSegmentForEvent(evt) {
-  if (!evt?.source_id || !Number.isFinite(evt.abs_ts)) return null;
+async function fetchRecordedSegmentForTimestamp(sourceId, ts) {
+  if (!Number.isFinite(ts)) return null;
   const p = new URLSearchParams({
-    source: evt.source_id,
-    ts: String(evt.abs_ts),
+    ts: String(ts),
+    exact: "1",
   });
+  const srcId = normalizedSourceId(sourceId);
+  if (srcId) p.set("source", srcId);
   const r = await fetch(`/api/video/segment-at?${p}`, { cache: "no-store" }).catch(() => null);
   if (!r?.ok) return null;
   const { segment } = await r.json().catch(() => ({}));
-  if (!segmentCoversEvent(segment, evt)) return null;
+  if (!segmentCoversTimestamp(segment, srcId, ts)) return null;
   mergeSegments([segment]);
   timeline.setData(allSegsForSrc(), filteredEvts());
   return segment;
 }
 
+async function seekLiveTimestamp(sourceId, lookupTs, desiredTs) {
+  const chosen = chooseLiveSource(sourceId);
+  if (!chosen) return false;
+  const win = await fetchLiveWindow(chosen);
+  if (!liveWindowContains(win, lookupTs)) return false;
+  const liveTs = liveWindowContains(win, desiredTs) ? desiredTs : lookupTs;
+  return seekLiveTail(chosen, liveTs);
+}
+
+async function seekToTimestamp(sourceId, ts, options = {}) {
+  const desiredTs = Number(ts);
+  const lookupTs = Number.isFinite(options.lookupTs) ? Number(options.lookupTs) : desiredTs;
+  if (!Number.isFinite(desiredTs) || !Number.isFinite(lookupTs)) return false;
+
+  const srcId = normalizedSourceId(sourceId);
+  const scrollTs = Number.isFinite(options.scrollTs) ? Number(options.scrollTs) : desiredTs;
+  const retries = Number.isFinite(options.retries) ? Math.max(0, Math.floor(options.retries)) : ABSOLUTE_SEEK_RETRIES;
+  const retryMs = Number.isFinite(options.retryMs) ? Math.max(0, Number(options.retryMs)) : ABSOLUTE_SEEK_RETRY_MS;
+  const updateHistory = options.updateHistory !== false;
+  const autoplay = options.autoplay !== false;
+  const seq = ++absoluteSeekSeq;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (seq !== absoluteSeekSeq) return false;
+
+    let recorded = recordedSegmentForTimestamp(srcId, lookupTs);
+    if (!recorded) {
+      setStatus("BUFFERING");
+      recorded = await fetchRecordedSegmentForTimestamp(srcId, lookupTs);
+    }
+    if (seq !== absoluteSeekSeq) return false;
+
+    if (recorded) {
+      const seekTs = clampTimestampToSegment(desiredTs, recorded);
+      stopLiveTail(false);
+      mode.seekTo(seekTs, recorded.source_id, null, { autoplay });
+      setStatus("REPLAY");
+      if (updateHistory) pushState();
+      if (options.scroll) scrollTimelineToTs(scrollTs);
+      el.empty.style.display = "none";
+      el.video.style.display = "block";
+      return true;
+    }
+
+    const liveOk = await seekLiveTimestamp(srcId, lookupTs, desiredTs);
+    if (seq !== absoluteSeekSeq) return false;
+    if (liveOk) {
+      if (options.scroll) scrollTimelineToTs(scrollTs);
+      return true;
+    }
+
+    if (attempt < retries) await sleep(retryMs);
+  }
+
+  setStatus("NONE");
+  return false;
+}
+
 async function seekToEvent(evt, { scroll = true } = {}) {
   if (!evt) return false;
-  let recorded = recordedSegmentForEvent(evt);
-  if (!recorded) {
-    setStatus("BUFFERING");
-    recorded = await fetchRecordedSegmentForEvent(evt);
-  }
-  if (recorded) {
-    stopLiveTail(false);
-    mode.seekTo(eventSeekTs(evt), evt.source_id);
-    pushState();
-    if (scroll) scrollTimelineToTs(evt.abs_ts);
-    el.empty.style.display = "none";
-    el.video.style.display = "block";
-    return true;
-  }
-  if (!evt.provisional) {
-    setStatus("NONE");
-    return false;
-  }
-  const ok = await seekLiveTail(evt.source_id, evt.abs_ts);
-  if (!ok) {
-    setStatus("NONE");
-    return false;
-  }
-  if (scroll) scrollTimelineToTs(evt.abs_ts);
-  return ok;
+  const desiredTs = evt.abs_ts - 1;
+  return seekToTimestamp(evt.source_id, desiredTs, {
+    lookupTs: evt.abs_ts,
+    scroll,
+    scrollTs: evt.abs_ts,
+  });
 }
 
 function isEventActive(evt, ts) {
@@ -2555,23 +2638,8 @@ el.tlCanvas.addEventListener("click", e => {
       await seekToEvent(hit.snapEvent, { scroll: false });
       return;
     } else {
-      const nowTs = Date.now() / 1000;
-      const srcSegs = st.segments.filter(s => s.source_id === hit.srcId && s.end_ts != null);
-      const latestEnd = srcSegs.length ? Math.max(...srcSegs.map(s => s.end_ts)) : 0;
-      const openSegs = st.segments.filter(s => s.source_id === hit.srcId && s.end_ts == null);
-      const openStart = openSegs.length ? Math.max(...openSegs.map(s => s.start_ts)) : 0;
-      const liveGapStart = latestEnd || openStart;
-      if (liveGapStart > 0 && liveGapStart > nowTs - LIVE_OPEN_MAX_AGE && hit.ts >= liveGapStart) {
-        const targetTs = Math.min(hit.ts, nowTs);
-        const ok = await seekLiveTail(hit.srcId, targetTs);
-        if (!ok) startLiveTail(hit.srcId);
-        return;
-      }
-      stopLiveTail(false);
-      mode.seekTo(hit.ts, hit.srcId); pushState();
+      await seekToTimestamp(hit.srcId, Math.min(hit.ts, Date.now() / 1000));
     }
-    el.empty.style.display = "none";
-    el.video.style.display = "block";
   }, 220);
 });
 
@@ -2825,6 +2893,9 @@ function loadHlsJs() {
 function replaceLiveHistory(srcId, ts = null) {
   const p = new URLSearchParams({ source: srcId, live: "1" });
   if (ts != null) p.set("ts", String(Math.floor(ts)));
+  if (st.cls.size > 0) p.set("cls", [...st.cls].join(","));
+  if (st.xls.size > 0) p.set("xcls", [...st.xls].join(","));
+  p.set("zone", selectedZoneParam());
   history.replaceState(null, "", `${location.pathname}?${p}`);
 }
 
@@ -3972,11 +4043,13 @@ function pushState() {
   history.replaceState(null, "", `${location.pathname}${p.size ? "?" + p : ""}`);
 }
 
-function readState() {
-  const p = new URLSearchParams(location.search);
-  if (p.has("source")) st.source = p.get("source");
+function applyQueryState(p) {
+  st.source = p.has("source") ? p.get("source") : "all";
+  st.cls.clear();
+  st.xls.clear();
   if (p.has("cls"))  p.get("cls").split(",").filter(Boolean).forEach(c => st.cls.add(c));
   if (p.has("xcls")) p.get("xcls").split(",").filter(Boolean).forEach(c => st.xls.add(c));
+  st.activeZoneId = null;
   if (p.has("zone")) {
     const z = p.get("zone");
     if (z === ZONE_ALL) {
@@ -3989,6 +4062,10 @@ function readState() {
     }
   }
   return { ts: p.has("ts") ? parseFloat(p.get("ts")) : null, live: p.get("live") === "1" };
+}
+
+function readState() {
+  return applyQueryState(new URLSearchParams(location.search));
 }
 
 // ── Boot ──────────────────────────────────────────────
@@ -4011,22 +4088,13 @@ async function init() {
   st.window.to   = anchor + 3 * 3600 + LIVE_TIMELINE_FUTURE_PAD_SECONDS;
   setTimelineWindow(st.window.from, st.window.to);
 
-  if (urlLive) {
-    // Direct live URL: load data in background, immediately enter live
+  if (urlLive && urlTs == null) {
+    // Direct live URL without a timestamp: load data in background, immediately enter live.
     load();
-    startLiveTail(st.source !== "all" ? st.source : null, urlTs != null ? { seekTs: urlTs } : {});
+    startLiveTail(st.source !== "all" ? st.source : null);
   } else if (urlTs) {
-    // Fast path: start video immediately, load timeline in background
-    const srcParam = st.source !== "all" ? `&source=${encodeURIComponent(st.source)}` : "";
-    fetch(`/api/video/segment-at?ts=${urlTs}${srcParam}`, { cache:"no-store" })
-      .then(r => r.json())
-      .then(({ segment }) => {
-        if (!segment) return;
-        player.setSegments([segment]);
-        el.empty.style.display = "none";
-        el.video.style.display = "block";
-        mode.seekTo(urlTs, segment.source_id);
-      });
+    // Fast path: land on the absolute timestamp while timeline data loads.
+    seekToTimestamp(st.source !== "all" ? st.source : null, urlTs, { scroll: false });
     load();
   } else {
     await load();

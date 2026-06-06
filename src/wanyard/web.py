@@ -421,6 +421,7 @@ def make_app(
         except (KeyError, ValueError):
             return JSONResponse({"error": "ts required"}, status_code=400)
         source_id = request.query_params.get("source") or None
+        exact = request.query_params.get("exact", "").lower() in {"1", "true", "yes"}
         with video_db._connect() as conn:
             where = "start_ts <= ? AND end_ts > ? AND end_ts IS NOT NULL"
             params = [ts, ts]
@@ -431,7 +432,7 @@ def make_app(
                 f"SELECT * FROM segments WHERE {where} ORDER BY start_ts DESC LIMIT 1",
                 params
             ).fetchone()
-            if not row:
+            if not row and not exact:
                 # Nearest closed segment before ts
                 where2 = "end_ts IS NOT NULL AND end_ts <= ?"
                 params2 = [ts]
