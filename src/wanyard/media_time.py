@@ -268,22 +268,24 @@ def resolve(conn: sqlite3.Connection, video_dir: Path,
 class RoundTrip:
     ok: bool
     detection_id: int
+    status: str               # ok | sentinel | no_anchor | gap | world_mismatch | no_detection
+    world_delta: float | None  # |resolved world - detection world|, the real invariant
     expected_offset: float
     resolved_offset: float | None
     provider: str
-    reason: str
-
-    @property
-    def delta(self) -> float | None:
-        if self.resolved_offset is None:
-            return None
-        return abs(self.resolved_offset - self.expected_offset)
+    alternate: bool           # resolved a valid but different segment (boundary duplicate)
 
 
 def check_detection_round_trip(conn: sqlite3.Connection, video_dir: Path,
                                detection_id: int) -> RoundTrip:
-    """Invariant: resolve(media->world(asset, media_offset)) lands back on the
-    same asset+offset within EPS. Used in shadow mode / tests, no side effects.
+    """Invariant: resolve(media->world(detection)) lands on a usable asset whose
+    world time equals the detection's world time, within EPS.
+
+    The invariant is on WORLD time, not offset equality: at contiguous segment
+    boundaries the same wall instant exists in two files, so resolving to the
+    adjacent segment (different offset) is correct. Sentinel rows (ts_offset<0,
+    the "processed, nothing found" marker) and NULL media_epoch are reported as
+    their own status, not resolver faults. No side effects.
     """
     row = conn.execute(
         "SELECT vd.id AS id, vd.ts_offset AS media_offset,"
@@ -293,18 +295,26 @@ def check_detection_round_trip(conn: sqlite3.Connection, video_dir: Path,
         (detection_id,),
     ).fetchone()
     if not row:
-        return RoundTrip(False, detection_id, 0.0, None, "none", "no_detection")
+        return RoundTrip(False, detection_id, "no_detection", None,
+                         0.0, None, "none", False)
 
-    media_epoch = row["media_epoch"]
     expected = float(row["media_offset"])
-    if media_epoch is None:
-        # Honest unknown: there is no world coordinate to round-trip from.
-        return RoundTrip(False, detection_id, expected, None, "none", "no_anchor")
+    if expected < 0:  # sentinel marker, not a real frame
+        return RoundTrip(True, detection_id, "sentinel", None,
+                         expected, None, "none", False)
+    media_epoch = row["media_epoch"]
+    if media_epoch is None:  # honest unknown — no world coordinate exists
+        return RoundTrip(False, detection_id, "no_anchor", None,
+                         expected, None, "none", False)
 
     world_t = float(media_epoch) + expected
     loc = resolve(conn, video_dir, row["source_id"], world_t)
-    ok = (loc.provider == "mp4"
-          and loc.media_offset is not None
-          and abs(loc.media_offset - expected) < EPS)
-    return RoundTrip(ok, detection_id, expected, loc.media_offset,
-                     loc.provider, loc.reason)
+    if loc.provider != "mp4" or loc.anchor is None or loc.media_offset is None:
+        return RoundTrip(False, detection_id, loc.reason, None,
+                         expected, loc.media_offset, loc.provider, False)
+    resolved_world = loc.anchor.media_to_world(loc.media_offset)
+    world_delta = abs(resolved_world - world_t)
+    ok = world_delta < EPS
+    alternate = abs(loc.media_offset - expected) > EPS
+    return RoundTrip(ok, detection_id, "ok" if ok else "world_mismatch",
+                     world_delta, expected, loc.media_offset, loc.provider, alternate)

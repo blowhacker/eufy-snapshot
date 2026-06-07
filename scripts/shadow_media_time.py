@@ -21,7 +21,7 @@ from pathlib import Path
 # Allow running from a source checkout without install.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from wanyard.media_time import EPS, check_detection_round_trip  # noqa: E402
+from wanyard.media_time import check_detection_round_trip  # noqa: E402
 
 
 def main() -> int:
@@ -42,52 +42,42 @@ def main() -> int:
     ids = [r["id"] for r in conn.execute(sql).fetchall()]
 
     total = len(ids)
-    ok = 0
-    providers: dict[str, int] = {}
-    reasons: dict[str, int] = {}
-    buckets = {"<0.01": 0, "0.01-0.05": 0, "0.05-0.25": 0,
-               "0.25-1": 0, ">1": 0, "n/a": 0}
+    status: dict[str, int] = {}
+    alternates = 0
     worst: list[tuple[float, int]] = []
 
     for det_id in ids:
         rt = check_detection_round_trip(conn, video_dir, det_id)
-        if rt.ok:
-            ok += 1
-        providers[rt.provider] = providers.get(rt.provider, 0) + 1
-        reasons[rt.reason] = reasons.get(rt.reason, 0) + 1
-        d = rt.delta
-        if d is None:
-            buckets["n/a"] += 1
-        elif d < 0.01:
-            buckets["<0.01"] += 1
-        elif d < 0.05:
-            buckets["0.01-0.05"] += 1
-        elif d < 0.25:
-            buckets["0.05-0.25"] += 1
-        elif d < 1.0:
-            buckets["0.25-1"] += 1
-        else:
-            buckets[">1"] += 1
-            worst.append((d, det_id))
+        status[rt.status] = status.get(rt.status, 0) + 1
+        if rt.alternate:
+            alternates += 1
+        if rt.status == "world_mismatch" and rt.world_delta is not None:
+            worst.append((rt.world_delta, det_id))
 
     conn.close()
 
-    print(f"detections checked : {total}")
-    print(f"round-trip ok (<{EPS}) : {ok}  ({100*ok/total:.1f}%)" if total else "no detections")
-    print(f"providers          : {providers}")
-    print(f"reasons            : {reasons}")
-    print("delta buckets      :")
-    for k, v in buckets.items():
-        print(f"    {k:>10} : {v}")
+    ok = status.get("ok", 0)
+    # Anchored real detections = the population the resolver is responsible for.
+    anchored = ok + status.get("world_mismatch", 0) + status.get("gap", 0)
+    print(f"detections scanned     : {total}")
+    print(f"status breakdown       : {status}")
+    print(f"  ok                   : {ok}")
+    print(f"  world_mismatch       : {status.get('world_mismatch', 0)}  (resolver faults)")
+    print(f"  gap                  : {status.get('gap', 0)}  (resolver faults)")
+    print(f"  no_anchor            : {status.get('no_anchor', 0)}  (NULL media_epoch, honest)")
+    print(f"  sentinel             : {status.get('sentinel', 0)}  (ts_offset<0 markers, skipped)")
+    print(f"alternate-segment hits : {alternates}  (boundary duplicates, valid)")
+    if anchored:
+        print(f"resolver correctness   : {100*ok/anchored:.3f}% of {anchored} anchored detections")
     if worst:
         worst.sort(reverse=True)
-        print("worst deltas (delta, det_id):")
+        print("worst world-deltas (delta, det_id):")
         for d, i in worst[:10]:
             print(f"    {d:.3f}  #{i}")
 
-    # Gate: fail if any usable detection exceeds EPS.
-    failures = buckets["0.05-0.25"] + buckets["0.25-1"] + buckets[">1"]
-    return 1 if failures else 0
+    # Gate fails ONLY on resolver faults: world_mismatch or unexpected gap.
+    faults = status.get("world_mismatch", 0) + status.get("gap", 0)
+    return 1 if faults else 0
 
 
 if __name__ == "__main__":
