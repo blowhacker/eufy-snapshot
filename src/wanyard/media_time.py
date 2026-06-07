@@ -28,6 +28,12 @@ EPS = 0.05  # round-trip identity tolerance, seconds
 # Live HLS clock can lead/lag the wall clock slightly at chunk edges.
 _LIVE_EDGE_SLOP_SECONDS = 2.0
 
+# Mirrors VideoWorker._MAX_SEGMENT_SECONDS — used only to estimate when an open
+# segment will close (i.e. when its authoritative MP4 frame becomes readable).
+_MAX_SEGMENT_SECONDS_HINT = 600.0
+# Grace after estimated close before the faststart MP4 is flushed + readable.
+_CLOSE_READY_GRACE_SECONDS = 20.0
+
 # The MP4 holds a hair more content than the wall recording span (end_ts -
 # start_ts) because ffmpeg flushes a final GOP at close. Allow a small tail
 # grace so a detection on that last fragment still resolves to its own file
@@ -269,6 +275,98 @@ def resolve(conn: sqlite3.Connection, video_dir: Path,
         return recorded
 
     return _none("gap", _nearest_coverage(conn, source_id, t))
+
+
+# ── extraction face: the single frame reader ────────────────────────────────
+
+@dataclass(frozen=True)
+class FrameResult:
+    frame: object | None       # numpy ndarray (BGR) or None
+    status: str                # "ok" | "pending" | "gap" | "no_anchor"
+    provider: str              # "mp4" | "hls" | "none"
+    retry_after: float | None  # for "pending": unix ts when the authoritative frame exists
+
+
+def _decode_mp4_frame(path: Path, offset: float):
+    """Indexed MP4 → seek by time and decode. Returns ndarray or None."""
+    import cv2
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return None
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, offset) * 1000.0)
+        ok, frame = cap.read()
+        return frame if ok and frame is not None else None
+    finally:
+        cap.release()
+
+
+def _decode_ts_frame(path: Path, offset: float):
+    """Indexless MPEG-TS fragment → decode from the lead keyframe and step to
+    the target frame. Frame-accurate; never a POS_MSEC guess. ndarray or None.
+    """
+    import cv2
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return None
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+        target = max(0, int(round(max(0.0, offset) * fps)))
+        frame = None
+        for _ in range(target + 1):
+            ok, f = cap.read()
+            if not ok or f is None:
+                break
+            frame = f
+        return frame
+    finally:
+        cap.release()
+
+
+def _expected_close_ts(conn: sqlite3.Connection, source_id: str,
+                       t: float) -> float | None:
+    """When the open segment covering t will close and its MP4 be readable."""
+    row = conn.execute(
+        "SELECT start_ts FROM segments"
+        " WHERE source_id=? AND end_ts IS NULL AND start_ts<=?"
+        " ORDER BY start_ts DESC LIMIT 1",
+        (source_id, t),
+    ).fetchone()
+    if not row:
+        return None
+    return float(row["start_ts"]) + _MAX_SEGMENT_SECONDS_HINT + _CLOSE_READY_GRACE_SECONDS
+
+
+def read_frame(conn: sqlite3.Connection, video_dir: Path,
+               source_id: str, t: float) -> FrameResult:
+    """The single frame reader behind the (source_id, t) boundary.
+
+    No consumer (confirmation, backfill, thumbnails) decodes media itself; the
+    provider choice, frame-accurate seek, and availability policy all live here.
+    The authoritative frame for a past instant is the closed MP4; while a segment
+    is still open the live .ts is best-effort, and if it is not fetchable the
+    result is `pending(retry_after=close)` rather than a wrong or blank frame.
+    """
+    loc = resolve(conn, video_dir, source_id, t)
+
+    if loc.provider == "mp4":
+        path = video_dir / loc.anchor.asset_ref
+        frame = _decode_mp4_frame(path, loc.media_offset)
+        if frame is not None:
+            return FrameResult(frame, "ok", "mp4", None)
+        # Closed file unreadable (rare) — let caller retry shortly.
+        return FrameResult(None, "pending", "mp4", t + _CLOSE_READY_GRACE_SECONDS)
+
+    if loc.provider == "hls":
+        path = video_dir / "live" / source_id / loc.anchor.asset_ref
+        frame = _decode_ts_frame(path, loc.media_offset)
+        if frame is not None:
+            return FrameResult(frame, "ok", "hls", None)
+        # Live chunk not fetchable; authoritative MP4 exists after segment close.
+        return FrameResult(None, "pending", "hls", _expected_close_ts(conn, source_id, t))
+
+    # provider "none": gap or no_anchor — propagate honestly.
+    return FrameResult(None, loc.reason, "none", None)
 
 
 # ── shadow-mode invariant check ─────────────────────────────────────────────
