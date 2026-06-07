@@ -474,6 +474,41 @@ def make_app(
                 ).fetchone()
         return JSONResponse({"segment": dict(row) if row else None})
 
+    async def api_video_resolve(request: Request) -> JSONResponse:
+        """World time -> media location. The single world<->media boundary.
+
+        See docs/media-time-architecture.md. Callers pass (source, ts) in world
+        time and receive {provider, url, media_offset, coverage, media_epoch}
+        without doing any offset math themselves.
+        """
+        if not video_db or not video_dir:
+            return JSONResponse({"error": "unavailable"}, status_code=503)
+        try:
+            ts = float(request.query_params["ts"])
+        except (KeyError, ValueError):
+            return JSONResponse({"error": "ts required"}, status_code=400)
+        source_id = request.query_params.get("source") or None
+        if not source_id:
+            return JSONResponse({"error": "source required"}, status_code=400)
+
+        from wanyard import media_time
+
+        def _resolve():
+            with video_db._connect() as conn:
+                return media_time.resolve(conn, video_dir, source_id, ts)
+
+        loc = await asyncio.to_thread(_resolve)
+        return JSONResponse({
+            "provider": loc.provider,
+            "url": loc.url,
+            "media_offset": loc.media_offset,
+            "media_epoch": loc.anchor.media_epoch if loc.anchor else None,
+            "duration": loc.anchor.duration if loc.anchor else None,
+            "coverage": ({"start": loc.coverage.start, "end": loc.coverage.end}
+                         if loc.coverage else None),
+            "reason": loc.reason,
+        })
+
     def _build_timeline(source_id, zone_id=None):
         from wanyard.video import _filter_with_polygons
         segs = video_db.list_segments(source_id)
@@ -1279,6 +1314,7 @@ def make_app(
         Route("/api/video/event-thumb/{event_id}", api_video_event_thumb),
         Route("/api/video/hls-thumb/{hls_id}", api_video_hls_thumb),
         Route("/api/video/segment-at",      api_video_segment_at),
+        Route("/api/video/resolve",         api_video_resolve),
         Route("/api/video2/timeline",       api_video2_timeline),
         Route("/api/video/events",          api_video_events),
         Route("/api/video/classes",         api_video_class_counts),
