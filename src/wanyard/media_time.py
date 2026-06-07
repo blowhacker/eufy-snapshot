@@ -79,34 +79,44 @@ def _none(reason: str, coverage: Coverage | None = None) -> MediaLocation:
 
 def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
                       t: float) -> MediaLocation | None:
-    """Closed segment whose nominal bracket contains t. None = not recorded
-    (caller should try live); a 'none' MediaLocation = recorded but unusable."""
+    """Closed segment covering t. None = not recorded (caller tries live); a
+    'none' MediaLocation = recorded region but unusable (no anchor).
+
+    Selection AND offset use a single basis: [media_epoch, end_ts], where
+    media_epoch = actual_start_ts. Never the nominal start_ts — mixing nominal
+    selection with media_epoch offset is the bug this design exists to kill.
+    """
     row = conn.execute(
-        "SELECT id, path, start_ts, end_ts, actual_start_ts FROM segments"
+        "SELECT id, path, end_ts, actual_start_ts FROM segments"
         " WHERE source_id=? AND end_ts IS NOT NULL"
-        "   AND start_ts<=? AND end_ts>=?"
-        " ORDER BY start_ts DESC LIMIT 1",
+        "   AND actual_start_ts IS NOT NULL"
+        "   AND actual_start_ts<=? AND end_ts>=?"
+        " ORDER BY actual_start_ts DESC LIMIT 1",
         (source_id, t, t),
     ).fetchone()
-    if not row:
-        return None
+    if row:
+        media_epoch = float(row["actual_start_ts"])
+        duration = float(row["end_ts"]) - media_epoch
+        anchor = Anchor("mp4", row["path"], media_epoch, duration)
+        return MediaLocation(
+            provider="mp4",
+            url=f"/video/files/{row['path']}",
+            media_offset=anchor.world_to_media(t),
+            coverage=Coverage(media_epoch, float(row["end_ts"])),
+            anchor=anchor,
+            reason="recorded",
+        )
 
-    media_epoch = row["actual_start_ts"]
-    if media_epoch is None:
-        # Known unknown — do NOT guess with start_ts. Surface it.
+    # No anchored coverage. If a closed segment nominally brackets t but has no
+    # media_epoch, surface the unknown instead of guessing with start_ts.
+    if conn.execute(
+        "SELECT 1 FROM segments"
+        " WHERE source_id=? AND end_ts IS NOT NULL AND actual_start_ts IS NULL"
+        "   AND start_ts<=? AND end_ts>=? LIMIT 1",
+        (source_id, t, t),
+    ).fetchone():
         return _none("no_anchor")
-
-    duration = float(row["end_ts"]) - float(row["start_ts"])
-    anchor = Anchor("mp4", row["path"], float(media_epoch), duration)
-    coverage = Coverage(anchor.media_epoch, anchor.media_epoch + duration)
-    return MediaLocation(
-        provider="mp4",
-        url=f"/video/files/{row['path']}",
-        media_offset=anchor.world_to_media(t),
-        coverage=coverage,
-        anchor=anchor,
-        reason="recorded",
-    )
+    return None
 
 
 # ── live HLS ────────────────────────────────────────────────────────────────
@@ -213,8 +223,9 @@ def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
         if epoch is None:
             return None
         end = row["end_ts"]
-        dur = (float(end) - float(row["start_ts"])) if end is not None else 0.0
-        return Coverage(float(epoch), float(epoch) + dur)
+        # Single basis: coverage = [media_epoch, end_ts]. Open segment (end NULL)
+        # is a point at its epoch.
+        return Coverage(float(epoch), float(end) if end is not None else float(epoch))
 
     cands = [c for c in (cov(before), cov(after)) if c]
     if not cands:
