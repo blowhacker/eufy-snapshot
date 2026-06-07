@@ -712,7 +712,7 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
                         # Delete oldest segments until under limit
                         where += " AND end_ts < (SELECT AVG(end_ts) FROM segments WHERE end_ts IS NOT NULL)"
                     segs = [dict(r) for r in conn.execute(
-                        f"SELECT id, path FROM segments WHERE {where}", params
+                        f"SELECT id, path, end_ts FROM segments WHERE {where}", params
                     ).fetchall()]
 
                 freed = 0
@@ -729,6 +729,14 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
                         pass
 
                 if segs:
+                    # Notifications point at footage; expire them on the same
+                    # horizon so none outlive the segment/event they reference.
+                    # In GB-only mode there is no time cutoff, so derive one
+                    # from the newest segment we just removed.
+                    notif_cutoff = cutoff_ts
+                    if notif_cutoff is None:
+                        ends = [float(s["end_ts"]) for s in segs if s.get("end_ts")]
+                        notif_cutoff = max(ends) if ends else None
                     with video_db._connect() as conn:
                         ids = [s["id"] for s in segs]
                         pl  = ",".join("?" * len(ids))
@@ -736,6 +744,15 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
                         conn.execute(f"DELETE FROM object_events WHERE segment_id IN ({pl})", ids)
                         conn.execute(f"DELETE FROM video_detections WHERE segment_id IN ({pl})", ids)
                         conn.execute(f"DELETE FROM segments WHERE id IN ({pl})", ids)
+                        if notif_cutoff is not None:
+                            conn.execute(
+                                "DELETE FROM notification_events WHERE event_ts < ?",
+                                (notif_cutoff,),
+                            )
+                            conn.execute(
+                                "DELETE FROM notification_confirmations WHERE event_ts < ?",
+                                (notif_cutoff,),
+                            )
                     LOG.info("auto-cleanup: deleted %d segments, freed %.1f GB",
                              len(segs), freed / 1e9)
         except Exception:

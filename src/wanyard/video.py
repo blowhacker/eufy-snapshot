@@ -231,6 +231,17 @@ CREATE TABLE IF NOT EXISTS hls_events (
     created_at  REAL    NOT NULL DEFAULT (unixepoch('now'))
 );
 CREATE INDEX IF NOT EXISTS hevt_source_ts ON hls_events(source_id, abs_ts);
+
+-- Per-rule progress cursor over each event source table. Tracks the highest
+-- row id already considered for notifications, keyed by insertion order (NOT
+-- abs_ts) so late, backdated object_events — inserted after their segment
+-- closes — are still picked up (their id is always above the cursor).
+CREATE TABLE IF NOT EXISTS notification_cursor (
+    rule_id   INTEGER NOT NULL REFERENCES notification_rules(id) ON DELETE CASCADE,
+    kind      TEXT    NOT NULL,
+    last_id   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (rule_id, kind)
+);
 """
 
 
@@ -507,59 +518,62 @@ class VideoSegmentDB:
             )
         return cur.rowcount > 0
 
-    def materialize_notifications(
-        self,
-        lookback_seconds: float = 24 * 60 * 60,
-        limit_per_rule: int = 300,
-    ) -> int:
+    def materialize_notifications(self, batch_per_kind: int = 2000) -> int:
+        """Turn newly-seen detections into notifications.
+
+        Progress is tracked per (rule, source-kind) by row id in
+        notification_cursor — keyed on insertion order, not abs_ts, so late
+        backdated object_events are never skipped. The cursor advances over
+        every scanned row regardless of whether it emits, so a stretch of
+        rejected/cooldown-skipped events can never freeze the pipeline.
+        """
         inserted = 0
         with self._connect() as conn:
             rules = conn.execute(
                 "SELECT * FROM notification_rules WHERE enabled=1 ORDER BY id"
             ).fetchall()
-
         for rule_row in rules:
-            rule = _notification_rule_from_row(rule_row)
-            now = time.time()
+            inserted += self._materialize_rule(
+                _notification_rule_from_row(rule_row), batch_per_kind
+            )
+        return inserted
+
+    def _materialize_rule(self, rule: dict, batch_per_kind: int) -> int:
+        cooldown = max(0, int(rule["cooldown_seconds"]))
+        with self._connect() as conn:
+            last_row = conn.execute(
+                "SELECT MAX(event_ts) FROM notification_events WHERE rule_id=?",
+                (rule["id"],),
+            ).fetchone()
+        # cooldown anchor — only ever advanced by an actual emission
+        cursor_ts = float(last_row[0]) if last_row and last_row[0] is not None else None
+        inserted = 0
+        while True:
+            # Drain a batch of newly-inserted rows from every source kind.
+            batch: list[dict] = []
+            advanced = False
             with self._connect() as conn:
-                last_row = conn.execute(
-                    "SELECT MAX(event_ts) FROM notification_events WHERE rule_id=?",
-                    (rule["id"],),
-                ).fetchone()
-                last_sent = float(last_row[0]) if last_row and last_row[0] is not None else None
-                base_since = max(
-                    now - max(60.0, float(lookback_seconds)),
-                    float(rule.get("created_at") or 0),
-                )
-                since = base_since
-                if last_sent is not None:
-                    since = max(base_since, last_sent - max(0, rule["cooldown_seconds"]))
-                candidates = _notification_candidate_events(
-                    conn, rule, since, now, limit_per_rule
-                )
-
-            if not candidates:
-                continue
-
-            cooldown = max(0, int(rule["cooldown_seconds"]))
-            cursor_ts = last_sent
-            for event in sorted(candidates, key=lambda e: e["abs_ts"]):
+                for kind in ("object", "hls"):
+                    start_id = _notification_cursor_get(conn, rule["id"], kind)
+                    events, max_id = _notification_events_after(
+                        conn, rule, kind, start_id, batch_per_kind
+                    )
+                    if max_id > start_id:
+                        _notification_cursor_set(conn, rule["id"], kind, max_id)
+                        advanced = True
+                    batch.extend(events)
+            # Cooldown is a time concept, so order the merged batch by abs_ts.
+            for event in sorted(batch, key=lambda e: e["abs_ts"]):
                 event_ts = float(event["abs_ts"])
                 if cursor_ts is not None and event_ts < cursor_ts + cooldown:
                     continue
-
                 event_ref = _notification_event_ref(event)
                 confirmation = self._ensure_notification_confirmation(event, event_ref)
                 if not confirmation.get("confirmed"):
                     continue
-
-                event_with_confirmation = {
-                    **event,
-                    "_confirmation": confirmation,
-                }
                 with self._connect() as conn:
                     row = _build_notification_event(
-                        conn, rule, event_with_confirmation, time.time()
+                        conn, rule, {**event, "_confirmation": confirmation}, time.time()
                     )
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO notification_events"
@@ -574,6 +588,9 @@ class VideoSegmentDB:
                 cursor_ts = event_ts
                 if cur.rowcount:
                     inserted += 1
+            # Stop once neither kind had more rows to advance over.
+            if not advanced:
+                break
         return inserted
 
     def _ensure_notification_confirmation(self, event: dict, event_ref: str) -> dict:
@@ -2257,69 +2274,103 @@ def _yolo_socket_request(req: dict, timeout: float) -> dict:
     return json.loads(raw.decode())
 
 
-def _notification_candidate_events(
+# Source tables a rule draws from, newest-arriving last. object_events are
+# derived from closed MP4 segments (retained per cleanup_days); hls_events are
+# the real-time feed, deleted once their segment is backfilled. A detection
+# transits hls -> object over time; the cooldown collapses that transit into a
+# single notification.
+_NOTIFICATION_KIND_TABLES = {
+    "object": ("object_events", "event_type='appeared'"),
+    "hls":    ("hls_events", None),
+}
+
+
+def _notification_kind_max_id(conn: sqlite3.Connection, kind: str) -> int:
+    table = _NOTIFICATION_KIND_TABLES.get(kind, (None, None))[0]
+    if not table:
+        return 0
+    row = conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()
+    return int(row[0]) if row else 0
+
+
+def _notification_cursor_get(conn: sqlite3.Connection, rule_id: int, kind: str) -> int:
+    row = conn.execute(
+        "SELECT last_id FROM notification_cursor WHERE rule_id=? AND kind=?",
+        (rule_id, kind),
+    ).fetchone()
+    if row is not None:
+        return int(row[0])
+    # First encounter: seed forward-only at the current max id so a freshly
+    # created rule (or first ever run) never replays the retained backlog.
+    seed = _notification_kind_max_id(conn, kind)
+    conn.execute(
+        "INSERT OR IGNORE INTO notification_cursor(rule_id, kind, last_id) VALUES(?,?,?)",
+        (rule_id, kind, seed),
+    )
+    return seed
+
+
+def _notification_cursor_set(
+    conn: sqlite3.Connection, rule_id: int, kind: str, last_id: int
+) -> None:
+    conn.execute(
+        "INSERT INTO notification_cursor(rule_id, kind, last_id) VALUES(?,?,?)"
+        " ON CONFLICT(rule_id, kind) DO UPDATE SET last_id=excluded.last_id"
+        " WHERE excluded.last_id > notification_cursor.last_id",
+        (rule_id, kind, last_id),
+    )
+
+
+def _notification_events_after(
     conn: sqlite3.Connection,
     rule: dict,
-    since: float,
-    until: float,
+    kind: str,
+    start_id: int,
     limit: int,
-) -> list[dict]:
+) -> tuple[list[dict], int]:
+    """Fetch rows of one source kind with id > start_id, zone+class filtered.
+
+    Returns (filtered events, max raw id seen). The max id covers rows that
+    were filtered out too, so the cursor advances past them and they are never
+    re-examined.
+    """
+    table, extra = _NOTIFICATION_KIND_TABLES.get(kind, (None, None))
+    if not table:
+        return [], start_id
     source_id = rule["source_id"]
     polygons = _notification_zone_polygons(conn, source_id, rule["zone_ref"])
     if polygons is None:
-        return []
+        return [], start_id
 
+    cols = "id, source_id, abs_ts, class, confidence, boxes_json"
+    if kind == "hls":
+        cols += ", thumb_jpeg"
+    where, params = ["source_id=?", "id>?"], [source_id, start_id]
+    if extra:
+        where.append(extra)
     classes = set(rule.get("classes") or [])
-    table = _notification_event_table(conn, source_id, since, until)
-    where, params = ["source_id=?", "abs_ts>=?", "abs_ts<=?"], [source_id, since, until]
-    if table == "object_events":
-        where.append("event_type='appeared'")
     if classes:
         placeholders = ",".join("?" for _ in classes)
         where.append(f"class IN ({placeholders})")
         params.extend(sorted(classes))
     rows = conn.execute(
-        "SELECT id, source_id, abs_ts, class, confidence, boxes_json"
-        f" FROM {table}"
+        f"SELECT {cols} FROM {table}"
         f" WHERE {' AND '.join(where)}"
-        " ORDER BY abs_ts ASC LIMIT ?",
+        " ORDER BY id ASC LIMIT ?",
         (*params, max(1, int(limit))),
     ).fetchall()
-    kind = "object" if table == "object_events" else "event"
-    events = [{**dict(r), "_kind": kind} for r in rows]
 
-    hls_since = max(since, until - _PROVISIONAL_GRACE_SECONDS)
-    hls_where, hls_params = ["source_id=?", "abs_ts>=?", "abs_ts<=?"], [source_id, hls_since, until]
-    if classes:
-        placeholders = ",".join("?" for _ in classes)
-        hls_where.append(f"class IN ({placeholders})")
-        hls_params.extend(sorted(classes))
-    hls_rows = conn.execute(
-        "SELECT id, source_id, abs_ts, class, confidence, boxes_json, thumb_jpeg"
-        " FROM hls_events"
-        f" WHERE {' AND '.join(hls_where)}"
-        " ORDER BY abs_ts ASC LIMIT ?",
-        (*hls_params, max(1, int(limit))),
-    ).fetchall()
-    events.extend({**dict(r), "_kind": "hls"} for r in hls_rows)
+    max_id = start_id
+    events = []
+    for r in rows:
+        d = dict(r)
+        d["_kind"] = kind
+        if d["id"] > max_id:
+            max_id = d["id"]
+        events.append(d)
     if polygons:
         events = _filter_with_polygons(events, polygons)
-    events.sort(key=lambda e: e["abs_ts"])
-    return events[: max(1, int(limit))]
-
-
-def _notification_event_table(
-    conn: sqlite3.Connection,
-    source_id: str,
-    since: float,
-    until: float,
-) -> str:
-    row = conn.execute(
-        "SELECT 1 FROM object_events"
-        " WHERE source_id=? AND abs_ts>=? AND abs_ts<=? LIMIT 1",
-        (source_id, since, until),
-    ).fetchone()
-    return "object_events" if row else "video_events"
+    return events, max_id
 
 
 def _notification_zone_polygons(

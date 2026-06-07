@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -21,6 +22,8 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .config import AppConfig
+
+LOG = logging.getLogger(__name__)
 
 _THUMB_W  = 160
 _IMG_CACHE = "public, max-age=604800, immutable"
@@ -262,13 +265,39 @@ def make_app(
     import wanyard
     static_dir = Path(wanyard.__file__).parent / "static"
 
+    async def _notification_materialize_loop(interval: float):
+        # Generate notifications in the backend, independent of any browser.
+        # Detections become notifications within `interval` of being recorded,
+        # whether or not the UI is open. The work is cheap when idle (a few
+        # SQLite reads) and only calls YOLO for genuinely new detections.
+        while True:
+            try:
+                await asyncio.to_thread(video_db.materialize_notifications)
+            except Exception:
+                LOG.exception("notification materialize loop error")
+            await asyncio.sleep(interval)
+
     @asynccontextmanager
     async def lifespan(app: Starlette):
         if capture_worker:
             capture_worker.start()
+        notify_task = None
+        if video_db is not None:
+            try:
+                interval = float(os.environ.get("NOTIFICATION_POLL_INTERVAL", "5"))
+            except ValueError:
+                interval = 5.0
+            interval = max(1.0, interval)
+            notify_task = asyncio.create_task(_notification_materialize_loop(interval))
         try:
             yield
         finally:
+            if notify_task is not None:
+                notify_task.cancel()
+                try:
+                    await notify_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if capture_worker:
                 await asyncio.to_thread(capture_worker.stop)
 
@@ -663,7 +692,7 @@ def make_app(
         except ValueError:
             limit = 30
         unread_only = request.query_params.get("unread") in {"1", "true", "yes"}
-        await asyncio.to_thread(video_db.materialize_notifications)
+        # Materialization runs in the backend loop — this endpoint only reads.
         notifications = await asyncio.to_thread(
             video_db.list_notifications, limit, unread_only
         )
@@ -676,7 +705,7 @@ def make_app(
     async def api_notifications_unread_count(request: Request) -> JSONResponse:
         if not video_db:
             return JSONResponse({"unread_count": 0})
-        await asyncio.to_thread(video_db.materialize_notifications)
+        # Materialization runs in the backend loop — this endpoint only reads.
         unread_count = await asyncio.to_thread(video_db.unread_notification_count)
         return JSONResponse({"unread_count": unread_count})
 
