@@ -28,6 +28,12 @@ EPS = 0.05  # round-trip identity tolerance, seconds
 # Live HLS clock can lead/lag the wall clock slightly at chunk edges.
 _LIVE_EDGE_SLOP_SECONDS = 2.0
 
+# The MP4 holds a hair more content than the wall recording span (end_ts -
+# start_ts) because ffmpeg flushes a final GOP at close. Allow a small tail
+# grace so a detection on that last fragment still resolves to its own file
+# rather than a gap. Far below real reconnect gaps.
+_COVERAGE_TAIL_GRACE_SECONDS = 0.5
+
 
 @dataclass(frozen=True)
 class Anchor:
@@ -92,9 +98,9 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
         "SELECT id, path, start_ts, end_ts, actual_start_ts FROM segments"
         " WHERE source_id=? AND end_ts IS NOT NULL AND actual_start_ts IS NOT NULL"
         "   AND actual_start_ts<=?"
-        "   AND actual_start_ts + (end_ts - start_ts) >=?"
+        "   AND actual_start_ts + (end_ts - start_ts) + ? >=?"
         " ORDER BY actual_start_ts DESC LIMIT 1",
-        (source_id, t, t),
+        (source_id, t, _COVERAGE_TAIL_GRACE_SECONDS, t),
     ).fetchone()
     if row:
         media_epoch = float(row["actual_start_ts"])
