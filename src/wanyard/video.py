@@ -553,11 +553,7 @@ class VideoSegmentDB:
             batch: list[dict] = []
             advanced = False
             with self._connect() as conn:
-                # hls = real-time (live), det = per-frame from recorded segments.
-                # det supersedes object_events 'appeared' — it sees the whole
-                # presence, not just the entry instant, so walk-ins into a zone
-                # are caught.
-                for kind in ("hls", "det"):
+                for kind in _NOTIFICATION_KINDS:
                     start_id = _notification_cursor_get(conn, rule["id"], kind)
                     events, max_id = _notification_events_after(
                         conn, rule, kind, start_id, batch_per_kind
@@ -2298,22 +2294,20 @@ def _yolo_socket_request(req: dict, timeout: float) -> dict:
     return json.loads(raw.decode())
 
 
-# Source tables a rule draws from, newest-arriving last. object_events are
-# derived from closed MP4 segments (retained per cleanup_days); hls_events are
-# the real-time feed, deleted once their segment is backfilled. A detection
-# transits hls -> object over time; the cooldown collapses that transit into a
-# single notification.
-_NOTIFICATION_KIND_TABLES = {
-    "object": ("object_events", "event_type='appeared'"),
-    "hls":    ("hls_events", None),
-}
+# Detection sources a rule draws candidates from. Each is a table read in
+# insertion-id order; the cursor (notification_cursor) holds the highest id
+# already considered. Insertion-id ordering — not abs_ts — means late,
+# backdated rows are still picked up (their id is always above the cursor).
+#   hls = real-time live feed (small, pruned at 2h)
+#   det = per-frame detections from recorded segments. Unlike object_events
+#         'appeared', this sees the whole presence, not just the entry instant,
+#         so a person who walks into a zone is caught.
+_NOTIFICATION_KINDS = ("hls", "det")
+_NOTIFICATION_KIND_MAX_ID_TABLE = {"hls": "hls_events", "det": "video_detections"}
 
 
 def _notification_kind_max_id(conn: sqlite3.Connection, kind: str) -> int:
-    if kind == "det":
-        table = "video_detections"
-    else:
-        table = _NOTIFICATION_KIND_TABLES.get(kind, (None, None))[0]
+    table = _NOTIFICATION_KIND_MAX_ID_TABLE.get(kind)
     if not table:
         return 0
     row = conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()
@@ -2355,50 +2349,53 @@ def _notification_events_after(
     start_id: int,
     limit: int,
 ) -> tuple[list[dict], int]:
-    """Fetch rows of one source kind with id > start_id, zone+class filtered.
+    """Fetch a rule's candidate events of one kind with id > start_id.
 
-    Returns (filtered events, max raw id seen). The max id covers rows that
-    were filtered out too, so the cursor advances past them and they are never
-    re-examined.
+    Returns (filtered events, max raw id seen). max_id covers rows filtered out
+    too, so the cursor advances past them and they are never re-examined.
+
+    Both fetchers scan by primary-key rowid range (id > start_id) and filter
+    source in Python rather than in SQL. Leading the SQL with source_id makes
+    the planner ignore the id range and table-scan every row of the source
+    (temp b-tree sort), so a tick would re-read the whole table; the rowid
+    range reads only rows newer than the cursor. The range is contiguous, so no
+    row of the wanted source is skipped by filtering afterwards.
     """
-    source_id = rule["source_id"]
-    polygons = _notification_zone_polygons(conn, source_id, rule["zone_ref"])
+    polygons = _notification_zone_polygons(conn, rule["source_id"], rule["zone_ref"])
     if polygons is None:
         return [], start_id
-
-    if kind == "det":
-        return _notification_det_events_after(
-            conn, rule, source_id, polygons, start_id, limit
-        )
-
-    table, extra = _NOTIFICATION_KIND_TABLES.get(kind, (None, None))
-    if not table:
-        return [], start_id
-    cols = "id, source_id, abs_ts, class, confidence, boxes_json"
     if kind == "hls":
-        cols += ", thumb_jpeg"
-    where, params = ["source_id=?", "id>?"], [source_id, start_id]
-    if extra:
-        where.append(extra)
-    classes = set(rule.get("classes") or [])
-    if classes:
-        placeholders = ",".join("?" for _ in classes)
-        where.append(f"class IN ({placeholders})")
-        params.extend(sorted(classes))
-    rows = conn.execute(
-        f"SELECT {cols} FROM {table}"
-        f" WHERE {' AND '.join(where)}"
-        " ORDER BY id ASC LIMIT ?",
-        (*params, max(1, int(limit))),
-    ).fetchall()
+        return _notification_hls_events_after(conn, rule, polygons, start_id, limit)
+    if kind == "det":
+        return _notification_det_events_after(conn, rule, polygons, start_id, limit)
+    return [], start_id
 
+
+def _notification_hls_events_after(
+    conn: sqlite3.Connection,
+    rule: dict,
+    polygons: list[list[dict]],
+    start_id: int,
+    limit: int,
+) -> tuple[list[dict], int]:
+    source_id = rule["source_id"]
+    classes = set(rule.get("classes") or [])
+    rows = conn.execute(
+        "SELECT id, source_id, abs_ts, class, confidence, boxes_json, thumb_jpeg"
+        " FROM hls_events WHERE id>? ORDER BY id ASC LIMIT ?",
+        (start_id, max(1, int(limit))),
+    ).fetchall()
     max_id = start_id
     events = []
     for r in rows:
         d = dict(r)
-        d["_kind"] = kind
         if d["id"] > max_id:
             max_id = d["id"]
+        if d["source_id"] != source_id:
+            continue
+        if classes and d["class"] not in classes:
+            continue
+        d["_kind"] = "hls"
         events.append(d)
     if polygons:
         events = _filter_with_polygons(events, polygons)
@@ -2408,7 +2405,6 @@ def _notification_events_after(
 def _notification_det_events_after(
     conn: sqlite3.Connection,
     rule: dict,
-    source_id: str,
     polygons: list[list[dict]],
     start_id: int,
     limit: int,
@@ -2422,23 +2418,25 @@ def _notification_det_events_after(
     is exactly ts_offset (no fragile remapping). The cooldown collapses the run
     of in-zone frames into a single notification.
     """
+    source_id = rule["source_id"]
+    classes = set(rule.get("classes") or [])
     rows = conn.execute(
         "SELECT vd.id AS id, s.source_id AS source_id, vd.confidence AS confidence,"
         " vd.boxes_json AS boxes_json,"
         " (COALESCE(s.actual_start_ts, s.start_ts) + vd.ts_offset) AS abs_ts"
         " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
-        " WHERE s.source_id=? AND vd.id>?"
-        " ORDER BY vd.id ASC LIMIT ?",
-        (source_id, start_id, max(1, int(limit))),
+        " WHERE vd.id>? ORDER BY vd.id ASC LIMIT ?",
+        (start_id, max(1, int(limit))),
     ).fetchall()
 
-    classes = set(rule.get("classes") or [])
     max_id = start_id
     events: list[dict] = []
     for r in rows:
         row = dict(r)
         if row["id"] > max_id:
             max_id = row["id"]
+        if row["source_id"] != source_id:
+            continue
         try:
             boxes = json.loads(row["boxes_json"]) if row["boxes_json"] else []
         except (TypeError, json.JSONDecodeError):
