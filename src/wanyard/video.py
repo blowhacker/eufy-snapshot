@@ -553,7 +553,11 @@ class VideoSegmentDB:
             batch: list[dict] = []
             advanced = False
             with self._connect() as conn:
-                for kind in ("object", "hls"):
+                # hls = real-time (live), det = per-frame from recorded segments.
+                # det supersedes object_events 'appeared' — it sees the whole
+                # presence, not just the entry instant, so walk-ins into a zone
+                # are caught.
+                for kind in ("hls", "det"):
                     start_id = _notification_cursor_get(conn, rule["id"], kind)
                     events, max_id = _notification_events_after(
                         conn, rule, kind, start_id, batch_per_kind
@@ -1169,6 +1173,26 @@ class VideoSegmentDB:
 
     def get_event_with_segment(self, event_id) -> dict | None:
         raw_id = str(event_id)
+        if raw_id.startswith("d:"):
+            # Per-frame detection: the thumb seek is ts_offset into the MP4, so
+            # report seg_start_ts/abs_ts such that (abs_ts - seg_start_ts) lands
+            # exactly on the tagged frame.
+            try:
+                det_id = int(raw_id[2:])
+            except ValueError:
+                return None
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT vd.boxes_json AS boxes_json, vd.confidence AS confidence,"
+                    " s.path AS seg_path, s.start_ts AS seg_start_ts,"
+                    " s.end_ts AS seg_end_ts,"
+                    " (s.start_ts + vd.ts_offset) AS abs_ts,"
+                    " NULL AS class"
+                    " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
+                    " WHERE vd.id=?",
+                    (det_id,),
+                ).fetchone()
+            return dict(row) if row else None
         if raw_id.startswith("o:"):
             try:
                 object_event_id = int(raw_id[2:])
@@ -2286,7 +2310,10 @@ _NOTIFICATION_KIND_TABLES = {
 
 
 def _notification_kind_max_id(conn: sqlite3.Connection, kind: str) -> int:
-    table = _NOTIFICATION_KIND_TABLES.get(kind, (None, None))[0]
+    if kind == "det":
+        table = "video_detections"
+    else:
+        table = _NOTIFICATION_KIND_TABLES.get(kind, (None, None))[0]
     if not table:
         return 0
     row = conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()
@@ -2334,14 +2361,19 @@ def _notification_events_after(
     were filtered out too, so the cursor advances past them and they are never
     re-examined.
     """
-    table, extra = _NOTIFICATION_KIND_TABLES.get(kind, (None, None))
-    if not table:
-        return [], start_id
     source_id = rule["source_id"]
     polygons = _notification_zone_polygons(conn, source_id, rule["zone_ref"])
     if polygons is None:
         return [], start_id
 
+    if kind == "det":
+        return _notification_det_events_after(
+            conn, rule, source_id, polygons, start_id, limit
+        )
+
+    table, extra = _NOTIFICATION_KIND_TABLES.get(kind, (None, None))
+    if not table:
+        return [], start_id
     cols = "id, source_id, abs_ts, class, confidence, boxes_json"
     if kind == "hls":
         cols += ", thumb_jpeg"
@@ -2370,6 +2402,75 @@ def _notification_events_after(
         events.append(d)
     if polygons:
         events = _filter_with_polygons(events, polygons)
+    return events, max_id
+
+
+def _notification_det_events_after(
+    conn: sqlite3.Connection,
+    rule: dict,
+    source_id: str,
+    polygons: list[list[dict]],
+    start_id: int,
+    limit: int,
+) -> tuple[list[dict], int]:
+    """Per-frame detections (video_detections) as notification candidates.
+
+    Unlike object_events — which only carry the appearance instant — this
+    surfaces every tagged frame, so a person who enters from outside a zone and
+    walks into it is caught at the first in-zone frame. abs_ts is derived as
+    segment base + ts_offset, so the offset back into the MP4 for confirmation
+    is exactly ts_offset (no fragile remapping). The cooldown collapses the run
+    of in-zone frames into a single notification.
+    """
+    rows = conn.execute(
+        "SELECT vd.id AS id, s.source_id AS source_id, vd.confidence AS confidence,"
+        " vd.boxes_json AS boxes_json,"
+        " (COALESCE(s.actual_start_ts, s.start_ts) + vd.ts_offset) AS abs_ts"
+        " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
+        " WHERE s.source_id=? AND vd.id>?"
+        " ORDER BY vd.id ASC LIMIT ?",
+        (source_id, start_id, max(1, int(limit))),
+    ).fetchall()
+
+    classes = set(rule.get("classes") or [])
+    max_id = start_id
+    events: list[dict] = []
+    for r in rows:
+        row = dict(r)
+        if row["id"] > max_id:
+            max_id = row["id"]
+        try:
+            boxes = json.loads(row["boxes_json"]) if row["boxes_json"] else []
+        except (TypeError, json.JSONDecodeError):
+            boxes = []
+        # Highest-confidence box of a wanted class whose centre sits in the zone.
+        best = None
+        for box in boxes:
+            if not isinstance(box, dict):
+                continue
+            cls = box.get("cls")
+            if not cls or (classes and cls not in classes):
+                continue
+            try:
+                cx = (float(box["x1"]) + float(box["x2"])) / 2
+                cy = (float(box["y1"]) + float(box["y2"])) / 2
+            except (KeyError, TypeError, ValueError):
+                continue
+            if polygons and not _point_in_any_polygon(cx, cy, polygons):
+                continue
+            if best is None or float(box.get("conf") or 0) > float(best.get("conf") or 0):
+                best = box
+        if best is None:
+            continue
+        events.append({
+            "id": row["id"],
+            "source_id": row["source_id"],
+            "abs_ts": float(row["abs_ts"]),
+            "class": best.get("cls"),
+            "confidence": float(best.get("conf") or 0),
+            "boxes_json": json.dumps([best], separators=(",", ":")),
+            "_kind": "det",
+        })
     return events, max_id
 
 
@@ -2519,6 +2620,8 @@ def _notification_event_ref(event: dict) -> str:
         return f"o:{event['id']}"
     if kind == "hls":
         return f"h:{event['id']}"
+    if kind == "det":
+        return f"d:{event['id']}"
     return str(event["id"])
 
 
