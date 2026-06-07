@@ -476,8 +476,16 @@ class VideoSegmentDB:
                     "updated_at": now,
                 },
             )
+            rule_id = int(cur.lastrowid)
+            # Seed the cursors at the current max id in the same transaction, so
+            # a detection arriving between now and the first materialize tick is
+            # caught (its id will be above the seed) rather than seeded over.
+            for kind in _NOTIFICATION_KINDS:
+                _notification_cursor_set(
+                    conn, rule_id, kind, _notification_kind_max_id(conn, kind)
+                )
             row = conn.execute(
-                "SELECT * FROM notification_rules WHERE id=?", (cur.lastrowid,)
+                "SELECT * FROM notification_rules WHERE id=?", (rule_id,)
             ).fetchone()
         return _notification_rule_from_row(row)
 
@@ -548,47 +556,71 @@ class VideoSegmentDB:
         # cooldown anchor — only ever advanced by an actual emission
         cursor_ts = float(last_row[0]) if last_row and last_row[0] is not None else None
         inserted = 0
+        blocked: set[str] = set()  # kinds held back this call by a retryable error
         while True:
-            # Drain a batch of newly-inserted rows from every source kind.
+            # Fetch a batch from every not-yet-blocked kind. Do NOT advance the
+            # cursor yet — an event whose confirmation errors (YOLO down, frame
+            # unavailable) must be retried, so the cursor cannot pass it.
             batch: list[dict] = []
-            advanced = False
+            bounds: dict[str, tuple[int, int]] = {}  # kind -> (start_id, max_id)
             with self._connect() as conn:
                 for kind in _NOTIFICATION_KINDS:
+                    if kind in blocked:
+                        continue
                     start_id = _notification_cursor_get(conn, rule["id"], kind)
                     events, max_id = _notification_events_after(
                         conn, rule, kind, start_id, batch_per_kind
                     )
-                    if max_id > start_id:
-                        _notification_cursor_set(conn, rule["id"], kind, max_id)
-                        advanced = True
+                    bounds[kind] = (start_id, max_id)
                     batch.extend(events)
+            if not bounds:
+                break
             # Cooldown is a time concept, so order the merged batch by abs_ts.
+            unresolved: dict[str, int] = {}  # kind -> lowest id still pending
             for event in sorted(batch, key=lambda e: e["abs_ts"]):
                 event_ts = float(event["abs_ts"])
                 if cursor_ts is not None and event_ts < cursor_ts + cooldown:
-                    continue
+                    continue  # terminal: deliberately suppressed
                 event_ref = _notification_event_ref(event)
                 confirmation = self._ensure_notification_confirmation(event, event_ref)
-                if not confirmation.get("confirmed"):
-                    continue
-                with self._connect() as conn:
-                    row = _build_notification_event(
-                        conn, rule, {**event, "_confirmation": confirmation}, time.time()
-                    )
-                    cur = conn.execute(
-                        "INSERT OR IGNORE INTO notification_events"
-                        " (rule_id, rule_name, source_id, zone_ref, event_ref,"
-                        " event_ts, class, confidence, title, body, thumb_url,"
-                        " thumb_jpeg, target_url, created_at, metadata_json)"
-                        " VALUES(:rule_id,:rule_name,:source_id,:zone_ref,:event_ref,"
-                        " :event_ts,:class,:confidence,:title,:body,:thumb_url,"
-                        " :thumb_jpeg,:target_url,:created_at,:metadata_json)",
-                        row,
-                    )
-                cursor_ts = event_ts
-                if cur.rowcount:
-                    inserted += 1
-            # Stop once neither kind had more rows to advance over.
+                if confirmation.get("confirmed"):
+                    with self._connect() as conn:
+                        row = _build_notification_event(
+                            conn, rule, {**event, "_confirmation": confirmation}, time.time()
+                        )
+                        cur = conn.execute(
+                            "INSERT OR IGNORE INTO notification_events"
+                            " (rule_id, rule_name, source_id, zone_ref, event_ref,"
+                            " event_ts, class, confidence, title, body, thumb_url,"
+                            " thumb_jpeg, target_url, created_at, metadata_json)"
+                            " VALUES(:rule_id,:rule_name,:source_id,:zone_ref,:event_ref,"
+                            " :event_ts,:class,:confidence,:title,:body,:thumb_url,"
+                            " :thumb_jpeg,:target_url,:created_at,:metadata_json)",
+                            row,
+                        )
+                    cursor_ts = event_ts
+                    if cur.rowcount:
+                        inserted += 1
+                elif str(confirmation.get("status")) == "rejected":
+                    pass  # terminal: confirmed-not-a-match
+                else:
+                    # Retryable (error / frame unavailable) — hold the cursor at
+                    # this id so the next pass re-examines it.
+                    k = event["_kind"]
+                    eid = int(event["id"])
+                    unresolved[k] = min(unresolved.get(k, eid), eid)
+            # Advance each kind's cursor to the highest id with no pending event
+            # before it; a blocked kind stops being fetched again this call.
+            advanced = False
+            with self._connect() as conn:
+                for kind, (start_id, max_id) in bounds.items():
+                    target = max_id
+                    if kind in unresolved:
+                        target = min(target, unresolved[kind] - 1)
+                        blocked.add(kind)
+                    if target > start_id:
+                        _notification_cursor_set(conn, rule["id"], kind, target)
+                        advanced = True
             if not advanced:
                 break
         return inserted
