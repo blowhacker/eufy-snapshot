@@ -104,7 +104,10 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
     ).fetchone()
     if row:
         media_epoch = float(row["actual_start_ts"])
-        duration = float(row["end_ts"]) - float(row["start_ts"])
+        # Include the final-GOP flush tail so a detection on the last fragment
+        # both selects (above) and clamps (world_to_media) to its own file.
+        duration = (float(row["end_ts"]) - float(row["start_ts"])
+                    + _COVERAGE_TAIL_GRACE_SECONDS)
         anchor = Anchor("mp4", row["path"], media_epoch, duration)
         return MediaLocation(
             provider="mp4",
