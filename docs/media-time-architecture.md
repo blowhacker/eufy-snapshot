@@ -84,6 +84,42 @@ Rules:
   back to `nominal_open_ts`.** Exposes real unknowns instead of papering over
   them with a wrong base.
 
+## The resolver is the single media-access layer (not just playback URLs)
+
+Anything that reads pixels or bytes for a `(source_id, t)` goes through the
+resolver. It has two faces over the same boundary:
+
+- **playback** → `MediaLocation` (above) for the browser.
+- **extraction** → a frame, for server-side YOLO (notification confirmation,
+  MP4 backfill, thumbnails).
+
+```
+read_frame(source_id: str, t: float) -> FrameResult
+
+FrameResult {
+    frame:   ndarray | None
+    status:  "ok" | "pending" | "gap" | "no_anchor"
+    provider: "mp4" | "hls" | "none"
+    retry_after: float | None   # for "pending": when the authoritative frame exists
+}
+```
+
+Rules that make the "confirmation can't get a good frame" bug class impossible:
+- **One frame reader.** No consumer (yolo_server, backfill, thumbs) implements
+  its own `_read_*_frame` or seek. Today's `_read_mp4_frame` /
+  `_read_live_hls_frame` collapse into this. Provider asymmetry stops leaking
+  into consumers.
+- **Frame-accurate seek, owned here.** MP4 is indexed → direct seek. An indexless
+  `.ts` fragment → decode from its lead keyframe and step to the offset; never a
+  raw `POS_MSEC` seek that lands a few frames off. The contract returns *the
+  frame at t*, never "a frame near t."
+- **Availability is policy, decided once.** The authoritative frame for a past
+  instant is the closed MP4. While the segment is still open (faststart moov not
+  written) and the live `.ts` is flaky/rolled-off, return `pending` with
+  `retry_after = segment close`. Consumers retry on that signal instead of
+  rejecting a real detection off a best-effort live read. This also bounds
+  notification latency to a known quantity rather than silent loss/lag.
+
 ## Migration plan (each step shippable, each guarded by the round-trip assert)
 
 1. **Design doc** (this file).
@@ -100,7 +136,12 @@ Rules:
 6. **Frontend seek → resolver**: UI calls `/api/video/resolve?source=&ts=`;
    `V2Player.seek(source_id, t)` only. No `start_ts` in JS. Live (`hls`) seek via
    hls.js fragment `.programDateTime`, killing the `wallClockOffset` fudge.
-7. **Normalize event/notification contract**:
+7. **Frame access → resolver** (`read_frame`): collapse `_read_mp4_frame` /
+   `_read_live_hls_frame` into the resolver with frame-accurate seek and the
+   `pending(retry_after)` availability policy. Move notification confirmation,
+   MP4 backfill, and thumbnails onto it. Kills the live/recorded confirmation
+   asymmetry (the `frame_unavailable` / `no_high_res_match` bug class).
+8. **Normalize event/notification contract**:
    `{source_id, t, duration, class, state, thumb_url, target_url}`. Storage refs
    (`h:`/`d:`/`o:`) stay server-side.
 
@@ -121,3 +162,10 @@ Rules:
   `media_offset`.
 - **HLS sliding window**: seek into a DVR window after chunks roll off still maps
   `t`→correct frame via PDT, not via `seekable.start(0)` arithmetic.
+- **Frame accuracy** (makes the confirmation bug class impossible): for a known
+  detection, `read_frame(source_id, t)` returns a frame whose decoded content
+  time is within one frame interval of `t`, for BOTH providers — never a
+  `POS_MSEC`-off `.ts` frame. Same instant via `hls` and `mp4` must agree.
+- **Availability policy**: a too-recent `t` (open segment, flaky live) returns
+  `pending` with a `retry_after`, never a wrong/blank frame; once the segment
+  closes, the same `t` returns `ok` from `mp4`.
