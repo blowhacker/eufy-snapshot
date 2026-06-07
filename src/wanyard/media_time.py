@@ -82,27 +82,29 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
     """Closed segment covering t. None = not recorded (caller tries live); a
     'none' MediaLocation = recorded region but unusable (no anchor).
 
-    Selection AND offset use a single basis: [media_epoch, end_ts], where
-    media_epoch = actual_start_ts. Never the nominal start_ts — mixing nominal
-    selection with media_epoch offset is the bug this design exists to kill.
+    Single basis anchored at media_epoch = actual_start_ts. Duration is the
+    wall recording span (end_ts - start_ts), which equals the file's content
+    length; end_ts itself is the close *wall* time and sits ~drift seconds
+    before the file's true end once anchored at media_epoch, so it must NOT be
+    used as the coverage end. Coverage = [media_epoch, media_epoch + duration].
     """
     row = conn.execute(
-        "SELECT id, path, end_ts, actual_start_ts FROM segments"
-        " WHERE source_id=? AND end_ts IS NOT NULL"
-        "   AND actual_start_ts IS NOT NULL"
-        "   AND actual_start_ts<=? AND end_ts>=?"
+        "SELECT id, path, start_ts, end_ts, actual_start_ts FROM segments"
+        " WHERE source_id=? AND end_ts IS NOT NULL AND actual_start_ts IS NOT NULL"
+        "   AND actual_start_ts<=?"
+        "   AND actual_start_ts + (end_ts - start_ts) >=?"
         " ORDER BY actual_start_ts DESC LIMIT 1",
         (source_id, t, t),
     ).fetchone()
     if row:
         media_epoch = float(row["actual_start_ts"])
-        duration = float(row["end_ts"]) - media_epoch
+        duration = float(row["end_ts"]) - float(row["start_ts"])
         anchor = Anchor("mp4", row["path"], media_epoch, duration)
         return MediaLocation(
             provider="mp4",
             url=f"/video/files/{row['path']}",
             media_offset=anchor.world_to_media(t),
-            coverage=Coverage(media_epoch, float(row["end_ts"])),
+            coverage=Coverage(media_epoch, media_epoch + duration),
             anchor=anchor,
             reason="recorded",
         )
@@ -223,9 +225,11 @@ def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
         if epoch is None:
             return None
         end = row["end_ts"]
-        # Single basis: coverage = [media_epoch, end_ts]. Open segment (end NULL)
-        # is a point at its epoch.
-        return Coverage(float(epoch), float(end) if end is not None else float(epoch))
+        # Coverage anchored at media_epoch, length = wall recording span. Open
+        # segment (end NULL) is a point at its epoch.
+        if end is None:
+            return Coverage(float(epoch), float(epoch))
+        return Coverage(float(epoch), float(epoch) + (float(end) - float(row["start_ts"])))
 
     cands = [c for c in (cov(before), cov(after)) if c]
     if not cands:
