@@ -472,7 +472,9 @@ def make_app(
                     f"SELECT * FROM segments WHERE {where2} ORDER BY end_ts DESC LIMIT 1",
                     params2
                 ).fetchone()
-        return JSONResponse({"segment": dict(row) if row else None})
+        from .video import _worldize_segment_row
+        return JSONResponse(
+            {"segment": _worldize_segment_row(dict(row)) if row else None})
 
     async def api_video_resolve(request: Request) -> JSONResponse:
         """World time -> media location. The single world<->media boundary.

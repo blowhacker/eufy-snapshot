@@ -253,6 +253,42 @@ def _dominant_class(classes: list[str]) -> str:
     return classes[0] if classes else "unknown"
 
 
+# ── world-time basis (see docs/media-time-architecture.md) ───────────────────
+# Stored abs_ts / start_ts are in nominal (start_ts) basis. Everything the UI
+# consumes is exposed in true-world (media_epoch = actual_start_ts) basis so that
+# `ts - start_ts` yields the real file offset for BOTH grid events and
+# notifications. Conversion happens once, at these read boundaries.
+
+def _seg_world_epoch(start_ts, actual_start_ts):
+    return actual_start_ts if actual_start_ts is not None else start_ts
+
+
+def _worldize_event_row(r: dict) -> dict:
+    """Event row → media_epoch basis, preserving (abs_ts - seg_start_ts) ==
+    ts_offset. Needs seg_start_ts (+ seg_actual_start_ts) on the row. Rows
+    without a segment join (e.g. live HLS events, already world-time) pass
+    through untouched."""
+    st = r.get("seg_start_ts")
+    if st is None:
+        return r
+    epoch = _seg_world_epoch(st, r.get("seg_actual_start_ts"))
+    if r.get("abs_ts") is not None:
+        r["abs_ts"] = r["abs_ts"] - st + epoch
+    r["seg_start_ts"] = epoch
+    return r
+
+
+def _worldize_segment_row(r: dict) -> dict:
+    """Segment row → media_epoch basis: start_ts becomes the camera-accurate
+    first-frame time and end_ts is re-anchored to keep the recording span, so
+    playback offset math (ts - start_ts) gives the true file offset."""
+    epoch = r.get("actual_start_ts")
+    if epoch is not None:
+        if r.get("end_ts") is not None and r.get("start_ts") is not None:
+            r["end_ts"] = epoch + (r["end_ts"] - r["start_ts"])
+        r["start_ts"] = epoch
+    return r
+
 
 class VideoSegmentDB:
     def __init__(self, db_path: Path) -> None:
@@ -896,7 +932,8 @@ class VideoSegmentDB:
         if polygons and limit < 100000:
             query_limit = max(limit * 20, 200)
         sql = (
-            "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts"
+            "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts,"
+            " s.actual_start_ts as seg_actual_start_ts"
             " FROM object_events e LEFT JOIN segments s ON s.id=e.segment_id"
             f" WHERE {' AND '.join(where)}"
             " ORDER BY e.abs_ts DESC LIMIT ?"
@@ -904,7 +941,8 @@ class VideoSegmentDB:
         params.append(query_limit)
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        events = _filter_with_polygons([dict(r) for r in rows], polygons)[:limit]
+        events = _filter_with_polygons(
+            [_worldize_event_row(dict(r)) for r in rows], polygons)[:limit]
         return [_public_object_event(r) for r in events]
 
     def nearest_object_events(self, around: float, source_id: str | None = None,
@@ -929,7 +967,7 @@ class VideoSegmentDB:
         base = " AND ".join(where)
         select = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
-            " s.start_ts as seg_start_ts"
+            " s.start_ts as seg_start_ts, s.actual_start_ts as seg_actual_start_ts"
             " FROM object_events e LEFT JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
@@ -944,7 +982,9 @@ class VideoSegmentDB:
                 f"{select} AND e.abs_ts>? ORDER BY e.abs_ts ASC LIMIT ?",
                 (*params, around, query_limit),
             ).fetchall()
-        rows = _filter_with_polygons([dict(r) for r in before] + [dict(r) for r in after], polygons)
+        rows = _filter_with_polygons(
+            [_worldize_event_row(dict(r)) for r in before]
+            + [_worldize_event_row(dict(r)) for r in after], polygons)
         rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
         return [_public_object_event(r) for r in rows[:limit]]
 
@@ -1145,7 +1185,8 @@ class VideoSegmentDB:
         if polygons and limit < 100000:
             query_limit = max(limit * 20, 200)
         sql = (
-            "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts"
+            "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts,"
+            " s.actual_start_ts as seg_actual_start_ts"
             " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {' AND '.join(where)}"
             " ORDER BY e.abs_ts DESC LIMIT ?"
@@ -1153,7 +1194,8 @@ class VideoSegmentDB:
         params.append(query_limit)
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return _filter_with_polygons([dict(r) for r in rows], polygons)[:limit]
+        return _filter_with_polygons(
+            [_worldize_event_row(dict(r)) for r in rows], polygons)[:limit]
 
     def nearest_events(self, around: float, source_id: str | None = None,
                        classes: list[str] | None = None,
@@ -1180,7 +1222,7 @@ class VideoSegmentDB:
         base = " AND ".join(where)
         select = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
-            " s.start_ts as seg_start_ts"
+            " s.start_ts as seg_start_ts, s.actual_start_ts as seg_actual_start_ts"
             " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
@@ -1195,7 +1237,9 @@ class VideoSegmentDB:
                 f"{select} AND e.abs_ts>? ORDER BY e.abs_ts ASC LIMIT ?",
                 (*params, around, query_limit),
             ).fetchall()
-        rows = _filter_with_polygons([dict(r) for r in before] + [dict(r) for r in after], polygons)
+        rows = _filter_with_polygons(
+            [_worldize_event_row(dict(r)) for r in before]
+            + [_worldize_event_row(dict(r)) for r in after], polygons)
         rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
         return rows[:limit]
 
@@ -1212,9 +1256,10 @@ class VideoSegmentDB:
             with self._connect() as conn:
                 row = conn.execute(
                     "SELECT vd.boxes_json AS boxes_json, vd.confidence AS confidence,"
-                    " s.path AS seg_path, s.start_ts AS seg_start_ts,"
+                    " s.path AS seg_path,"
+                    " COALESCE(s.actual_start_ts, s.start_ts) AS seg_start_ts,"
                     " s.end_ts AS seg_end_ts,"
-                    " (s.start_ts + vd.ts_offset) AS abs_ts,"
+                    " (COALESCE(s.actual_start_ts, s.start_ts) + vd.ts_offset) AS abs_ts,"
                     " NULL AS class"
                     " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
                     " WHERE vd.id=?",
@@ -1229,12 +1274,12 @@ class VideoSegmentDB:
             with self._connect() as conn:
                 row = conn.execute(
                     "SELECT e.*, s.path as seg_path, s.start_ts as seg_start_ts,"
-                    " s.end_ts as seg_end_ts"
+                    " s.actual_start_ts as seg_actual_start_ts, s.end_ts as seg_end_ts"
                     " FROM object_events e JOIN segments s ON s.id=e.segment_id"
                     " WHERE e.id=?",
                     (object_event_id,),
                 ).fetchone()
-            return dict(row) if row else None
+            return _worldize_event_row(dict(row)) if row else None
 
         try:
             legacy_event_id = int(raw_id)
@@ -1243,12 +1288,12 @@ class VideoSegmentDB:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT e.*, s.path as seg_path, s.start_ts as seg_start_ts,"
-                " s.end_ts as seg_end_ts"
+                " s.actual_start_ts as seg_actual_start_ts, s.end_ts as seg_end_ts"
                 " FROM video_events e JOIN segments s ON s.id=e.segment_id"
                 " WHERE e.id=?",
                 (legacy_event_id,),
             ).fetchone()
-        return dict(row) if row else None
+        return _worldize_event_row(dict(row)) if row else None
 
     def get_setting(self, key: str, default=None):
         with self._connect() as conn:
@@ -1364,7 +1409,7 @@ class VideoSegmentDB:
         sql += " ORDER BY start_ts DESC"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        return [_worldize_segment_row(dict(r)) for r in rows]
 
     def segments_overlapping(self, source_id: str | None,
                              start_ts: float, end_ts: float) -> list[dict]:
@@ -1418,6 +1463,8 @@ class VideoSegmentDB:
                 row["seg_path"] = seg["path"]
                 row["spritesheet"] = seg.get("spritesheet")
                 row["seg_start_ts"] = seg["start_ts"]
+                row["seg_actual_start_ts"] = seg.get("actual_start_ts")
+                _worldize_event_row(row)
                 events.append(row)
         events = _filter_with_polygons(events, polygons)
         # Merge real-time HLS events (tagged within seconds of capture)
@@ -1535,17 +1582,17 @@ class VideoSegmentDB:
             ], [time.time() - _PROVISIONAL_GRACE_SECONDS]
             if source_id and source_id != "all":
                 where.append("s.source_id=?"); params.append(source_id)
-            segs = [dict(r) for r in conn.execute(
+            segs = [_worldize_segment_row(dict(r)) for r in conn.execute(
                 "SELECT s.* FROM segments s"
                 f" WHERE {' AND '.join(where)}"
                 " ORDER BY s.start_ts DESC",
                 params,
             ).fetchall()]
             latest_rows = conn.execute(
-                "SELECT s.source_id, s.start_ts, d.*"
+                "SELECT s.source_id, s.start_ts, s.actual_start_ts, d.*"
                 " FROM segments s JOIN video_detections d ON d.segment_id=s.id"
                 f" WHERE {' AND '.join(where)}"
-                " ORDER BY (s.start_ts + d.ts_offset) DESC",
+                " ORDER BY (COALESCE(s.actual_start_ts, s.start_ts) + d.ts_offset) DESC",
                 params,
             ).fetchall()
 
@@ -1557,7 +1604,7 @@ class VideoSegmentDB:
             latest[r["source_id"]] = {
                 "segment_id": r["segment_id"],
                 "source_id": r["source_id"],
-                "abs_ts": r["start_ts"] + r["ts_offset"],
+                "abs_ts": _seg_world_epoch(r["start_ts"], r["actual_start_ts"]) + r["ts_offset"],
                 "ts_offset": r["ts_offset"],
                 "has_human": bool(r["has_human"]),
                 "confidence": r["confidence"],
