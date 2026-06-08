@@ -1208,7 +1208,7 @@ def make_app(
             with video_db._connect() as conn:
                 pending = conn.execute(
                     "SELECT COUNT(*) FROM segments s WHERE s.end_ts IS NOT NULL"
-                    " AND NOT EXISTS (SELECT 1 FROM video_detections WHERE segment_id=s.id)"
+                    " AND s.scanned_at IS NULL"
                 ).fetchone()[0]
                 total_segs = conn.execute(
                     "SELECT COUNT(*) FROM segments WHERE end_ts IS NOT NULL"

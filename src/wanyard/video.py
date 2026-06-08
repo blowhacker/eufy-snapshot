@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS segments (
     end_ts          REAL,
     media_epoch     REAL,        -- world time (unix UTC) of media offset 0; the one anchor
     duration_sec    REAL,        -- playable media duration; private media metadata
+    scanned_at      REAL,        -- world time the detector finished scanning (NULL = pending)
     spritesheet     TEXT,
     webvtt          TEXT
 );
@@ -62,14 +63,13 @@ CREATE TABLE IF NOT EXISTS video_detections (
     id          INTEGER PRIMARY KEY,
     segment_id  INTEGER REFERENCES segments(id) ON DELETE CASCADE,
     source_id   TEXT    NOT NULL,
-    abs_ts      REAL    NOT NULL,
-    ts_offset   REAL    NOT NULL,
+    abs_ts      REAL    NOT NULL,   -- world time of the tagged frame; the only time
     has_human   INTEGER NOT NULL DEFAULT 0,
     confidence  REAL    NOT NULL DEFAULT 0,
     boxes_json  TEXT,
     classes_json TEXT
 );
-CREATE INDEX IF NOT EXISTS vdet_seg ON video_detections(segment_id, ts_offset);
+CREATE INDEX IF NOT EXISTS vdet_seg ON video_detections(segment_id, abs_ts);
 
 CREATE TABLE IF NOT EXISTS video_events (
     id          INTEGER PRIMARY KEY,
@@ -347,6 +347,7 @@ class VideoSegmentDB:
                 "ALTER TABLE hls_events ADD COLUMN thumb_jpeg BLOB",
                 "ALTER TABLE segments  ADD COLUMN media_epoch REAL",
                 "ALTER TABLE segments  ADD COLUMN duration_sec REAL",
+                "ALTER TABLE segments  ADD COLUMN scanned_at REAL",
                 "ALTER TABLE video_detections ADD COLUMN source_id TEXT",
                 "ALTER TABLE video_detections ADD COLUMN abs_ts REAL",
                 "ALTER TABLE video_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'detection'",
@@ -376,6 +377,22 @@ class VideoSegmentDB:
                 "DROP INDEX IF EXISTS seg_source_media_start",
                 "ALTER TABLE segments DROP COLUMN media_start_ts",
                 "ALTER TABLE segments DROP COLUMN actual_start_ts",
+            ]:
+                try:
+                    conn.execute(migration)
+                except Exception:
+                    pass
+            # One-time drop of the redundant file-relative offset. abs_ts (world
+            # time) is the only detection time. A scanned-but-empty segment was
+            # marked by a sentinel row (ts_offset<0); that role moves to
+            # segments.scanned_at. Tolerant of a fresh DB without ts_offset.
+            for migration in [
+                "UPDATE segments SET scanned_at = COALESCE(scanned_at, end_ts, start_ts)"
+                " WHERE id IN (SELECT DISTINCT segment_id FROM video_detections)",
+                "DELETE FROM video_detections WHERE ts_offset < 0",
+                "DROP INDEX IF EXISTS vdet_seg",
+                "ALTER TABLE video_detections DROP COLUMN ts_offset",
+                "CREATE INDEX IF NOT EXISTS vdet_seg ON video_detections(segment_id, abs_ts)",
             ]:
                 try:
                     conn.execute(migration)
@@ -458,65 +475,38 @@ class VideoSegmentDB:
                 (media_epoch, media_epoch, segment_id),
             )
 
-    def add_detection(self, segment_id: int, ts_offset: float,
-                      has_human: bool, confidence: float,
-                      boxes: list | None, classes: list | None) -> None:
+    def mark_scanned(self, segment_id: int, scanned_at: float | None = None) -> None:
+        """Record that the detector finished scanning a segment.
+
+        Replaces the old sentinel detection row: a scanned segment with no rows
+        simply has scanned_at set, so backfill never re-scans it.
+        """
         with self._connect() as conn:
-            seg = conn.execute(
-                "SELECT source_id, start_ts, media_epoch"
-                " FROM segments WHERE id=?",
-                (segment_id,),
-            ).fetchone()
-            if not seg:
-                raise ValueError(f"unknown segment_id {segment_id}")
-            media_start = _seg_media_start(seg)
-            if media_start is None:
-                raise ValueError(f"segment {segment_id} has no media_epoch")
             conn.execute(
-                "INSERT INTO video_detections"
-                "(segment_id, source_id, abs_ts, ts_offset, has_human,"
-                " confidence, boxes_json, classes_json)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (segment_id, seg["source_id"], media_start + float(ts_offset),
-                 ts_offset, int(has_human), confidence,
-                 json.dumps(boxes) if boxes else None,
-                 json.dumps(classes) if classes else None),
+                "UPDATE segments SET scanned_at=? WHERE id=?",
+                (time.time() if scanned_at is None else float(scanned_at), segment_id),
             )
 
     def replace_detections(self, segment_id: int, detections: list[dict]) -> None:
+        """Store detections in world time. Each carries abs_ts; nothing else times them."""
         with self._connect() as conn:
             seg = conn.execute(
-                "SELECT source_id, start_ts, media_epoch"
-                " FROM segments WHERE id=?",
+                "SELECT source_id, media_epoch FROM segments WHERE id=?",
                 (segment_id,),
             ).fetchone()
             if not seg:
                 raise ValueError(f"unknown segment_id {segment_id}")
-            media_start = _seg_media_start(seg)
-            has_real = any(float(d.get("ts_offset", 0.0)) >= 0 for d in detections)
-            if media_start is None and has_real:
-                raise ValueError(f"segment {segment_id} has no media_epoch")
-            sentinel_ts = media_start if media_start is not None else float(seg["start_ts"])
             conn.execute("DELETE FROM video_detections WHERE segment_id=?", (segment_id,))
             conn.executemany(
                 "INSERT INTO video_detections"
-                "(segment_id, source_id, abs_ts, ts_offset, has_human,"
+                "(segment_id, source_id, abs_ts, has_human,"
                 " confidence, boxes_json, classes_json)"
-                " VALUES(?,?,?,?,?,?,?,?)",
+                " VALUES(?,?,?,?,?,?,?)",
                 [
                     (
                         segment_id,
                         seg["source_id"],
-                        (
-                            float(d["abs_ts"])
-                            if d.get("abs_ts") is not None
-                            else (
-                                media_start + float(d["ts_offset"])
-                                if media_start is not None and float(d["ts_offset"]) >= 0
-                                else sentinel_ts
-                            )
-                        ),
-                        d["ts_offset"],
+                        float(d["abs_ts"]),
                         int(d["has_human"]),
                         d["confidence"],
                         json.dumps(d["boxes"]) if d.get("boxes") else None,
@@ -536,15 +526,18 @@ class VideoSegmentDB:
     def detections_for_segment(self, segment_id: int) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT source_id, abs_ts, ts_offset, has_human, confidence,"
-                " boxes_json, classes_json"
-                " FROM video_detections WHERE segment_id=? ORDER BY ts_offset",
+                "SELECT vd.source_id, vd.abs_ts, vd.has_human, vd.confidence,"
+                " vd.boxes_json, vd.classes_json, s.media_epoch AS media_epoch"
+                " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
+                " WHERE vd.segment_id=? ORDER BY vd.abs_ts",
                 (segment_id,),
             ).fetchall()
         return [{
             "source_id":   r["source_id"],
             "abs_ts":      r["abs_ts"],
-            "ts_offset":  r["ts_offset"],
+            # offset into the file is derived on read, never stored
+            "ts_offset":  (float(r["abs_ts"]) - float(r["media_epoch"])
+                           if r["media_epoch"] is not None else None),
             "has_human":  bool(r["has_human"]),
             "confidence": r["confidence"],
             "boxes":   json.loads(r["boxes_json"])   if r["boxes_json"]   else [],
@@ -554,14 +547,13 @@ class VideoSegmentDB:
     def detections_between(self, source_id: str, since: float, until: float) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT vd.segment_id, vd.source_id, vd.abs_ts, vd.ts_offset,"
+                "SELECT vd.segment_id, vd.source_id, vd.abs_ts,"
                 " vd.has_human, vd.confidence, vd.boxes_json, vd.classes_json,"
                 " s.media_epoch AS media_epoch"
                 " FROM video_detections vd"
                 " JOIN segments s ON s.id=vd.segment_id"
                 " WHERE vd.source_id=?"
                 " AND vd.abs_ts>=? AND vd.abs_ts<=?"
-                " AND vd.ts_offset>=0"
                 " ORDER BY vd.abs_ts",
                 (source_id, since, until),
             ).fetchall()
@@ -578,7 +570,8 @@ class VideoSegmentDB:
             "source_id":   r["source_id"],
             "abs_ts":      r["abs_ts"],
             "media_epoch": r["media_epoch"],
-            "ts_offset":   r["ts_offset"],
+            "ts_offset":   (float(r["abs_ts"]) - float(r["media_epoch"])
+                            if r["media_epoch"] is not None else None),
             "has_human":   bool(r["has_human"]),
             "confidence":  r["confidence"],
             "boxes":       json.loads(r["boxes_json"])   if r["boxes_json"]   else [],
@@ -1893,7 +1886,7 @@ class VideoSegmentDB:
             ).fetchall()]
             epoch = _segment_media_epoch_sql("s")
             latest_rows = conn.execute(
-                "SELECT d.*"
+                "SELECT d.*, s.media_epoch AS media_epoch"
                 " FROM video_detections d JOIN segments s ON s.id=d.segment_id"
                 f" WHERE {' AND '.join(where)}"
                 " ORDER BY d.abs_ts DESC",
@@ -1909,7 +1902,8 @@ class VideoSegmentDB:
                 "segment_id": r["segment_id"],
                 "source_id": r["source_id"],
                 "abs_ts": r["abs_ts"],
-                "ts_offset": r["ts_offset"],
+                "ts_offset": (float(r["abs_ts"]) - float(r["media_epoch"])
+                              if r["media_epoch"] is not None else None),
                 "has_human": bool(r["has_human"]),
                 "confidence": r["confidence"],
                 "boxes": json.loads(r["boxes_json"]) if r["boxes_json"] else [],
@@ -2003,8 +1997,12 @@ def _yolo_tag_video(
     db: VideoSegmentDB,
     predict_lock=None,
 ) -> int:
-    """Read video file at 1fps, run YOLO, store detections with exact timestamps."""
+    """Read video file at 1fps, run YOLO, store detections in world time."""
     import cv2
+
+    media_epoch = _seg_media_start(db.get_segment(seg_id) or {})
+    if media_epoch is None:
+        return 0   # unanchored segment: cannot place frames in world time
 
     cap = cv2.VideoCapture(str(seg_path))
     if not cap.isOpened():
@@ -2037,7 +2035,7 @@ def _yolo_tag_video(
                 has_human, conf, boxes = _parse_results(results)
                 classes = list({b["cls"] for b in boxes}) if boxes else []
                 detections.append({
-                    "ts_offset": ts_off,
+                    "abs_ts": media_epoch + ts_off,
                     "has_human": has_human,
                     "confidence": conf,
                     "boxes": boxes,
@@ -2049,6 +2047,7 @@ def _yolo_tag_video(
 
     cap.release()
     db.replace_detections(seg_id, detections)
+    db.mark_scanned(seg_id)
     return len(detections)
 
 
@@ -2059,7 +2058,7 @@ def backfill_events(db: VideoSegmentDB, video_dir: Path | None = None,
         segs = conn.execute(
             "SELECT s.* FROM segments s WHERE s.end_ts IS NOT NULL"
             " AND s.media_epoch IS NOT NULL"
-            " AND NOT EXISTS (SELECT 1 FROM video_detections WHERE segment_id=s.id)"
+            " AND s.scanned_at IS NULL"
             " ORDER BY s.start_ts"
         ).fetchall()
     for row in segs:

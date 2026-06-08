@@ -546,7 +546,7 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                 segs = conn.execute(
                     "SELECT s.* FROM segments s WHERE s.end_ts IS NOT NULL"
                     " AND s.media_epoch IS NOT NULL"
-                    " AND NOT EXISTS (SELECT 1 FROM video_detections WHERE segment_id=s.id)"
+                    " AND s.scanned_at IS NULL"
                     " ORDER BY s.start_ts"
                     " LIMIT 5"
                 ).fetchall()
@@ -565,8 +565,6 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                 if duration is None:
                     duration = float(seg["end_ts"]) - float(seg["start_ts"])
                 media_end = float(media_start) + max(0.0, float(duration))
-                _sentinel = [{"ts_offset": -1, "has_human": False, "confidence": 0.0,
-                              "boxes": [], "classes": []}]
 
                 # Check if HLS real-time tagging already covered this segment
                 hls_evts = video_db.get_hls_events(
@@ -581,10 +579,8 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                         )
                         LOG.info("HLS events + MP4 YOLO (%d frames): %s",
                                  n, seg["path"][-35:])
-                        if n == 0:
-                            video_db.replace_detections(seg["id"], _sentinel)
                     else:
-                        video_db.replace_detections(seg["id"], _sentinel)
+                        video_db.mark_scanned(seg["id"])
                     video_db.delete_hls_events(
                         seg["source_id"], float(media_start), media_end
                     )
@@ -599,10 +595,8 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                         model, seg_path, seg["id"], video_db, predict_lock
                     )
                     LOG.info("tagged %d frames: %s", n, seg["path"][-35:])
-                    if n == 0:
-                        video_db.replace_detections(seg["id"], _sentinel)
                 else:
-                    video_db.replace_detections(seg["id"], _sentinel)
+                    video_db.mark_scanned(seg["id"])
                 dets = video_db.detections_for_segment(seg["id"])
                 n_evt = extract_events(seg, dets, video_db)
                 if n_evt:

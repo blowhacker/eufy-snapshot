@@ -418,24 +418,21 @@ def check_detection_round_trip(conn: sqlite3.Connection, video_dir: Path,
 
     The invariant is on WORLD time, not offset equality: at contiguous segment
     boundaries the same wall instant exists in two files, so resolving to the
-    adjacent segment (different offset) is correct. Sentinel rows (ts_offset<0,
-    the "processed, nothing found" marker) and NULL media_epoch are reported as
-    their own status, not resolver faults. No side effects.
+    adjacent segment (different offset) is correct. The expected media offset is
+    derived (abs_ts - media_epoch), never stored. No side effects.
     """
     row = conn.execute(
-        "SELECT id, source_id, abs_ts, ts_offset AS media_offset"
-        " FROM video_detections"
-        " WHERE id=?",
+        "SELECT vd.id, vd.source_id, vd.abs_ts,"
+        " (vd.abs_ts - s.media_epoch) AS media_offset"
+        " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
+        " WHERE vd.id=?",
         (detection_id,),
     ).fetchone()
-    if not row:
+    if not row or row["media_offset"] is None:
         return RoundTrip(False, detection_id, "no_detection", None,
                          0.0, None, "none", False)
 
     expected = float(row["media_offset"])
-    if expected < 0:  # sentinel marker, not a real frame
-        return RoundTrip(True, detection_id, "sentinel", None,
-                         expected, None, "none", False)
     world_t = float(row["abs_ts"])
     loc = resolve(conn, video_dir, row["source_id"], world_t)
     if loc.provider != "mp4" or loc.anchor is None or loc.media_offset is None:
