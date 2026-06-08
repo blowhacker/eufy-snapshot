@@ -215,6 +215,8 @@ def _prepare_replay_hls(
         "-c", "copy",
         "-start_at_zero",
         "-avoid_negative_ts", "make_zero",
+        "-muxdelay", "0",
+        "-muxpreload", "0",
         "-f", "hls",
         "-hls_time", "2",
         "-hls_list_size", "0",
