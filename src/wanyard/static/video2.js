@@ -3766,6 +3766,7 @@ const _OVL_GATE_FLOOR = 0.22;  // normalized center units — generous; keep gli
 const _OVL_GATE_K     = 2.5;   // gate grows with speed*dt (fast straight movers get slack)
 const _OVL_WARM_GATE  = 0.40;  // first link has no velocity — near old greedy, lets fast tracks start
 const _OVL_MIN_SPEED  = 0.04;  // below this (per s) treat as stationary; skip heading veto
+const _OVL_LEAD       = 0.15;  // s — tiny forward tolerance so the current frame still shows
 
 function overlayTracklets() {
   const o = st.overlays;
@@ -3849,9 +3850,15 @@ function boxesAtOverlayTime(ts) {
       }
     }
     if (drawn) continue;                       // interpolated within the tracklet
-    let nearest = null, nd = Infinity;          // else snap to a lone/edge sample
-    for (const p of pts) { const d = Math.abs(p.ts - ts); if (d < nd) { nd = d; nearest = p; } }
-    if (nearest && nd <= _OVL_SNAP) out.push(nearest.box);
+    // else persist the most recent PAST detection (causal): a box must never
+    // appear before its own detection, or it looks like the box predicts the
+    // object and the subject "rides into" a box already sitting ahead.
+    let recent = null;
+    for (const p of pts) {
+      const age = ts - p.ts;                   // >0 = past, small <0 = current frame
+      if (age >= -_OVL_LEAD && age <= _OVL_SNAP && (!recent || p.ts > recent.ts)) recent = p;
+    }
+    if (recent) out.push(recent.box);
   }
   return _filterBoxes(out);                     // class/zone filter applied at draw
 }
