@@ -424,6 +424,37 @@ class VideoSegmentDB:
             "classes": json.loads(r["classes_json"]) if r["classes_json"] else [],
         } for r in rows]
 
+    def detections_between(self, source_id: str, since: float, until: float) -> list[dict]:
+        epoch = _segment_media_epoch_sql("s")
+        abs_expr = f"({epoch} + vd.ts_offset)"
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT vd.ts_offset, vd.has_human, vd.confidence,"
+                " vd.boxes_json, vd.classes_json,"
+                " s.id AS segment_id, s.source_id AS source_id,"
+                f" {epoch} AS media_epoch, {abs_expr} AS abs_ts"
+                " FROM video_detections vd"
+                " JOIN segments s ON s.id=vd.segment_id"
+                " WHERE s.source_id=?"
+                " AND s.end_ts IS NOT NULL"
+                " AND vd.ts_offset>=0"
+                f" AND {abs_expr}>=?"
+                f" AND {abs_expr}<=?"
+                f" ORDER BY {abs_expr}",
+                (source_id, since, until),
+            ).fetchall()
+        return [{
+            "segment_id":  r["segment_id"],
+            "source_id":   r["source_id"],
+            "abs_ts":      r["abs_ts"],
+            "media_epoch": r["media_epoch"],
+            "ts_offset":   r["ts_offset"],
+            "has_human":   bool(r["has_human"]),
+            "confidence":  r["confidence"],
+            "boxes":       json.loads(r["boxes_json"])   if r["boxes_json"]   else [],
+            "classes":     json.loads(r["classes_json"]) if r["classes_json"] else [],
+        } for r in rows]
+
     def list_zones(self, source_id: str | None = None,
                    zone_type: str | None = None) -> list[dict]:
         where, params = ["1"], []

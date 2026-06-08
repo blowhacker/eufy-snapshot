@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -145,6 +145,34 @@ def _cleanup_replay_hls_root(now: float | None = None) -> None:
             continue
 
 
+def _hls_datetime(ts: float) -> str:
+    return (
+        datetime.fromtimestamp(float(ts), timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _add_program_date_time_tags(playlist: Path, media_epoch: float) -> None:
+    lines = playlist.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    cursor = float(media_epoch)
+    for line in lines:
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            continue
+        if line.startswith("#EXTINF:"):
+            out.append(f"#EXT-X-PROGRAM-DATE-TIME:{_hls_datetime(cursor)}")
+            out.append(line)
+            try:
+                duration = float(line.split(":", 1)[1].split(",", 1)[0])
+            except (IndexError, ValueError):
+                duration = 0.0
+            cursor += max(0.0, duration)
+            continue
+        out.append(line)
+    playlist.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
 def _prepare_replay_hls(
     video_dir: Path,
     source_id: str,
@@ -240,6 +268,7 @@ def _prepare_replay_hls(
         shutil.rmtree(out_dir, ignore_errors=True)
         err = proc.stderr.decode("utf-8", "replace")[-500:] if proc.stderr else ""
         raise RuntimeError(err or "ffmpeg replay HLS generation failed")
+    _add_program_date_time_tags(playlist, media_epoch)
 
     return {
         "token": token,
@@ -1015,6 +1044,25 @@ def make_app(
         dets = await asyncio.to_thread(video_db.detections_for_segment, int(seg_id))
         return JSONResponse({"detections": dets})
 
+    async def api_video_overlays(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({"detections": []})
+        source_id = request.query_params.get("source") or None
+        if not source_id or source_id == "all":
+            return JSONResponse({"error": "source required"}, status_code=400)
+        try:
+            since = float(request.query_params["since"])
+            until = float(request.query_params["until"])
+        except (KeyError, ValueError):
+            return JSONResponse({"error": "since/until required"}, status_code=400)
+        if until < since:
+            since, until = until, since
+        if until - since > 900:
+            return JSONResponse({"error": "overlay window too large"}, status_code=400)
+        dets = await asyncio.to_thread(
+            video_db.detections_between, source_id, since, until)
+        return JSONResponse({"detections": dets})
+
     async def api_video_live_status(request: Request) -> JSONResponse:
         if not video_db:
             return JSONResponse({"segments": [], "events": [], "detections": []})
@@ -1519,6 +1567,7 @@ def make_app(
         Route("/api/notifications/rules/{rule_id}", api_notification_rule, methods=["PUT", "DELETE"]),
         Route("/api/video/segments",        api_video_segments),
         Route("/api/video/detections",      api_video_detections),
+        Route("/api/video/overlays",        api_video_overlays),
         Route("/api/video/live",            api_video_live_status),
         Route("/api/video/live-window",     api_video_live_window),
         Route("/api/video/source-status",   api_video_source_status),

@@ -11,7 +11,8 @@ class V2Player {
   #lastSeek = null;
   #rate = 1;
   #intendedTs = null;  // display target while async seek/load is in flight
-  #listeners = { timeupdate: new Set(), play: new Set(), pause: new Set(), ended: new Set() };
+  #presentedMediaTime = null;
+  #listeners = { timeupdate: new Set(), frame: new Set(), play: new Set(), pause: new Set(), ended: new Set() };
 
   constructor(videoEl) {
     this.#v = videoEl;
@@ -19,6 +20,7 @@ class V2Player {
     this.#v.addEventListener("play",       () => this.#emit("play"));
     this.#v.addEventListener("pause",      () => this.#emit("pause"));
     this.#v.addEventListener("ended",      () => this.#emit("ended"));
+    this.#startFrameClock();
   }
 
   setSegments(segs) {
@@ -59,6 +61,7 @@ class V2Player {
     };
 
     this.#intendedTs = actualTs;
+    this.#presentedMediaTime = offset;
 
     try {
       this.#destroyHls();
@@ -87,6 +90,7 @@ class V2Player {
     }
 
     if (signal.aborted) return null;
+    this.#presentedMediaTime = offset;
     if (this.#intendedTs === actualTs) this.#intendedTs = null;
     this.#lastSeek = landing;
     this.#emit("timeupdate");
@@ -105,15 +109,11 @@ class V2Player {
     if (!url || !Number.isFinite(mediaEpoch)) return null;
 
     const actualTs = mediaEpoch + startPosition;
-    const detectionStartTs = Number.isFinite(Number(opts.detectionStartTs))
-      ? Number(opts.detectionStartTs)
-      : mediaEpoch;
     const seg = {
       id: opts.segmentId ?? `replay:${url}`,
       source_id: opts.sourceId ?? null,
       start_ts: mediaEpoch,
       end_ts: Number.isFinite(duration) ? mediaEpoch + duration : null,
-      detection_start_ts: detectionStartTs,
       path: null,
       replay_hls: true,
     };
@@ -128,6 +128,7 @@ class V2Player {
       segment: seg,
     };
     this.#intendedTs = actualTs;
+    this.#presentedMediaTime = startPosition;
 
     try {
       this.#destroyHls();
@@ -172,6 +173,7 @@ class V2Player {
     }
 
     if (signal.aborted) return null;
+    this.#presentedMediaTime = startPosition;
     if (this.#intendedTs === actualTs) this.#intendedTs = null;
     this.#lastSeek = landing;
     this.#emit("timeupdate");
@@ -213,7 +215,9 @@ class V2Player {
 
   // ── Current timestamp ─────────────────────────────────
   get currentTs() {
-    return this.#activeSeg ? this.#activeSeg.start_ts + this.#v.currentTime : null;
+    const mediaTime = this.#currentMediaTime();
+    if (!this.#activeSeg || mediaTime == null) return null;
+    return this.#programDateTimeForMediaTime(mediaTime) ?? (this.#activeSeg.start_ts + mediaTime);
   }
 
   get currentSeg() {
@@ -231,6 +235,51 @@ class V2Player {
   on(event, fn)  { this.#listeners[event]?.add(fn); }
   off(event, fn) { this.#listeners[event]?.delete(fn); }
   #emit(event)   { this.#listeners[event]?.forEach(fn => fn()); }
+
+  #startFrameClock() {
+    if (typeof this.#v.requestVideoFrameCallback !== "function") return;
+    const tick = (_now, metadata) => {
+      const mediaTime = Number(metadata?.mediaTime);
+      if (Number.isFinite(mediaTime)) {
+        this.#presentedMediaTime = mediaTime;
+        this.#emit("frame");
+      }
+      this.#v.requestVideoFrameCallback(tick);
+    };
+    this.#v.requestVideoFrameCallback(tick);
+  }
+
+  #currentMediaTime() {
+    const current = Number(this.#v.currentTime);
+    const presented = Number(this.#presentedMediaTime);
+    if (Number.isFinite(presented)) return Math.max(0, presented);
+    return Number.isFinite(current) ? Math.max(0, current) : null;
+  }
+
+  #programDateTimeForMediaTime(mediaTime) {
+    const level = this.#hls?.levels?.[this.#hls.currentLevel];
+    const details = this.#hls?.latestLevelDetails || level?.details || this.#hls?.levels?.find(l => l.details)?.details;
+    const fragments = details?.fragments || [];
+    for (const frag of fragments) {
+      const start = Number(frag.start);
+      const duration = Number(frag.duration);
+      const pdt = this.#programDateSeconds(frag.programDateTime);
+      if (!Number.isFinite(start) || !Number.isFinite(duration) || pdt == null) continue;
+      if (mediaTime >= start - 0.05 && mediaTime <= start + duration + 0.05) {
+        return pdt + (mediaTime - start);
+      }
+    }
+    return null;
+  }
+
+  #programDateSeconds(value) {
+    if (value == null) return null;
+    if (value instanceof Date) return value.getTime() / 1000;
+    const n = Number(value);
+    if (Number.isFinite(n)) return n > 1e11 ? n / 1000 : n;
+    const parsed = Date.parse(String(value));
+    return Number.isFinite(parsed) ? parsed / 1000 : null;
+  }
 
   #applyRate() {
     this.#v.defaultPlaybackRate = this.#rate;
@@ -1128,7 +1177,7 @@ const st = {
   speed:    parseInt(localStorage.getItem("v2speed") || "1"),
   loop:     true,
   showBoxes:localStorage.getItem("v2boxes") !== "0",
-  dets:     {},  // segId → [{ts_offset, boxes, classes}]
+  overlays: { sourceId: null, from: 0, to: 0, detections: [], loadingKey: null, seq: 0 },
   initDone: false,
   classSearchSeq: 0,
   summary: { total: 0, classes: {} },
@@ -1991,7 +2040,6 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
         startPosition,
         sourceId: resolved.source_id ?? srcId,
         segmentId: resolved.segment_id,
-        detectionStartTs: Number(resolved.segment_media_epoch),
         requestedTs: desiredTs,
         autoplay,
       });
@@ -3637,31 +3685,89 @@ player.on("timeupdate", () => {
   maybeLoopResolvedClipPreview(ts);
 });
 
+player.on("frame", () => {
+  if (liveTail.active) return;
+  const ts = player.currentTs;
+  if (ts == null) return;
+  drawBoxes(ts);
+});
+
 // ── Box overlay ───────────────────────────────────────
-async function loadDets(segId) {
-  if (st.dets[segId] != null) return;
-  st.dets[segId] = [];  // mark as loading
-  const r = await fetch(`/api/video/detections?segment_id=${segId}`, { cache:"no-store" });
-  if (r.ok) st.dets[segId] = (await r.json()).detections || [];
+function overlayRangeFor(seg, ts) {
+  const start = Number(seg?.start_ts);
+  const end = Number(seg?.end_ts);
+  if (Number.isFinite(start) && Number.isFinite(end) && end > start && end - start <= 900) {
+    return { from: start - 2, to: end + 2 };
+  }
+  return { from: ts - 30, to: ts + 30 };
+}
+
+function overlayCacheCovers(sourceId, ts) {
+  return (
+    st.overlays.sourceId === sourceId &&
+    Number(st.overlays.from) <= ts &&
+    Number(st.overlays.to) >= ts
+  );
+}
+
+async function loadOverlayDets(sourceId, from, to) {
+  if (!sourceId || sourceId === "all") return;
+  const lo = Math.floor(Math.min(from, to));
+  const hi = Math.ceil(Math.max(from, to));
+  const key = `${sourceId}|${lo}|${hi}`;
+  if (st.overlays.loadingKey === key) return;
+  if (
+    st.overlays.sourceId === sourceId &&
+    st.overlays.from <= lo &&
+    st.overlays.to >= hi
+  ) return;
+  st.overlays.loadingKey = key;
+  const seq = ++st.overlays.seq;
+  const p = new URLSearchParams({
+    source: sourceId,
+    since: String(lo),
+    until: String(hi),
+  });
+  const r = await fetch(`/api/video/overlays?${p}`, { cache:"no-store" }).catch(() => null);
+  if (seq !== st.overlays.seq) return;
+  if (r?.ok) {
+    st.overlays = {
+      sourceId,
+      from: lo,
+      to: hi,
+      detections: (await r.json().catch(() => ({}))).detections || [],
+      loadingKey: null,
+      seq,
+    };
+    drawBoxes(player.currentTs);
+  } else if (st.overlays.loadingKey === key) {
+    st.overlays.loadingKey = null;
+  }
 }
 
 function drawBoxes(ts) {
   if (liveTail.active) return;
   const v = el.video;
   const seg = player.currentSeg;
+  if (!Number.isFinite(Number(ts))) { drawBoxList(v, []); return; }
   if (!seg) { drawBoxList(v, []); return; }
-  if (!st.dets[seg.id]) { loadDets(seg.id); drawBoxList(v, []); return; }
+  const sourceId = seg.source_id ?? (st.source !== "all" ? st.source : null);
+  if (!sourceId) { drawBoxList(v, []); return; }
+  if (!overlayCacheCovers(sourceId, ts)) {
+    const range = overlayRangeFor(seg, ts);
+    loadOverlayDets(sourceId, range.from, range.to);
+    drawBoxList(v, []);
+    return;
+  }
 
-  const detStartTs = Number.isFinite(Number(seg.detection_start_ts))
-    ? Number(seg.detection_start_ts)
-    : seg.start_ts;
-  const off = ts - detStartTs;
   let nearestBoxes = [];
   let bestDist = Infinity;
-  for (const d of st.dets[seg.id] || []) {
+  for (const d of st.overlays.detections || []) {
     const boxes = _filterBoxes(d.boxes);
     if (!boxes.length) continue;
-    const dist = Math.abs(d.ts_offset - off);
+    const detTs = Number(d.abs_ts);
+    if (!Number.isFinite(detTs)) continue;
+    const dist = Math.abs(detTs - ts);
     if (dist < bestDist) {
       bestDist = dist;
       nearestBoxes = boxes;
