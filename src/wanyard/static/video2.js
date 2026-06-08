@@ -1235,7 +1235,9 @@ const liveTail = {
 
 function urlTimestamp(ts) {
   const n = Number(ts);
-  if (!Number.isFinite(n)) return null;
+  // Reject null/undefined (Number(null)===0) and any non-positive value: a URL ts
+  // is an absolute world time, never 0. Prevents ?ts=0 from a live click.
+  if (ts == null || !Number.isFinite(n) || n <= 0) return null;
   return n.toFixed(3).replace(/\.?0+$/, "");
 }
 
@@ -4473,7 +4475,8 @@ function applyQueryState(p) {
       st.activeZoneId = Number.isFinite(n) ? n : null;
     }
   }
-  return { ts: p.has("ts") ? parseFloat(p.get("ts")) : null, live: p.get("live") === "1" };
+  const tsv = p.has("ts") ? parseFloat(p.get("ts")) : null;
+  return { ts: Number.isFinite(tsv) && tsv > 0 ? tsv : null, live: p.get("live") === "1" };
 }
 
 function readState() {
