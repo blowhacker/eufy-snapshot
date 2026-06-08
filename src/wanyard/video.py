@@ -58,7 +58,6 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 CREATE INDEX IF NOT EXISTS seg_source_ts ON segments(source_id, start_ts);
 CREATE INDEX IF NOT EXISTS seg_source_end_ts ON segments(source_id, end_ts, start_ts);
-CREATE INDEX IF NOT EXISTS seg_source_media_start ON segments(source_id, media_start_ts);
 
 CREATE TABLE IF NOT EXISTS video_detections (
     id          INTEGER PRIMARY KEY,
@@ -72,7 +71,6 @@ CREATE TABLE IF NOT EXISTS video_detections (
     classes_json TEXT
 );
 CREATE INDEX IF NOT EXISTS vdet_seg ON video_detections(segment_id, ts_offset);
-CREATE INDEX IF NOT EXISTS vdet_source_abs ON video_detections(source_id, abs_ts);
 
 CREATE TABLE IF NOT EXISTS video_events (
     id          INTEGER PRIMARY KEY,
@@ -133,7 +131,6 @@ CREATE TABLE IF NOT EXISTS object_events (
 );
 CREATE INDEX IF NOT EXISTS oevt_source_ts ON object_events(source_id, abs_ts);
 CREATE INDEX IF NOT EXISTS oevt_class_ts ON object_events(class, abs_ts);
-CREATE INDEX IF NOT EXISTS oevt_source_display_ts ON object_events(source_id, display_ts);
 CREATE INDEX IF NOT EXISTS oevt_track ON object_events(track_id, abs_ts);
 CREATE INDEX IF NOT EXISTS oevt_seg ON object_events(segment_id, class);
 
