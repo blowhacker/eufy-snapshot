@@ -3762,9 +3762,10 @@ function interpolateBox(a, b, t) {
 //                is implausible. Fast-but-straight stays; teleport/heading-flip cut.
 const _OVL_MAX_GAP    = 2.5;   // s — never bridge a bigger hole
 const _OVL_SNAP       = 0.8;   // s — show a lone/edge sample within this window
-const _OVL_GATE_FLOOR = 0.06;  // normalized center units (min gate)
-const _OVL_GATE_K     = 1.5;   // gate grows with speed*dt (fast objects get slack)
-const _OVL_WARM_GATE  = 0.14;  // first link has no velocity yet — plain distance gate
+const _OVL_GATE_FLOOR = 0.22;  // normalized center units — generous; keep glides smooth
+const _OVL_GATE_K     = 2.5;   // gate grows with speed*dt (fast straight movers get slack)
+const _OVL_WARM_GATE  = 0.40;  // first link has no velocity — near old greedy, lets fast tracks start
+const _OVL_MIN_SPEED  = 0.04;  // below this (per s) treat as stationary; skip heading veto
 
 function overlayTracklets() {
   const o = st.overlays;
@@ -3806,15 +3807,22 @@ function overlayTracklets() {
         if (d < bd) { bd = d; cand.bestHead = p; }
       }
     }
-    // link only mutual pairs that pass the gate
+    // link only mutual pairs that pass the gate (and don't reverse heading)
     for (const p of preds) {
       const b = p.best;
-      if (b && !b.used && b.bestHead === p && p.bestDist <= p.gate) {
-        p.t.vx = (b.cx - p.h.cx) / p.dt;
-        p.t.vy = (b.cy - p.h.cy) / p.dt;
-        p.t.pts.push({ ts: s.ts, box: b.box, cx: b.cx, cy: b.cy });
-        b.used = true;
+      if (!b || b.used || b.bestHead !== p || p.bestDist > p.gate) continue;
+      // heading veto: an established mover can't flip direction >90deg in one step
+      // (across-street hijack is opposite to the subject's motion). Magnitude alone
+      // can't tell — a fast straight mover needs a big gate, which also admits the
+      // stranger; direction is the discriminator.
+      if (p.t.vx != null && Math.hypot(p.t.vx, p.t.vy) > _OVL_MIN_SPEED) {
+        const ddx = b.cx - p.h.cx, ddy = b.cy - p.h.cy;
+        if (p.t.vx * ddx + p.t.vy * ddy < 0) continue;   // reversal -> reject
       }
+      p.t.vx = (b.cx - p.h.cx) / p.dt;
+      p.t.vy = (b.cy - p.h.cy) / p.dt;
+      p.t.pts.push({ ts: s.ts, box: b.box, cx: b.cx, cy: b.cy });
+      b.used = true;
     }
     // unmatched detections start their own tracklet
     for (const cand of cands)
