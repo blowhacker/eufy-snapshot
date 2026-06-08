@@ -121,6 +121,73 @@ def _read_live_hls_window(video_dir: Path | None, source_id: str | None) -> dict
     }
 
 
+# Overlay association — kept in lockstep with the browser overlay
+# (video2.js overlayTracklets). Chain per-frame boxes into tracklets so a burned
+# clip box only interpolates toward the SAME object: mutual-NN + constant-velocity
+# gate + heading veto. Same constants as the JS so clip == on-screen overlay.
+_OVL_MAX_GAP    = 2.5
+_OVL_SNAP       = 0.8
+_OVL_GATE_FLOOR = 0.22
+_OVL_GATE_K     = 2.5
+_OVL_WARM_GATE  = 0.40
+_OVL_MIN_SPEED  = 0.04
+
+
+def _hypot(a: float, b: float) -> float:
+    return (a * a + b * b) ** 0.5
+
+
+def _overlay_tracklets(samples: list) -> list:
+    """samples: [(rel_ts, [box {cls,conf,x1,y1,x2,y2,cx,cy}])] sorted by rel_ts.
+    Returns [{cls, pts:[{t, box, cx, cy}]}] using the same association as the UI."""
+    tracks: list = []
+    for rel, boxes in samples:
+        heads = [t for t in tracks if rel - t["pts"][-1]["t"] <= _OVL_MAX_GAP]
+        cands = [{"box": b, "cx": b["cx"], "cy": b["cy"], "cls": b["cls"],
+                  "used": False, "bestHead": None} for b in boxes]
+        preds = []
+        for t in heads:
+            h = t["pts"][-1]; dt = rel - h["t"]; mv = t["vx"] is not None
+            px = h["cx"] + t["vx"] * dt if mv else h["cx"]
+            py = h["cy"] + t["vy"] * dt if mv else h["cy"]
+            gate = (max(_OVL_GATE_FLOOR, _OVL_GATE_K * _hypot(t["vx"], t["vy"]) * dt)
+                    if mv else _OVL_WARM_GATE)
+            preds.append({"t": t, "h": h, "dt": dt, "px": px, "py": py,
+                          "gate": gate, "best": None, "bestDist": float("inf")})
+        for p in preds:
+            for c in cands:
+                if c["cls"] != p["t"]["cls"]:
+                    continue
+                d = _hypot(c["cx"] - p["px"], c["cy"] - p["py"])
+                if d < p["bestDist"]:
+                    p["bestDist"] = d; p["best"] = c
+        for c in cands:
+            bd = float("inf")
+            for p in preds:
+                if p["t"]["cls"] != c["cls"]:
+                    continue
+                d = _hypot(c["cx"] - p["h"]["cx"], c["cy"] - p["h"]["cy"])
+                if d < bd:
+                    bd = d; c["bestHead"] = p
+        for p in preds:
+            b = p["best"]
+            if not b or b["used"] or b["bestHead"] is not p or p["bestDist"] > p["gate"]:
+                continue
+            t = p["t"]
+            if t["vx"] is not None and _hypot(t["vx"], t["vy"]) > _OVL_MIN_SPEED:
+                if t["vx"] * (b["cx"] - p["h"]["cx"]) + t["vy"] * (b["cy"] - p["h"]["cy"]) < 0:
+                    continue   # heading reversal -> reject
+            t["vx"] = (b["cx"] - p["h"]["cx"]) / p["dt"]
+            t["vy"] = (b["cy"] - p["h"]["cy"]) / p["dt"]
+            t["pts"].append({"t": rel, "box": b["box"], "cx": b["cx"], "cy": b["cy"]})
+            b["used"] = True
+        for c in cands:
+            if not c["used"]:
+                tracks.append({"cls": c["cls"], "vx": None, "vy": None,
+                               "pts": [{"t": rel, "box": c["box"], "cx": c["cx"], "cy": c["cy"]}]})
+    return tracks
+
+
 def _generate_thumb(src: Path, dest: Path) -> bool:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -987,7 +1054,7 @@ def make_app(
             return None
 
         duration = max(0.0, clip_end - clip_start)
-        samples: list[tuple[float, list[tuple[str, float, float, float, float, float]]]] = []
+        samples = []
         for det in dets:
             try:
                 rel = float(det["abs_ts"]) - clip_start
@@ -999,11 +1066,6 @@ def make_app(
             for box in det.get("boxes") or []:
                 if not isinstance(box, dict):
                     continue
-                cls = str(box.get("cls") or "")
-                if include_classes and cls not in include_classes:
-                    continue
-                if exclude_classes and cls in exclude_classes:
-                    continue
                 try:
                     x1 = max(0.0, min(1.0, float(box["x1"])))
                     y1 = max(0.0, min(1.0, float(box["y1"])))
@@ -1014,7 +1076,11 @@ def make_app(
                     continue
                 if x2 <= x1 or y2 <= y1:
                     continue
-                boxes.append((cls, conf, x1, y1, x2, y2))
+                # tracklets are built unfiltered (assoc is per-class); class filter
+                # is applied per tracklet below, matching the browser overlay.
+                boxes.append({"cls": str(box.get("cls") or ""), "conf": conf,
+                              "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                              "cx": (x1 + x2) / 2, "cy": (y1 + y2) / 2})
             if boxes:
                 samples.append((rel, boxes))
 
@@ -1022,38 +1088,56 @@ def make_app(
             return None
         samples.sort(key=lambda item: item[0])
 
+        def _lerp_expr(v0, v1, t0, t1):
+            # linear-in-t ffmpeg expression so the burned box glides a->b
+            if abs(t1 - t0) < 1e-6 or abs(v1 - v0) < 1e-9:
+                return f"{v0:.6f}"
+            return f"({v0:.6f}+({(v1 - v0):.6f})*(t-{t0:.6f})/{(t1 - t0):.6f})"
+
+        def _emit(a, b, cls, conf, t0, t1):
+            color = _box_color(cls)
+            ex1 = _lerp_expr(a["x1"], b["x1"], t0, t1)
+            ey1 = _lerp_expr(a["y1"], b["y1"], t0, t1)
+            ex2 = _lerp_expr(a["x2"], b["x2"], t0, t1)
+            ey2 = _lerp_expr(a["y2"], b["y2"], t0, t1)
+            enable = f"between(t\\,{t0:.3f}\\,{t1:.3f})"
+            label = f"{cls} {round(conf * 100)}%" if conf > 0 else cls
+            label_y = f"h*{ey1}-30" if a["y1"] > 0.03 else f"h*{ey2}+2"
+            return [
+                "drawbox="
+                f"x=iw*{ex1}:y=ih*{ey1}:"
+                f"w=iw*({ex2}-{ex1}):h=ih*({ey2}-{ey1}):"
+                f"color={color}@0.95:t=3:enable='{enable}'",
+                "drawtext="
+                "expansion=none:"
+                f"text='{_drawtext_escape(label)}':"
+                f"x=w*{ex1}:y={label_y}:"
+                "fontcolor=0x050709:fontsize=24:"
+                f"box=1:boxcolor={color}@0.95:boxborderw=5:"
+                f"enable='{enable}'",
+            ]
+
         filters = []
-        for i, (rel, boxes) in enumerate(samples):
-            prev_rel = samples[i - 1][0] if i > 0 else None
-            next_rel = samples[i + 1][0] if i + 1 < len(samples) else None
-            start = rel - min(1.5, (rel - prev_rel) / 2) if prev_rel is not None else rel - 1.5
-            end = rel + min(1.5, (next_rel - rel) / 2) if next_rel is not None else rel + 1.5
-            start = max(0.0, start)
-            end = min(duration, end)
-            if end <= start:
+        for tr in _overlay_tracklets(samples):
+            cls = tr["cls"]
+            if include_classes and cls not in include_classes:
                 continue
-            enable = f"between(t\\,{start:.3f}\\,{end:.3f})"
-            for cls, conf, x1, y1, x2, y2 in boxes:
-                color = _box_color(cls)
-                label = cls
-                if conf > 0:
-                    label = f"{cls} {round(conf * 100)}%"
-                label_y = f"h*{y1:.6f}-30" if y1 > 0.03 else f"h*{y2:.6f}+2"
-                filters.append(
-                    "drawbox="
-                    f"x=iw*{x1:.6f}:y=ih*{y1:.6f}:"
-                    f"w=iw*{(x2 - x1):.6f}:h=ih*{(y2 - y1):.6f}:"
-                    f"color={color}@0.95:t=3:enable='{enable}'"
-                )
-                filters.append(
-                    "drawtext="
-                    "expansion=none:"
-                    f"text='{_drawtext_escape(label)}':"
-                    f"x=w*{x1:.6f}:y={label_y}:"
-                    "fontcolor=0x050709:fontsize=24:"
-                    f"box=1:boxcolor={color}@0.95:boxborderw=5:"
-                    f"enable='{enable}'"
-                )
+            if exclude_classes and cls in exclude_classes:
+                continue
+            pts = tr["pts"]
+            for i in range(len(pts)):
+                a = pts[i]["box"]
+                conf = float(a.get("conf") or 0.0)
+                nxt = pts[i + 1] if i + 1 < len(pts) else None
+                if nxt is not None and (nxt["t"] - pts[i]["t"]) <= _OVL_MAX_GAP:
+                    t0 = max(0.0, pts[i]["t"]); t1 = min(duration, nxt["t"])
+                    if t1 > t0:
+                        filters += _emit(a, nxt["box"], cls, conf, t0, t1)
+                else:
+                    # tail / lone / gap: persist this box forward (causal), no lerp
+                    t0 = max(0.0, pts[i]["t"]); t1 = min(duration, pts[i]["t"] + _OVL_SNAP)
+                    if t1 > t0:
+                        filters += _emit(a, a, cls, conf, t0, t1)
                 if len(filters) >= 2500:
                     return ",".join(filters)
         return ",".join(filters) if filters else None
