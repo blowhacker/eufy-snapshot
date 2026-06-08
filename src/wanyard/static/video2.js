@@ -3745,6 +3745,96 @@ async function loadOverlayDets(sourceId, from, to) {
   }
 }
 
+function boxCenter(box) {
+  return {
+    x: (Number(box.x1) + Number(box.x2)) / 2,
+    y: (Number(box.y1) + Number(box.y2)) / 2,
+  };
+}
+
+function boxCenterDistance(a, b) {
+  const ac = boxCenter(a);
+  const bc = boxCenter(b);
+  return Math.hypot(ac.x - bc.x, ac.y - bc.y);
+}
+
+function lerp(a, b, t) {
+  return Number(a) + (Number(b) - Number(a)) * t;
+}
+
+function interpolateBox(a, b, t) {
+  return {
+    ...a,
+    x1: lerp(a.x1, b.x1, t),
+    y1: lerp(a.y1, b.y1, t),
+    x2: lerp(a.x2, b.x2, t),
+    y2: lerp(a.y2, b.y2, t),
+    conf: lerp(a.conf ?? b.conf ?? 0, b.conf ?? a.conf ?? 0, t),
+    cls: a.cls,
+  };
+}
+
+function interpolateBoxSamples(prev, next, ts) {
+  if (!prev || !next || prev === next) return prev?.boxes || next?.boxes || [];
+  const span = next.ts - prev.ts;
+  if (!(span > 0)) return prev.boxes || [];
+  const t = Math.max(0, Math.min(1, (ts - prev.ts) / span));
+  const used = new Set();
+  const out = [];
+  for (const a of prev.boxes) {
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < next.boxes.length; i++) {
+      if (used.has(i)) continue;
+      const b = next.boxes[i];
+      if (b.cls !== a.cls) continue;
+      const dist = boxCenterDistance(a, b);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx >= 0 && bestDist <= 0.45) {
+      used.add(bestIdx);
+      out.push(interpolateBox(a, next.boxes[bestIdx], t));
+    }
+  }
+  return out.length ? out : (t < 0.5 ? prev.boxes : next.boxes);
+}
+
+function boxesAtOverlayTime(ts) {
+  const samples = (st.overlays.detections || [])
+    .map(d => ({ ts: Number(d.abs_ts), boxes: _filterBoxes(d.boxes) }))
+    .filter(s => Number.isFinite(s.ts) && s.boxes.length)
+    .sort((a, b) => a.ts - b.ts);
+  if (!samples.length) return [];
+
+  let prev = null;
+  let next = null;
+  for (const sample of samples) {
+    if (sample.ts <= ts) prev = sample;
+    if (sample.ts >= ts) {
+      next = sample;
+      break;
+    }
+  }
+
+  if (prev && next && prev !== next && ts - prev.ts <= 2.5 && next.ts - ts <= 2.5) {
+    return interpolateBoxSamples(prev, next, ts);
+  }
+
+  let nearest = null;
+  let bestDist = Infinity;
+  for (const sample of samples) {
+    const dist = Math.abs(sample.ts - ts);
+    if (dist < bestDist) {
+      nearest = sample;
+      bestDist = dist;
+    }
+  }
+  return nearest && bestDist <= 1.5 ? nearest.boxes : [];
+}
+
 function drawBoxes(ts) {
   if (liveTail.active) return;
   const v = el.video;
@@ -3760,22 +3850,7 @@ function drawBoxes(ts) {
     return;
   }
 
-  let nearestBoxes = [];
-  let bestDist = Infinity;
-  for (const d of st.overlays.detections || []) {
-    const boxes = _filterBoxes(d.boxes);
-    if (!boxes.length) continue;
-    const detTs = Number(d.abs_ts);
-    if (!Number.isFinite(detTs)) continue;
-    const dist = Math.abs(detTs - ts);
-    if (dist < bestDist) {
-      bestDist = dist;
-      nearestBoxes = boxes;
-    }
-  }
-  if (bestDist > 1.5) { drawBoxList(v, []); return; }
-
-  drawBoxList(v, nearestBoxes);
+  drawBoxList(v, boxesAtOverlayTime(ts));
 }
 
 function drawLiveBoxes() {
