@@ -25,7 +25,6 @@ _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS = (
     _LIVE_HLS_SEGMENT_SECONDS * (_LIVE_HLS_LIST_SIZE + 30)
 )
 _LIVE_HLS_STALE_PLAYLIST_SECONDS = _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS
-_HLS_ANCHOR_PRESTART_GRACE_SECONDS = 2.0
 _SPRITE_FPS          = "1/5"
 _SPRITE_W            = 160
 _SPRITE_COLS         = 10
@@ -51,16 +50,21 @@ CREATE TABLE IF NOT EXISTS segments (
     path            TEXT    NOT NULL UNIQUE,
     start_ts        REAL    NOT NULL,
     end_ts          REAL,
-    actual_start_ts REAL,        -- camera-accurate first-frame time (from HLS)
+    media_start_ts  REAL,        -- camera/world time of media offset 0
+    duration_sec    REAL,        -- playable media duration; private media metadata
+    actual_start_ts REAL,        -- legacy alias for media_start_ts during rollout
     spritesheet     TEXT,
     webvtt          TEXT
 );
 CREATE INDEX IF NOT EXISTS seg_source_ts ON segments(source_id, start_ts);
 CREATE INDEX IF NOT EXISTS seg_source_end_ts ON segments(source_id, end_ts, start_ts);
+CREATE INDEX IF NOT EXISTS seg_source_media_start ON segments(source_id, media_start_ts);
 
 CREATE TABLE IF NOT EXISTS video_detections (
     id          INTEGER PRIMARY KEY,
     segment_id  INTEGER REFERENCES segments(id) ON DELETE CASCADE,
+    source_id   TEXT    NOT NULL,
+    abs_ts      REAL    NOT NULL,
     ts_offset   REAL    NOT NULL,
     has_human   INTEGER NOT NULL DEFAULT 0,
     confidence  REAL    NOT NULL DEFAULT 0,
@@ -68,6 +72,7 @@ CREATE TABLE IF NOT EXISTS video_detections (
     classes_json TEXT
 );
 CREATE INDEX IF NOT EXISTS vdet_seg ON video_detections(segment_id, ts_offset);
+CREATE INDEX IF NOT EXISTS vdet_source_abs ON video_detections(source_id, abs_ts);
 
 CREATE TABLE IF NOT EXISTS video_events (
     id          INTEGER PRIMARY KEY,
@@ -118,6 +123,7 @@ CREATE TABLE IF NOT EXISTS object_events (
     segment_id  INTEGER REFERENCES segments(id) ON DELETE SET NULL,
     source_id   TEXT    NOT NULL,
     abs_ts      REAL    NOT NULL,
+    display_ts  REAL    NOT NULL,
     class       TEXT    NOT NULL,
     event_type  TEXT    NOT NULL,
     start_off   REAL    NOT NULL DEFAULT 0,
@@ -127,6 +133,7 @@ CREATE TABLE IF NOT EXISTS object_events (
 );
 CREATE INDEX IF NOT EXISTS oevt_source_ts ON object_events(source_id, abs_ts);
 CREATE INDEX IF NOT EXISTS oevt_class_ts ON object_events(class, abs_ts);
+CREATE INDEX IF NOT EXISTS oevt_source_display_ts ON object_events(source_id, display_ts);
 CREATE INDEX IF NOT EXISTS oevt_track ON object_events(track_id, abs_ts);
 CREATE INDEX IF NOT EXISTS oevt_seg ON object_events(segment_id, class);
 
@@ -255,59 +262,86 @@ def _dominant_class(classes: list[str]) -> str:
 
 
 # ── world-time basis (see docs/media-time-architecture.md) ───────────────────
-# Stored abs_ts / start_ts are in nominal (start_ts) basis. Everything the UI
-# consumes is exposed in true-world (media_epoch = actual_start_ts) basis so that
-# `ts - start_ts` yields the real file offset for BOTH grid events and
-# notifications. Conversion happens once, at these read boundaries.
+# Public media state uses one clock: fractional camera/world time. Historical
+# recorder-open time (`start_ts`) and media offsets are private storage metadata.
 
-def _seg_world_epoch(start_ts, actual_start_ts):
-    if actual_start_ts is None:
-        return start_ts
+def _row_value(row, key: str, default=None):
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
     try:
-        st = float(start_ts)
-        epoch = float(actual_start_ts)
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
+
+def _seg_media_start(row) -> float | None:
+    value = _row_value(row, "media_start_ts")
+    if value is None:
+        value = _row_value(row, "actual_start_ts")
+    if value is None:
+        return None
+    try:
+        return float(value)
     except (TypeError, ValueError):
-        return start_ts
-    if epoch < st - _HLS_ANCHOR_PRESTART_GRACE_SECONDS:
-        return start_ts
-    return actual_start_ts
+        return None
+
+
+def _seg_duration(row) -> float | None:
+    duration = _row_value(row, "duration_sec")
+    if duration is not None:
+        try:
+            return max(0.0, float(duration))
+        except (TypeError, ValueError):
+            pass
+    end_ts = _row_value(row, "end_ts")
+    start_ts = _row_value(row, "start_ts")
+    if end_ts is None or start_ts is None:
+        return None
+    try:
+        return max(0.0, float(end_ts) - float(start_ts))
+    except (TypeError, ValueError):
+        return None
 
 
 def _segment_media_epoch_sql(alias: str | None = None) -> str:
     p = f"{alias}." if alias else ""
-    grace = f"{_HLS_ANCHOR_PRESTART_GRACE_SECONDS:.6f}"
-    return (
-        "(CASE WHEN "
-        f"{p}actual_start_ts IS NOT NULL"
-        f" AND {p}actual_start_ts >= {p}start_ts - {grace}"
-        f" THEN {p}actual_start_ts ELSE {p}start_ts END)"
-    )
+    return f"COALESCE({p}media_start_ts, {p}actual_start_ts)"
 
 
 def _worldize_event_row(r: dict) -> dict:
-    """Event row → media_epoch basis, preserving (abs_ts - seg_start_ts) ==
-    ts_offset. Needs seg_start_ts (+ seg_actual_start_ts) on the row. Rows
-    without a segment join (e.g. live HLS events, already world-time) pass
-    through untouched."""
-    st = r.get("seg_start_ts")
-    if st is None:
+    """Public event row: abs_ts/display_ts are already universal time.
+
+    Segment start is rewritten to media_start_ts for consumers that need private
+    media offset math, such as thumbnails and clip export.
+    """
+    media_start = _seg_media_start({
+        "media_start_ts": r.get("seg_media_start_ts"),
+        "actual_start_ts": r.get("seg_actual_start_ts"),
+    })
+    if media_start is None:
         return r
-    epoch = _seg_world_epoch(st, r.get("seg_actual_start_ts"))
-    if r.get("abs_ts") is not None:
-        r["abs_ts"] = r["abs_ts"] - st + epoch
-    r["seg_start_ts"] = epoch
+    r["seg_start_ts"] = media_start
+    if r.get("display_ts") is None and r.get("abs_ts") is not None:
+        r["display_ts"] = r["abs_ts"]
     return r
 
 
 def _worldize_segment_row(r: dict) -> dict:
-    """Segment row → media_epoch basis: start_ts becomes the camera-accurate
-    first-frame time and end_ts is re-anchored to keep the recording span, so
-    playback offset math (ts - start_ts) gives the true file offset."""
-    if r.get("actual_start_ts") is not None:
-        epoch = _seg_world_epoch(r.get("start_ts"), r.get("actual_start_ts"))
-        if r.get("end_ts") is not None and r.get("start_ts") is not None:
-            r["end_ts"] = epoch + (r["end_ts"] - r["start_ts"])
-        r["start_ts"] = epoch
+    """Segment row exposed in universal time.
+
+    `start_ts` remains the field name expected by the UI, but its public value is
+    media_start_ts. The original recorder-open value is retained as
+    recording_start_ts for debugging/storage-only paths.
+    """
+    media_start = _seg_media_start(r)
+    r["recording_start_ts"] = r.get("start_ts")
+    if media_start is not None:
+        duration = _seg_duration(r)
+        r["start_ts"] = media_start
+        if r.get("end_ts") is not None and duration is not None:
+            r["end_ts"] = media_start + duration
     return r
 
 
@@ -321,8 +355,13 @@ class VideoSegmentDB:
             for migration in [
                 "ALTER TABLE hls_events ADD COLUMN thumb_jpeg BLOB",
                 "ALTER TABLE segments  ADD COLUMN actual_start_ts REAL",
+                "ALTER TABLE segments  ADD COLUMN media_start_ts REAL",
+                "ALTER TABLE segments  ADD COLUMN duration_sec REAL",
+                "ALTER TABLE video_detections ADD COLUMN source_id TEXT",
+                "ALTER TABLE video_detections ADD COLUMN abs_ts REAL",
                 "ALTER TABLE video_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'detection'",
                 "ALTER TABLE video_events ADD COLUMN track_id TEXT",
+                "ALTER TABLE object_events ADD COLUMN display_ts REAL",
                 "ALTER TABLE video_zones ADD COLUMN uid TEXT",
                 "ALTER TABLE notification_events ADD COLUMN thumb_jpeg BLOB",
             ]:
@@ -340,6 +379,18 @@ class VideoSegmentDB:
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS vzone_source_uid"
                 " ON video_zones(source_id, uid)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS seg_source_media_start"
+                " ON segments(source_id, media_start_ts)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS vdet_source_abs"
+                " ON video_detections(source_id, abs_ts)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS oevt_source_display_ts"
+                " ON object_events(source_id, display_ts)"
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -364,34 +415,95 @@ class VideoSegmentDB:
     def close_segment(self, segment_id: int, end_ts: float,
                       spritesheet: str | None, webvtt: str | None) -> None:
         with self._connect() as conn:
+            row = conn.execute(
+                "SELECT start_ts FROM segments WHERE id=?",
+                (segment_id,),
+            ).fetchone()
+            duration = None
+            if row:
+                duration = max(0.0, float(end_ts) - float(row["start_ts"]))
             conn.execute(
-                "UPDATE segments SET end_ts=?, spritesheet=?, webvtt=? WHERE id=?",
-                (end_ts, spritesheet, webvtt, segment_id),
+                "UPDATE segments"
+                " SET end_ts=?, duration_sec=?, spritesheet=?, webvtt=?"
+                " WHERE id=?",
+                (end_ts, duration, spritesheet, webvtt, segment_id),
+            )
+
+    def set_segment_media_start(self, segment_id: int, media_start_ts: float) -> None:
+        """Attach the world-time anchor for media offset 0 of one segment."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE segments"
+                " SET media_start_ts = CASE"
+                "   WHEN media_start_ts IS NULL THEN ?"
+                "   ELSE MIN(media_start_ts, ?)"
+                " END,"
+                " actual_start_ts = CASE"
+                "   WHEN actual_start_ts IS NULL THEN ?"
+                "   ELSE MIN(actual_start_ts, ?)"
+                " END"
+                " WHERE id=?",
+                (media_start_ts, media_start_ts, media_start_ts, media_start_ts, segment_id),
             )
 
     def add_detection(self, segment_id: int, ts_offset: float,
                       has_human: bool, confidence: float,
                       boxes: list | None, classes: list | None) -> None:
         with self._connect() as conn:
+            seg = conn.execute(
+                "SELECT source_id, start_ts, media_start_ts, actual_start_ts"
+                " FROM segments WHERE id=?",
+                (segment_id,),
+            ).fetchone()
+            if not seg:
+                raise ValueError(f"unknown segment_id {segment_id}")
+            media_start = _seg_media_start(seg)
+            if media_start is None:
+                raise ValueError(f"segment {segment_id} has no media_start_ts")
             conn.execute(
                 "INSERT INTO video_detections"
-                "(segment_id, ts_offset, has_human, confidence, boxes_json, classes_json)"
-                " VALUES(?,?,?,?,?,?)",
-                (segment_id, ts_offset, int(has_human), confidence,
+                "(segment_id, source_id, abs_ts, ts_offset, has_human,"
+                " confidence, boxes_json, classes_json)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (segment_id, seg["source_id"], media_start + float(ts_offset),
+                 ts_offset, int(has_human), confidence,
                  json.dumps(boxes) if boxes else None,
                  json.dumps(classes) if classes else None),
             )
 
     def replace_detections(self, segment_id: int, detections: list[dict]) -> None:
         with self._connect() as conn:
+            seg = conn.execute(
+                "SELECT source_id, start_ts, media_start_ts, actual_start_ts"
+                " FROM segments WHERE id=?",
+                (segment_id,),
+            ).fetchone()
+            if not seg:
+                raise ValueError(f"unknown segment_id {segment_id}")
+            media_start = _seg_media_start(seg)
+            has_real = any(float(d.get("ts_offset", 0.0)) >= 0 for d in detections)
+            if media_start is None and has_real:
+                raise ValueError(f"segment {segment_id} has no media_start_ts")
+            sentinel_ts = media_start if media_start is not None else float(seg["start_ts"])
             conn.execute("DELETE FROM video_detections WHERE segment_id=?", (segment_id,))
             conn.executemany(
                 "INSERT INTO video_detections"
-                "(segment_id, ts_offset, has_human, confidence, boxes_json, classes_json)"
-                " VALUES(?,?,?,?,?,?)",
+                "(segment_id, source_id, abs_ts, ts_offset, has_human,"
+                " confidence, boxes_json, classes_json)"
+                " VALUES(?,?,?,?,?,?,?,?)",
                 [
                     (
                         segment_id,
+                        seg["source_id"],
+                        (
+                            float(d["abs_ts"])
+                            if d.get("abs_ts") is not None
+                            else (
+                                media_start + float(d["ts_offset"])
+                                if media_start is not None and float(d["ts_offset"]) >= 0
+                                else sentinel_ts
+                            )
+                        ),
                         d["ts_offset"],
                         int(d["has_human"]),
                         d["confidence"],
@@ -412,11 +524,14 @@ class VideoSegmentDB:
     def detections_for_segment(self, segment_id: int) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT ts_offset, has_human, confidence, boxes_json, classes_json"
+                "SELECT source_id, abs_ts, ts_offset, has_human, confidence,"
+                " boxes_json, classes_json"
                 " FROM video_detections WHERE segment_id=? ORDER BY ts_offset",
                 (segment_id,),
             ).fetchall()
         return [{
+            "source_id":   r["source_id"],
+            "abs_ts":      r["abs_ts"],
             "ts_offset":  r["ts_offset"],
             "has_human":  bool(r["has_human"]),
             "confidence": r["confidence"],
@@ -425,22 +540,17 @@ class VideoSegmentDB:
         } for r in rows]
 
     def detections_between(self, source_id: str, since: float, until: float) -> list[dict]:
-        epoch = _segment_media_epoch_sql("s")
-        abs_expr = f"({epoch} + vd.ts_offset)"
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT vd.ts_offset, vd.has_human, vd.confidence,"
-                " vd.boxes_json, vd.classes_json,"
-                " s.id AS segment_id, s.source_id AS source_id,"
-                f" {epoch} AS media_epoch, {abs_expr} AS abs_ts"
+                "SELECT vd.segment_id, vd.source_id, vd.abs_ts, vd.ts_offset,"
+                " vd.has_human, vd.confidence, vd.boxes_json, vd.classes_json,"
+                " COALESCE(s.media_start_ts, s.actual_start_ts) AS media_epoch"
                 " FROM video_detections vd"
                 " JOIN segments s ON s.id=vd.segment_id"
-                " WHERE s.source_id=?"
-                " AND s.end_ts IS NOT NULL"
+                " WHERE vd.source_id=?"
+                " AND vd.abs_ts>=? AND vd.abs_ts<=?"
                 " AND vd.ts_offset>=0"
-                f" AND {abs_expr}>=?"
-                f" AND {abs_expr}<=?"
-                f" ORDER BY {abs_expr}",
+                " ORDER BY vd.abs_ts",
                 (source_id, since, until),
             ).fetchall()
             hls_rows = conn.execute(
@@ -933,37 +1043,22 @@ class VideoSegmentDB:
         since: float | None = None,
         until: float | None = None,
     ) -> bool:
+        where, params = ["1"], []
+        if source_id and source_id != "all":
+            where.append("source_id=?")
+            params.append(source_id)
+        if since is not None:
+            where.append("display_ts>=?")
+            params.append(since)
+        if until is not None:
+            where.append("display_ts<=?")
+            params.append(until)
         with self._connect() as conn:
-            if source_id and source_id != "all":
-                row = conn.execute(
-                    "SELECT since, until FROM object_derivations WHERE source_id=?",
-                    (source_id,),
-                ).fetchone()
-                return _derivation_covers(dict(row) if row else None, since, until)
-
-            where, params = ["1"], []
-            if since is not None:
-                where.append("(end_ts IS NULL OR end_ts>=?)")
-                params.append(since)
-            if until is not None:
-                where.append("start_ts<=?")
-                params.append(until)
-            sources = [
-                r["source_id"] for r in conn.execute(
-                    "SELECT DISTINCT source_id FROM segments"
-                    f" WHERE {' AND '.join(where)}",
-                    params,
-                ).fetchall()
-            ]
-            if not sources:
-                return False
-            rows = {
-                r["source_id"]: dict(r)
-                for r in conn.execute(
-                    "SELECT source_id, since, until FROM object_derivations"
-                ).fetchall()
-            }
-        return all(_derivation_covers(rows.get(src), since, until) for src in sources)
+            row = conn.execute(
+                f"SELECT 1 FROM object_events WHERE {' AND '.join(where)} LIMIT 1",
+                params,
+            ).fetchone()
+        return row is not None
 
     def mark_object_derivation(
         self,
@@ -981,14 +1076,21 @@ class VideoSegmentDB:
     def insert_object_events(self, events: list[dict]) -> None:
         if not events:
             return
+        rows = [
+            {
+                **event,
+                "display_ts": event.get("display_ts", event["abs_ts"]),
+            }
+            for event in events
+        ]
         with self._connect() as conn:
             conn.executemany(
                 "INSERT INTO object_events"
-                "(track_id, segment_id, source_id, abs_ts, class, event_type,"
+                "(track_id, segment_id, source_id, abs_ts, display_ts, class, event_type,"
                 " start_off, end_off, confidence, boxes_json)"
-                " VALUES(:track_id,:segment_id,:source_id,:abs_ts,:class,:event_type,"
+                " VALUES(:track_id,:segment_id,:source_id,:abs_ts,:display_ts,:class,:event_type,"
                 " :start_off,:end_off,:confidence,:boxes_json)",
-                events,
+                rows,
             )
 
     def list_object_events(self, source_id: str | None = None, cls: str | None = None,
@@ -1002,16 +1104,16 @@ class VideoSegmentDB:
         if cls and cls != "all":
             where.append("e.class=?"); params.append(cls)
         if since is not None:
-            where.append("e.abs_ts>=?"); params.append(since)
+            where.append("e.display_ts>=?"); params.append(since)
         if until is not None:
-            where.append("e.abs_ts<=?"); params.append(until)
+            where.append("e.display_ts<=?"); params.append(until)
         if date:
             import calendar
             from datetime import date as ddate
             d = ddate.fromisoformat(date)
             lo = calendar.timegm(d.timetuple()) - 86400
             hi = lo + 3 * 86400
-            where.append("e.abs_ts BETWEEN ? AND ?")
+            where.append("e.display_ts BETWEEN ? AND ?")
             params += [lo, hi]
         polygons = self.zone_polygons(source_id, zone_id)
         query_limit = limit
@@ -1019,10 +1121,11 @@ class VideoSegmentDB:
             query_limit = max(limit * 20, 200)
         sql = (
             "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts,"
+            " s.media_start_ts as seg_media_start_ts,"
             " s.actual_start_ts as seg_actual_start_ts"
             " FROM object_events e LEFT JOIN segments s ON s.id=e.segment_id"
             f" WHERE {' AND '.join(where)}"
-            " ORDER BY e.abs_ts DESC LIMIT ?"
+            " ORDER BY e.display_ts DESC LIMIT ?"
         )
         params.append(query_limit)
         with self._connect() as conn:
@@ -1040,7 +1143,10 @@ class VideoSegmentDB:
                 rows.extend(self.nearest_object_events(around, source_id, [cls], limit, zone_id))
             by_id = {r["id"]: r for r in rows}
             rows = list(by_id.values())
-            rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
+            rows.sort(key=lambda r: (
+                abs(float(r.get("display_ts", r["abs_ts"])) - around),
+                float(r.get("display_ts", r["abs_ts"])),
+            ))
             return rows[:limit]
 
         where, params = ["1"], []
@@ -1053,7 +1159,8 @@ class VideoSegmentDB:
         base = " AND ".join(where)
         select = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
-            " s.start_ts as seg_start_ts, s.actual_start_ts as seg_actual_start_ts"
+            " s.start_ts as seg_start_ts, s.media_start_ts as seg_media_start_ts,"
+            " s.actual_start_ts as seg_actual_start_ts"
             " FROM object_events e LEFT JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
@@ -1061,17 +1168,20 @@ class VideoSegmentDB:
         query_limit = max(limit * 20, 200) if polygons else limit
         with self._connect() as conn:
             before = conn.execute(
-                f"{select} AND e.abs_ts<=? ORDER BY e.abs_ts DESC LIMIT ?",
+                f"{select} AND e.display_ts<=? ORDER BY e.display_ts DESC LIMIT ?",
                 (*params, around, query_limit),
             ).fetchall()
             after = conn.execute(
-                f"{select} AND e.abs_ts>? ORDER BY e.abs_ts ASC LIMIT ?",
+                f"{select} AND e.display_ts>? ORDER BY e.display_ts ASC LIMIT ?",
                 (*params, around, query_limit),
             ).fetchall()
         rows = _filter_with_polygons(
             [_worldize_event_row(dict(r)) for r in before]
             + [_worldize_event_row(dict(r)) for r in after], polygons)
-        rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
+        rows.sort(key=lambda r: (
+            abs(float(r.get("display_ts", r["abs_ts"])) - around),
+            float(r.get("display_ts", r["abs_ts"])),
+        ))
         return [_public_object_event(r) for r in rows[:limit]]
 
     def insert_events(self, events: list[dict]) -> None:
@@ -1095,8 +1205,12 @@ class VideoSegmentDB:
 
     def track_object_events(self, segment: dict, tracklets: list[dict]) -> list[dict]:
         source_id = segment["source_id"]
-        seg_start = float(segment["start_ts"])
-        seg_end = float(segment.get("end_ts") or seg_start)
+        media_start = _seg_media_start(segment)
+        if media_start is None:
+            return []
+        duration = _seg_duration(segment) or 0.0
+        seg_start = media_start
+        seg_end = media_start + duration
         output: list[dict] = []
 
         with self._connect() as conn:
@@ -1205,6 +1319,7 @@ class VideoSegmentDB:
                     output.append({
                         **tracklet,
                         "event_type": "appeared",
+                        "display_ts": tracklet["abs_ts"],
                         "track_id": track_id,
                     })
 
@@ -1229,6 +1344,7 @@ class VideoSegmentDB:
                     "segment_id": track["last_segment_id"],
                     "source_id": track["source_id"],
                     "abs_ts": track["last_seen"],
+                    "display_ts": track["last_seen"],
                     "class": track["class"],
                     "event_type": "disappeared",
                     "start_off": track["last_start_off"],
@@ -1272,6 +1388,7 @@ class VideoSegmentDB:
             query_limit = max(limit * 20, 200)
         sql = (
             "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts,"
+            " s.media_start_ts as seg_media_start_ts,"
             " s.actual_start_ts as seg_actual_start_ts"
             " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {' AND '.join(where)}"
@@ -1308,7 +1425,8 @@ class VideoSegmentDB:
         base = " AND ".join(where)
         select = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
-            " s.start_ts as seg_start_ts, s.actual_start_ts as seg_actual_start_ts"
+            " s.start_ts as seg_start_ts, s.media_start_ts as seg_media_start_ts,"
+            " s.actual_start_ts as seg_actual_start_ts"
             " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
@@ -1339,14 +1457,15 @@ class VideoSegmentDB:
                 det_id = int(raw_id[2:])
             except ValueError:
                 return None
-            epoch = _segment_media_epoch_sql("s")
             with self._connect() as conn:
                 row = conn.execute(
                     "SELECT vd.boxes_json AS boxes_json, vd.confidence AS confidence,"
+                    " vd.abs_ts AS abs_ts,"
                     " s.path AS seg_path,"
-                    f" {epoch} AS seg_start_ts,"
+                    " COALESCE(s.media_start_ts, s.actual_start_ts) AS seg_start_ts,"
+                    " s.media_start_ts AS seg_media_start_ts,"
+                    " s.actual_start_ts AS seg_actual_start_ts,"
                     " s.end_ts AS seg_end_ts,"
-                    f" ({epoch} + vd.ts_offset) AS abs_ts,"
                     " NULL AS class"
                     " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
                     " WHERE vd.id=?",
@@ -1361,6 +1480,7 @@ class VideoSegmentDB:
             with self._connect() as conn:
                 row = conn.execute(
                     "SELECT e.*, s.path as seg_path, s.start_ts as seg_start_ts,"
+                    " s.media_start_ts as seg_media_start_ts,"
                     " s.actual_start_ts as seg_actual_start_ts, s.end_ts as seg_end_ts"
                     " FROM object_events e JOIN segments s ON s.id=e.segment_id"
                     " WHERE e.id=?",
@@ -1375,6 +1495,7 @@ class VideoSegmentDB:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT e.*, s.path as seg_path, s.start_ts as seg_start_ts,"
+                " s.media_start_ts as seg_media_start_ts,"
                 " s.actual_start_ts as seg_actual_start_ts, s.end_ts as seg_end_ts"
                 " FROM video_events e JOIN segments s ON s.id=e.segment_id"
                 " WHERE e.id=?",
@@ -1457,9 +1578,11 @@ class VideoSegmentDB:
         if source_id and source_id != "all":
             where.append("source_id=?"); params.append(source_id)
         if since is not None:
-            where.append("abs_ts>=?"); params.append(since)
+            where.append(("display_ts>=?" if table == "object_events" else "abs_ts>=?"))
+            params.append(since)
         if until is not None:
-            where.append("abs_ts<?"); params.append(until)
+            where.append(("display_ts<?" if table == "object_events" else "abs_ts<?"))
+            params.append(until)
         polygons = self.zone_polygons(source_id, zone_id)
         if polygons:
             sql = (
@@ -1486,14 +1609,49 @@ class VideoSegmentDB:
             classes[evt["class"]] = classes.get(evt["class"], 0) + 1
         return {"total": sum(classes.values()), "classes": classes}
 
-    def list_segments(self, source_id: str | None = None) -> list[dict]:
-        where, params = [], []
+    def segment_bounds(self, source_id: str | None = None) -> dict | None:
+        epoch = _segment_media_epoch_sql()
+        now = f"{time.time():.3f}"
+        coverage_end = (
+            f"(CASE WHEN end_ts IS NOT NULL"
+            f" THEN ({epoch} + COALESCE(duration_sec, end_ts - start_ts))"
+            f" ELSE {now} END)"
+        )
+        where, params = [f"{epoch} IS NOT NULL"], []
         if source_id and source_id != "all":
             where.append("source_id=?"); params.append(source_id)
+        sql = f"SELECT MIN({epoch}) AS from_ts, MAX({coverage_end}) AS to_ts FROM segments"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        with self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        if not row or row["from_ts"] is None or row["to_ts"] is None:
+            return None
+        return {"from": row["from_ts"], "to": row["to_ts"]}
+
+    def list_segments(self, source_id: str | None = None,
+                      since: float | None = None,
+                      until: float | None = None) -> list[dict]:
+        epoch = _segment_media_epoch_sql()
+        now = f"{time.time():.3f}"
+        coverage_end = (
+            f"(CASE WHEN end_ts IS NOT NULL"
+            f" THEN ({epoch} + COALESCE(duration_sec, end_ts - start_ts))"
+            f" ELSE {now} END)"
+        )
+        where, params = [f"{epoch} IS NOT NULL"], []
+        if source_id and source_id != "all":
+            where.append("source_id=?"); params.append(source_id)
+        if since is not None:
+            where.append(f"{coverage_end}>?")
+            params.append(float(since))
+        if until is not None:
+            where.append(f"{epoch}<?")
+            params.append(float(until))
         sql = "SELECT * FROM segments"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY start_ts DESC"
+        sql += f" ORDER BY {epoch} DESC"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [_worldize_segment_row(dict(r)) for r in rows]
@@ -1501,9 +1659,10 @@ class VideoSegmentDB:
     def segments_overlapping(self, source_id: str | None,
                              start_ts: float, end_ts: float) -> list[dict]:
         epoch = _segment_media_epoch_sql()
-        coverage_end = f"({epoch} + (end_ts - start_ts))"
+        coverage_end = f"({epoch} + COALESCE(duration_sec, end_ts - start_ts))"
         where, params = [
             "end_ts IS NOT NULL",
+            f"{epoch} IS NOT NULL",
             f"{coverage_end}>?",
             f"{epoch}<?",
         ], [start_ts, end_ts]
@@ -1521,9 +1680,10 @@ class VideoSegmentDB:
     def segment_at(self, source_id: str | None, ts: float, *,
                    exact: bool = True) -> dict | None:
         epoch = _segment_media_epoch_sql()
-        coverage_end = f"({epoch} + (end_ts - start_ts))"
+        coverage_end = f"({epoch} + COALESCE(duration_sec, end_ts - start_ts))"
         where, params = [
             "end_ts IS NOT NULL",
+            f"{epoch} IS NOT NULL",
             f"{epoch}<=?",
             f"{coverage_end}>?",
         ], [ts, ts]
@@ -1539,6 +1699,7 @@ class VideoSegmentDB:
             if not row and not exact:
                 where2, params2 = [
                     "end_ts IS NOT NULL",
+                    f"{epoch} IS NOT NULL",
                     f"{coverage_end}<=?",
                 ], [ts]
                 if source_id and source_id != "all":
@@ -1556,19 +1717,23 @@ class VideoSegmentDB:
                            zone_id=None) -> list[dict]:
         cutoff = time.time() - _PROVISIONAL_GRACE_SECONDS
         open_cutoff = time.time() - _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS
+        epoch = _segment_media_epoch_sql("s")
+        coverage_end = f"({epoch} + COALESCE(s.duration_sec, s.end_ts - s.start_ts))"
         where, params = [
+            f"{epoch} IS NOT NULL",
             "((s.end_ts IS NULL AND s.start_ts>=?)"
-            " OR (s.end_ts IS NOT NULL AND s.end_ts>=?"
+            f" OR (s.end_ts IS NOT NULL AND {coverage_end}>=?"
             " AND NOT EXISTS (SELECT 1 FROM video_events e WHERE e.segment_id=s.id)))"
         ], [open_cutoff, cutoff]
         if source_id and source_id != "all":
             where.append("s.source_id=?"); params.append(source_id)
         if since is not None:
-            where.append("s.start_ts>=?"); params.append(since - _MAX_SEGMENT_SECONDS)
+            where.append(f"(s.end_ts IS NULL OR {coverage_end}>=?)")
+            params.append(since)
         sql = (
             "SELECT s.* FROM segments s"
             f" WHERE {' AND '.join(where)}"
-            " ORDER BY s.start_ts DESC"
+            f" ORDER BY {epoch} DESC"
         )
         with self._connect() as conn:
             segs = [dict(r) for r in conn.execute(sql, params).fetchall()]
@@ -1585,6 +1750,7 @@ class VideoSegmentDB:
                 row["seg_path"] = seg["path"]
                 row["spritesheet"] = seg.get("spritesheet")
                 row["seg_start_ts"] = seg["start_ts"]
+                row["seg_media_start_ts"] = seg.get("media_start_ts")
                 row["seg_actual_start_ts"] = seg.get("actual_start_ts")
                 _worldize_event_row(row)
                 events.append(row)
@@ -1630,6 +1796,8 @@ class VideoSegmentDB:
                        zone_id=None) -> list[dict]:
         cutoff = time.time() - _PROVISIONAL_GRACE_SECONDS
         live_cutoff = time.time() - _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS
+        epoch = _segment_media_epoch_sql("s")
+        coverage_end = f"({epoch} + COALESCE(s.duration_sec, s.end_ts - s.start_ts))"
         where, params = [
             "abs_ts>=?",
             "("
@@ -1638,8 +1806,9 @@ class VideoSegmentDB:
             "SELECT 1 FROM segments s"
             " WHERE s.source_id=hls_events.source_id"
             " AND s.end_ts IS NOT NULL"
-            " AND s.start_ts<=hls_events.abs_ts"
-            " AND s.end_ts>hls_events.abs_ts"
+            f" AND {epoch} IS NOT NULL"
+            f" AND {epoch}<=hls_events.abs_ts"
+            f" AND {coverage_end}>hls_events.abs_ts"
             ")"
             ")",
         ], [cutoff, live_cutoff]
@@ -1684,29 +1853,33 @@ class VideoSegmentDB:
             conn.execute("DELETE FROM hls_events WHERE abs_ts<?", (cutoff,))
 
     def observe_frame_time(self, source_id: str, abs_ts: float) -> None:
-        """Update the open segment's actual_start_ts from live HLS PDT.
-
-        Ignore playlist chunks that predate the open MP4. At segment rollover
-        the live HLS playlist can still contain old chunks; using one as the
-        MP4 media epoch makes recorded seeks land late after finalization.
-        """
+        """Fallback anchor capture from live HLS PDT for the current open segment."""
         with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM segments"
+                " WHERE source_id=? AND end_ts IS NULL AND start_ts<=?"
+                " ORDER BY start_ts DESC LIMIT 1",
+                (source_id, abs_ts),
+            ).fetchone()
+            if not row:
+                return
             conn.execute(
                 "UPDATE segments"
-                " SET actual_start_ts = CASE"
-                "   WHEN actual_start_ts IS NULL"
-                "     OR actual_start_ts < start_ts - ? THEN ?"
+                " SET media_start_ts = CASE"
+                "   WHEN media_start_ts IS NULL THEN ?"
+                "   ELSE MIN(media_start_ts, ?)"
+                " END,"
+                " actual_start_ts = CASE"
+                "   WHEN actual_start_ts IS NULL THEN ?"
                 "   ELSE MIN(actual_start_ts, ?)"
                 " END"
-                " WHERE source_id=? AND end_ts IS NULL"
-                "   AND ? >= start_ts - ?",
+                " WHERE id=?",
                 (
-                    _HLS_ANCHOR_PRESTART_GRACE_SECONDS,
                     abs_ts,
                     abs_ts,
-                    source_id,
                     abs_ts,
-                    _HLS_ANCHOR_PRESTART_GRACE_SECONDS,
+                    abs_ts,
+                    row["id"],
                 ),
             )
 
@@ -1726,10 +1899,10 @@ class VideoSegmentDB:
             ).fetchall()]
             epoch = _segment_media_epoch_sql("s")
             latest_rows = conn.execute(
-                "SELECT s.source_id, s.start_ts, s.actual_start_ts, d.*"
-                " FROM segments s JOIN video_detections d ON d.segment_id=s.id"
+                "SELECT d.*"
+                " FROM video_detections d JOIN segments s ON s.id=d.segment_id"
                 f" WHERE {' AND '.join(where)}"
-                f" ORDER BY ({epoch} + d.ts_offset) DESC",
+                " ORDER BY d.abs_ts DESC",
                 params,
             ).fetchall()
 
@@ -1741,7 +1914,7 @@ class VideoSegmentDB:
             latest[r["source_id"]] = {
                 "segment_id": r["segment_id"],
                 "source_id": r["source_id"],
-                "abs_ts": _seg_world_epoch(r["start_ts"], r["actual_start_ts"]) + r["ts_offset"],
+                "abs_ts": r["abs_ts"],
                 "ts_offset": r["ts_offset"],
                 "has_human": bool(r["has_human"]),
                 "confidence": r["confidence"],
@@ -1891,6 +2064,7 @@ def backfill_events(db: VideoSegmentDB, video_dir: Path | None = None,
     with db._connect() as conn:
         segs = conn.execute(
             "SELECT s.* FROM segments s WHERE s.end_ts IS NOT NULL"
+            " AND COALESCE(s.media_start_ts, s.actual_start_ts) IS NOT NULL"
             " AND NOT EXISTS (SELECT 1 FROM video_detections WHERE segment_id=s.id)"
             " ORDER BY s.start_ts"
         ).fetchall()
@@ -1914,6 +2088,12 @@ def extract_events(segment: dict, detections: list[dict], db: VideoSegmentDB) ->
     if rows:
         db.insert_object_events(rows)
         db.insert_events(_legacy_events_from_object_events(rows))
+    media_start = _seg_media_start(segment)
+    duration = _seg_duration(segment)
+    if media_start is not None and duration is not None:
+        db.mark_object_derivation(
+            segment["source_id"], media_start, media_start + duration
+        )
     return len(rows)
 
 
@@ -2064,13 +2244,19 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
     if not detections:
         return []
 
-    seg_start = float(segment["start_ts"])
+    media_start = _seg_media_start(segment)
+    if media_start is None:
+        return []
     tracks: list[dict] = []
 
     for det in detections:
         off = float(det.get("ts_offset", 0.0))
         if off < 0:
             continue
+        det_abs_ts = det.get("abs_ts")
+        if det_abs_ts is None:
+            det_abs_ts = media_start + off
+        det_abs_ts = float(det_abs_ts)
         boxes = [
             b for b in (det.get("boxes") or [])
             if isinstance(b, dict) and b.get("cls")
@@ -2099,6 +2285,8 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
                     "class": cls,
                     "first": off,
                     "last": off,
+                    "first_abs_ts": det_abs_ts,
+                    "last_abs_ts": det_abs_ts,
                     "cx": cx,
                     "cy": cy,
                     "area": area,
@@ -2112,6 +2300,7 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
             track = tracks[best_idx]
             used.add(best_idx)
             track["last"] = off
+            track["last_abs_ts"] = det_abs_ts
             track["seen"] += 1
             track["cx"] = (track["cx"] * 0.7) + (cx * 0.3)
             track["cy"] = (track["cy"] * 0.7) + (cy * 0.3)
@@ -2130,7 +2319,8 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
         rows.append({
             "segment_id": segment["id"],
             "source_id": segment["source_id"],
-            "abs_ts": seg_start + float(track["first"]),
+            "abs_ts": float(track["first_abs_ts"]),
+            "display_ts": float(track["first_abs_ts"]),
             "class": track["class"],
             "start_off": float(track["first"]),
             "end_off": float(track["last"]),
@@ -2163,6 +2353,8 @@ def _legacy_events_from_object_events(events: list[dict]) -> list[dict]:
 
 def _public_object_event(event: dict) -> dict:
     row = dict(event)
+    if row.get("display_ts") is not None:
+        row["abs_ts"] = row["display_ts"]
     row["id"] = f"o:{row['id']}"
     return row
 
@@ -2490,6 +2682,14 @@ def _safe_round(value, *, digits: int = 3):
         return None
 
 
+def _url_ts(value) -> str:
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        ts = 0.0
+    return f"{ts:.3f}".rstrip("0").rstrip(".")
+
+
 def _yolo_socket_request(req: dict, timeout: float) -> dict:
     sock_path = os.environ.get("YOLO_SOCKET", "/tmp/yolo.sock")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -2627,21 +2827,15 @@ def _notification_det_events_after(
 ) -> tuple[list[dict], int]:
     """Per-frame detections (video_detections) as notification candidates.
 
-    Unlike object_events — which only carry the appearance instant — this
-    surfaces every tagged frame, so a person who enters from outside a zone and
-    walks into it is caught at the first in-zone frame. abs_ts is derived as
-    segment base + ts_offset, so the offset back into the MP4 for confirmation
-    is exactly ts_offset (no fragile remapping). The cooldown collapses the run
-    of in-zone frames into a single notification.
+    Surfaces every tagged frame, keyed by the stored universal abs_ts. Media
+    offsets remain private metadata for frame extraction.
     """
     source_id = rule["source_id"]
     classes = set(rule.get("classes") or [])
-    epoch = _segment_media_epoch_sql("s")
     rows = conn.execute(
-        "SELECT vd.id AS id, s.source_id AS source_id, vd.confidence AS confidence,"
-        " vd.boxes_json AS boxes_json,"
-        f" ({epoch} + vd.ts_offset) AS abs_ts"
-        " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
+        "SELECT vd.id AS id, vd.source_id AS source_id, vd.abs_ts AS abs_ts,"
+        " vd.confidence AS confidence, vd.boxes_json AS boxes_json"
+        " FROM video_detections vd"
         " WHERE vd.id>? ORDER BY vd.id ASC LIMIT ?",
         (start_id, max(1, int(limit))),
     ).fetchall()
@@ -2791,7 +2985,7 @@ def _build_notification_event(
     event_ref = _notification_event_ref(event)
     params = {
         "source": rule["source_id"],
-        "ts": str(int(float(event["abs_ts"]))),
+        "ts": _url_ts(event["abs_ts"]),
         "cls": cls,
         "zone": zone_param,
     }
@@ -2967,6 +3161,64 @@ class VideoWorker:
                 except OSError:
                     pass
 
+    def _parse_live_pdt(self, raw: str) -> float | None:
+        value = raw.strip()
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        if len(value) >= 5 and value[-5] in "+-" and value[-3] != ":":
+            value = value[:-2] + ":" + value[-2:]
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return None
+
+    def _observe_live_anchor(
+        self,
+        segment_id: int | None = None,
+        segment_start: float | None = None,
+    ) -> None:
+        """Bind one MP4 segment to the first HLS PDT from this ffmpeg run."""
+        seg_id = self._seg_id if segment_id is None else segment_id
+        seg_start = self._seg_start if segment_start is None else segment_start
+        if not seg_id or not seg_start:
+            return
+        playlist = self._live_dir / "live.m3u8"
+        try:
+            if playlist.stat().st_mtime < seg_start:
+                return
+            lines = playlist.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+
+        pending_start: float | None = None
+        candidates: list[float] = []
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+                pending_start = self._parse_live_pdt(line.split(":", 1)[1])
+                continue
+            if line.startswith("#") or pending_start is None:
+                continue
+            media_file = self._live_dir / Path(line.split("?", 1)[0]).name
+            try:
+                if media_file.stat().st_mtime < seg_start:
+                    pending_start = None
+                    continue
+            except OSError:
+                pending_start = None
+                continue
+            candidates.append(pending_start)
+            pending_start = None
+
+        if not candidates:
+            return
+        try:
+            self.db.set_segment_media_start(seg_id, min(candidates))
+        except Exception:
+            LOG.exception("failed to set media_start_ts for segment %s", seg_id)
+
     def run(self) -> None:
         """Continuous recording loop — call from a daemon thread."""
         LOG.info("continuous recording started: %s", self.source.id)
@@ -2982,6 +3234,7 @@ class VideoWorker:
                         if self._proc.poll() is not None:
                             LOG.warning("ffmpeg exited early for %s", self.source.id)
                             break
+                        self._observe_live_anchor()
                         self._stop.wait(5)
                     elapsed = time.time() - ts
                     self._stop_segment(time.time())
@@ -3055,12 +3308,17 @@ class VideoWorker:
     def _stop_segment(self, ts: float) -> None:
         proc      = self._proc;     self._proc     = None
         seg_path  = self._seg_path; self._seg_path = None
-        seg_id    = self._seg_id;   self._seg_id   = None
+        seg_id    = self._seg_id
+        seg_start = self._seg_start
         if proc and proc.poll() is None:
             try:
                 proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
             except Exception:
                 proc.kill()
+        if seg_id:
+            self._observe_live_anchor(seg_id, seg_start)
+        self._seg_id = None
+        self._seg_start = 0.0
         if seg_id:
             self.db.close_segment(seg_id, ts, None, None)
 

@@ -28,7 +28,6 @@ _CONFIRM_CROP_IMGSZ = (640, 960)
 _CONFIRM_MIN_CONF = 0.25
 _CONFIRM_MIN_IOU = 0.10
 _CONFIRM_MAX_CENTER_DISTANCE = 0.060
-_LIVE_FRAME_SLOP_SECONDS = 0.25
 
 
 # ── Socket server ──────────────────────────────────────────────────────────────
@@ -303,77 +302,16 @@ def _candidate_boxes(raw, cls: str) -> list[dict]:
     return boxes
 
 
-def _frame_for_confirmation(video_db, video_dir: Path, source_id: str, abs_ts: float, event_kind: str):
-    prefer_live = event_kind == "hls"
-    readers = (
-        (_read_live_hls_frame, _read_mp4_frame)
-        if prefer_live else
-        (_read_mp4_frame, _read_live_hls_frame)
-    )
-    errors = []
-    for reader in readers:
-        frame, source, err = reader(video_db, video_dir, source_id, abs_ts)
-        if frame is not None:
-            return frame, source, None
-        if err:
-            errors.append(err)
-    return None, None, "; ".join(errors)
-
-
-def _read_mp4_frame(video_db, video_dir: Path, source_id: str, abs_ts: float):
-    import cv2
+def _frame_for_confirmation(video_db, video_dir: Path, source_id: str, abs_ts: float, _event_kind: str):
+    from . import media_time
     with video_db._connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM segments"
-            " WHERE source_id=? AND start_ts<=?"
-            " AND (end_ts IS NULL OR end_ts>=?)"
-            " ORDER BY start_ts DESC LIMIT 1",
-            (source_id, abs_ts, abs_ts),
-        ).fetchone()
-    if not row:
-        return None, "mp4", "no_segment"
-    seg = dict(row)
-    path = Path(seg["path"])
-    if not path.is_absolute():
-        path = video_dir / path
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        return None, "mp4", f"open_failed:{path.name}"
-    base = float(seg["actual_start_ts"] if seg.get("actual_start_ts") is not None else seg["start_ts"])
-    offset = max(0.0, abs_ts - base)
-    cap.set(cv2.CAP_PROP_POS_MSEC, offset * 1000.0)
-    ok, frame = cap.read()
-    cap.release()
-    if not ok or frame is None:
-        return None, "mp4", f"read_failed:{path.name}:{offset:.3f}"
-    return frame, "mp4", None
-
-
-def _read_live_hls_frame(_video_db, video_dir: Path, source_id: str, abs_ts: float):
-    import cv2
-    source_dir = video_dir / "live" / source_id
-    m3u8 = source_dir / "live.m3u8"
-    segments = _parse_hls_segments(m3u8)
-    if not segments:
-        return None, "hls", "no_live_playlist"
-    for idx, (filename, start_ts) in enumerate(segments):
-        next_ts = segments[idx + 1][1] if idx + 1 < len(segments) else start_ts + 2.0
-        if abs_ts < start_ts - _LIVE_FRAME_SLOP_SECONDS:
-            continue
-        if abs_ts > next_ts + _LIVE_FRAME_SLOP_SECONDS:
-            continue
-        path = source_dir / filename
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            return None, "hls", f"open_failed:{filename}"
-        offset = max(0.0, abs_ts - start_ts)
-        cap.set(cv2.CAP_PROP_POS_MSEC, offset * 1000.0)
-        ok, frame = cap.read()
-        cap.release()
-        if ok and frame is not None:
-            return frame, "hls", None
-        return None, "hls", f"read_failed:{filename}:{offset:.3f}"
-    return None, "hls", "live_segment_not_found"
+        result = media_time.read_frame(conn, video_dir, source_id, abs_ts)
+    if result.frame is not None:
+        return result.frame, result.provider, None
+    detail = result.status
+    if result.retry_after is not None:
+        detail = f"{detail}:retry_after={result.retry_after:.3f}"
+    return None, result.provider, detail
 
 
 def _predict_boxes(
@@ -607,6 +545,7 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
             with video_db._connect() as conn:
                 segs = conn.execute(
                     "SELECT s.* FROM segments s WHERE s.end_ts IS NOT NULL"
+                    " AND COALESCE(s.media_start_ts, s.actual_start_ts) IS NOT NULL"
                     " AND NOT EXISTS (SELECT 1 FROM video_detections WHERE segment_id=s.id)"
                     " ORDER BY s.start_ts"
                     " LIMIT 5"
@@ -621,14 +560,19 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                     break
                 seg = dict(row)
                 seg_path = video_dir / seg["path"]
+                media_start = seg.get("media_start_ts") or seg.get("actual_start_ts")
+                duration = seg.get("duration_sec")
+                if duration is None:
+                    duration = float(seg["end_ts"]) - float(seg["start_ts"])
+                media_end = float(media_start) + max(0.0, float(duration))
                 _sentinel = [{"ts_offset": -1, "has_human": False, "confidence": 0.0,
                               "boxes": [], "classes": []}]
 
                 # Check if HLS real-time tagging already covered this segment
                 hls_evts = video_db.get_hls_events(
                     source_id=seg["source_id"],
-                    since=seg["start_ts"],
-                    until=seg["end_ts"],
+                    since=float(media_start),
+                    until=media_end,
                 )
                 if hls_evts:
                     if seg_path.exists():
@@ -642,7 +586,7 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                     else:
                         video_db.replace_detections(seg["id"], _sentinel)
                     video_db.delete_hls_events(
-                        seg["source_id"], seg["start_ts"], seg["end_ts"]
+                        seg["source_id"], float(media_start), media_end
                     )
                     dets = video_db.detections_for_segment(seg["id"])
                     n_evt = extract_events(seg, dets, video_db)

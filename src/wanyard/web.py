@@ -783,14 +783,63 @@ def make_app(
             "reason": reason,
         })
 
-    def _build_timeline(source_id, zone_id=None):
+    def _build_timeline(source_id, zone_id=None, since=None, until=None):
         from wanyard.video import _filter_with_polygons
-        segs = video_db.list_segments(source_id)
+        segs = video_db.list_segments(source_id, since, until)
+        bounds = video_db.segment_bounds(source_id)
         summary: dict[int, dict] = {}
-        table = "object_events" if video_db.object_events_available(source_id) else "video_events"
+        table = (
+            "object_events"
+            if video_db.object_events_available(source_id, since, until)
+            else "video_events"
+        )
         episode_filter = "event_type='appeared'" if table == "object_events" else "1"
         polygons = video_db.zone_polygons(source_id, zone_id)
-        if polygons:
+        seg_ids = [s["id"] for s in segs]
+        bounded = since is not None or until is not None
+        if bounded and seg_ids:
+            placeholders = ",".join("?" for _ in seg_ids)
+            if polygons:
+                where, params = [
+                    f"e.{episode_filter}" if table == "object_events" else episode_filter,
+                    f"e.segment_id IN ({placeholders})",
+                ], list(seg_ids)
+                if source_id and source_id != "all":
+                    where.append("e.source_id=?")
+                    params.append(source_id)
+                with video_db._connect() as conn:
+                    rows = conn.execute(
+                        f"SELECT e.segment_id, e.source_id, e.class, e.boxes_json FROM {table} e"
+                        f" WHERE {' AND '.join(where)}",
+                        params,
+                    ).fetchall()
+                for evt in _filter_with_polygons([dict(r) for r in rows], polygons):
+                    if evt["segment_id"] is None:
+                        continue
+                    summary.setdefault(evt["segment_id"], {})[evt["class"]] = (
+                        summary.setdefault(evt["segment_id"], {}).get(evt["class"], 0) + 1
+                    )
+            else:
+                where, params = [
+                    f"e.{episode_filter}" if table == "object_events" else episode_filter,
+                    f"e.segment_id IN ({placeholders})",
+                ], list(seg_ids)
+                if source_id and source_id != "all":
+                    where.append("e.source_id=?")
+                    params.append(source_id)
+                with video_db._connect() as conn:
+                    rows = conn.execute(
+                        "SELECT e.segment_id, e.class, COUNT(*) as n"
+                        f" FROM {table} e"
+                        f" WHERE {' AND '.join(where)}"
+                        " GROUP BY e.segment_id, e.class",
+                        params,
+                    ).fetchall()
+                for r in rows:
+                    summary.setdefault(r["segment_id"], {})[r["class"]] = r["n"]
+        elif bounded:
+            pass
+        elif polygons:
             where, params = [episode_filter], []
             if source_id and source_id != "all":
                 where.append("source_id=?")
@@ -822,13 +871,16 @@ def make_app(
                 ).fetchall()
             for r in rows:
                 summary.setdefault(r["segment_id"], {})[r["class"]] = r["n"]
-        for evt in video_db.provisional_events(source_id, zone_id=zone_id):
-            summary.setdefault(evt["segment_id"], {})[evt["class"]] = (
-                summary.setdefault(evt["segment_id"], {}).get(evt["class"], 0) + 1
-            )
+        if until is None or until >= time.time() - 2 * 3600:
+            for evt in video_db.provisional_events(source_id, since, zone_id=zone_id):
+                if until is not None and evt.get("abs_ts") is not None and evt["abs_ts"] > until:
+                    continue
+                summary.setdefault(evt["segment_id"], {})[evt["class"]] = (
+                    summary.setdefault(evt["segment_id"], {}).get(evt["class"], 0) + 1
+                )
         for s in segs:
             s["classes"] = summary.get(s["id"], {})
-        return segs
+        return {"segments": segs, "bounds": bounds}
 
     async def api_video2_timeline(request: Request) -> JSONResponse:
         """Segments list for the video2 filmstrip."""
@@ -836,8 +888,17 @@ def make_app(
             return JSONResponse({"segments": []})
         source_id = request.query_params.get("source") or None
         zone_id = request.query_params.get("zone") or None
-        segs = await asyncio.to_thread(_build_timeline, source_id, zone_id)
-        return JSONResponse({"segments": segs})
+        since_raw = request.query_params.get("since")
+        until_raw = request.query_params.get("until")
+        try:
+            since = float(since_raw) if since_raw else None
+            until = float(until_raw) if until_raw else None
+        except ValueError:
+            return JSONResponse({"error": "invalid since/until"}, status_code=400)
+        if since is not None and until is not None and until < since:
+            since, until = until, since
+        timeline = await asyncio.to_thread(_build_timeline, source_id, zone_id, since, until)
+        return JSONResponse(timeline)
 
     async def api_video_events(request: Request) -> JSONResponse:
         if not video_db:
@@ -1109,7 +1170,16 @@ def make_app(
         if not video_db:
             return JSONResponse({"segments": []})
         source_id = request.query_params.get("source") or None
-        segs = await asyncio.to_thread(video_db.list_segments, source_id)
+        since_raw = request.query_params.get("since")
+        until_raw = request.query_params.get("until")
+        try:
+            since = float(since_raw) if since_raw else None
+            until = float(until_raw) if until_raw else None
+        except ValueError:
+            return JSONResponse({"error": "invalid since/until"}, status_code=400)
+        if since is not None and until is not None and until < since:
+            since, until = until, since
+        segs = await asyncio.to_thread(video_db.list_segments, source_id, since, until)
         return JSONResponse({"segments": segs})
 
     async def api_video_detections(request: Request) -> JSONResponse:
@@ -1203,8 +1273,8 @@ def make_app(
         samples: list[tuple[float, list[tuple[str, float, float, float, float, float]]]] = []
         for det in dets:
             try:
-                rel = seg_start + float(det.get("ts_offset") or 0.0) - clip_start
-            except (TypeError, ValueError):
+                rel = float(det["abs_ts"]) - clip_start
+            except (KeyError, TypeError, ValueError):
                 continue
             if rel < -1.5 or rel > duration + 1.5:
                 continue

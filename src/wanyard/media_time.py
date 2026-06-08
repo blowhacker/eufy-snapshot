@@ -6,13 +6,9 @@ World time = (source_id, t), t = unix UTC seconds. The only coordinate that
 crosses module boundaries. Media time = (asset, offset), exists only inside this
 module and the player/decoder.
 
-This module is ADDITIVE. It reads existing columns (start_ts, actual_start_ts,
-end_ts) but speaks only the new vocabulary. No caller is moved here yet; the
-DB schema is unchanged. `media_epoch` maps to today's `actual_start_ts`,
-`nominal_open_ts` to `start_ts`, `media_offset` to `ts_offset`.
-
-Hard rule: media_epoch unknown -> provider "none", reason "no_anchor". Never
-fall back to nominal_open_ts. Surfacing the unknown is the point.
+Hard rule: world time is the only public point-in-time coordinate. Recorded
+media is anchored by segments.media_start_ts, and media offsets stay private to
+this resolver/player boundary.
 """
 
 from __future__ import annotations
@@ -39,28 +35,29 @@ _CLOSE_READY_GRACE_SECONDS = 20.0
 # grace so a detection on that last fragment still resolves to its own file
 # rather than a gap. Far below real reconnect gaps.
 _COVERAGE_TAIL_GRACE_SECONDS = 0.5
-_ANCHOR_PRESTART_GRACE_SECONDS = 2.0
 
 
 def _recorded_media_epoch(row: sqlite3.Row) -> float | None:
-    actual = row["actual_start_ts"]
-    if actual is None:
+    value = row["media_start_ts"]
+    if value is None:
+        value = row["actual_start_ts"]
+    if value is None:
         return None
-    start = float(row["start_ts"])
-    epoch = float(actual)
-    if epoch < start - _ANCHOR_PRESTART_GRACE_SECONDS:
-        return start
-    return epoch
+    return float(value)
+
+
+def _recorded_duration(row: sqlite3.Row) -> float | None:
+    duration = row["duration_sec"]
+    if duration is not None:
+        return max(0.0, float(duration))
+    if row["end_ts"] is None:
+        return None
+    return max(0.0, float(row["end_ts"]) - float(row["start_ts"]))
 
 
 def _recorded_media_epoch_sql(alias: str | None = None) -> str:
     p = f"{alias}." if alias else ""
-    grace = f"{_ANCHOR_PRESTART_GRACE_SECONDS:.6f}"
-    return (
-        "(CASE WHEN "
-        f"{p}actual_start_ts >= {p}start_ts - {grace}"
-        f" THEN {p}actual_start_ts ELSE {p}start_ts END)"
-    )
+    return f"COALESCE({p}media_start_ts, {p}actual_start_ts)"
 
 
 @dataclass(frozen=True)
@@ -117,19 +114,19 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
     """Closed segment covering t. None = not recorded (caller tries live); a
     'none' MediaLocation = recorded region but unusable (no anchor).
 
-    Single basis anchored at media_epoch = actual_start_ts. Duration is the
-    wall recording span (end_ts - start_ts), which equals the file's content
-    length; end_ts itself is the close *wall* time and sits ~drift seconds
-    before the file's true end once anchored at media_epoch, so it must NOT be
-    used as the coverage end. Coverage = [media_epoch, media_epoch + duration].
+    Single basis anchored at media_epoch = media_start_ts. Duration is private
+    media metadata. Coverage = [media_start_ts, media_start_ts + duration].
     """
     epoch = _recorded_media_epoch_sql()
+    duration = "COALESCE(duration_sec, end_ts - start_ts)"
     row = conn.execute(
-        f"SELECT id, path, start_ts, end_ts, actual_start_ts, {epoch} AS media_epoch"
+        "SELECT id, path, start_ts, end_ts, media_start_ts, actual_start_ts,"
+        f" duration_sec, {epoch} AS media_epoch"
         " FROM segments"
-        " WHERE source_id=? AND end_ts IS NOT NULL AND actual_start_ts IS NOT NULL"
+        " WHERE source_id=? AND end_ts IS NOT NULL"
+        f"   AND {epoch} IS NOT NULL"
         f"   AND {epoch}<=?"
-        f"   AND {epoch} + (end_ts - start_ts) + ? >=?"
+        f"   AND {epoch} + {duration} + ? >=?"
         f" ORDER BY {epoch} DESC LIMIT 1",
         (source_id, t, _COVERAGE_TAIL_GRACE_SECONDS, t),
     ).fetchone()
@@ -139,14 +136,13 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
             return _none("no_anchor")
         # Include the final-GOP flush tail so a detection on the last fragment
         # both selects (above) and clamps (world_to_media) to its own file.
-        duration = (float(row["end_ts"]) - float(row["start_ts"])
-                    + _COVERAGE_TAIL_GRACE_SECONDS)
-        anchor = Anchor("mp4", row["path"], media_epoch, duration)
+        media_duration = (_recorded_duration(row) or 0.0) + _COVERAGE_TAIL_GRACE_SECONDS
+        anchor = Anchor("mp4", row["path"], media_epoch, media_duration)
         return MediaLocation(
             provider="mp4",
             url=f"/video/files/{row['path']}",
             media_offset=anchor.world_to_media(t),
-            coverage=Coverage(media_epoch, media_epoch + duration),
+            coverage=Coverage(media_epoch, media_epoch + media_duration),
             anchor=anchor,
             reason="recorded",
             segment_id=int(row["id"]),
@@ -155,8 +151,9 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
     # No anchored coverage. If a closed segment nominally brackets t but has no
     # media_epoch, surface the unknown instead of guessing with start_ts.
     if conn.execute(
-        "SELECT 1 FROM segments"
-        " WHERE source_id=? AND end_ts IS NOT NULL AND actual_start_ts IS NULL"
+        f"SELECT 1 FROM segments"
+        " WHERE source_id=? AND end_ts IS NOT NULL"
+        f"   AND {epoch} IS NULL"
         "   AND start_ts<=? AND end_ts>=? LIMIT 1",
         (source_id, t, t),
     ).fetchone():
@@ -252,16 +249,18 @@ def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
                       t: float) -> Coverage | None:
     epoch = _recorded_media_epoch_sql()
     before = conn.execute(
-        f"SELECT actual_start_ts, start_ts, end_ts, {epoch} AS media_epoch"
+        "SELECT media_start_ts, actual_start_ts, start_ts, end_ts, duration_sec,"
+        f" {epoch} AS media_epoch"
         " FROM segments"
-        f" WHERE source_id=? AND actual_start_ts IS NOT NULL AND {epoch}<=?"
+        f" WHERE source_id=? AND {epoch} IS NOT NULL AND {epoch}<=?"
         f" ORDER BY {epoch} DESC LIMIT 1",
         (source_id, t),
     ).fetchone()
     after = conn.execute(
-        f"SELECT actual_start_ts, start_ts, end_ts, {epoch} AS media_epoch"
+        "SELECT media_start_ts, actual_start_ts, start_ts, end_ts, duration_sec,"
+        f" {epoch} AS media_epoch"
         " FROM segments"
-        f" WHERE source_id=? AND actual_start_ts IS NOT NULL AND {epoch}>?"
+        f" WHERE source_id=? AND {epoch} IS NOT NULL AND {epoch}>?"
         f" ORDER BY {epoch} ASC LIMIT 1",
         (source_id, t),
     ).fetchone()
@@ -273,11 +272,9 @@ def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
         if epoch is None:
             return None
         end = row["end_ts"]
-        # Coverage anchored at media_epoch, length = wall recording span. Open
-        # segment (end NULL) is a point at its epoch.
         if end is None:
             return Coverage(float(epoch), float(epoch))
-        return Coverage(float(epoch), float(epoch) + (float(end) - float(row["start_ts"])))
+        return Coverage(float(epoch), float(epoch) + (_recorded_duration(row) or 0.0))
 
     cands = [c for c in (cov(before), cov(after)) if c]
     if not cands:
@@ -428,10 +425,9 @@ def check_detection_round_trip(conn: sqlite3.Connection, video_dir: Path,
     their own status, not resolver faults. No side effects.
     """
     row = conn.execute(
-        "SELECT vd.id AS id, vd.ts_offset AS media_offset,"
-        " s.source_id AS source_id, s.actual_start_ts AS media_epoch"
-        " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
-        " WHERE vd.id=?",
+        "SELECT id, source_id, abs_ts, ts_offset AS media_offset"
+        " FROM video_detections"
+        " WHERE id=?",
         (detection_id,),
     ).fetchone()
     if not row:
@@ -442,12 +438,7 @@ def check_detection_round_trip(conn: sqlite3.Connection, video_dir: Path,
     if expected < 0:  # sentinel marker, not a real frame
         return RoundTrip(True, detection_id, "sentinel", None,
                          expected, None, "none", False)
-    media_epoch = row["media_epoch"]
-    if media_epoch is None:  # honest unknown — no world coordinate exists
-        return RoundTrip(False, detection_id, "no_anchor", None,
-                         expected, None, "none", False)
-
-    world_t = float(media_epoch) + expected
+    world_t = float(row["abs_ts"])
     loc = resolve(conn, video_dir, row["source_id"], world_t)
     if loc.provider != "mp4" or loc.anchor is None or loc.media_offset is None:
         return RoundTrip(False, detection_id, loc.reason, None,

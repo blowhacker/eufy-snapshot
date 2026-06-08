@@ -51,13 +51,12 @@ world→media(t)  = t - media_epoch        # clamp [0, duration]
 media→world(o)  = media_epoch + o
 
 For every stored detection d:
-  loc = resolve(d.source_id, media→world(d.asset, d.media_offset))
-  assert loc.provider     == d.asset.provider
-  assert |loc.media_offset - d.media_offset| < EPS    # round-trip identity
+  loc = resolve(d.source_id, d.t)
+  assert |loc.anchor.media_to_world(loc.media_offset) - d.t| < EPS
 ```
 
-If `start_ts` (now `nominal_open_ts`) ever creeps back in as a coordinate, this
-fails. Enforced in CI (py) and on-device (js). `EPS = 0.05s`.
+If `start_ts` (now `nominal_open_ts`) ever creeps back in as a public
+coordinate, this fails. Enforced in CI (py) and on-device (js). `EPS = 0.05s`.
 
 ## Resolver contract
 
@@ -129,8 +128,7 @@ Rules that make the "confirmation can't get a good frame" bug class impossible:
    keep working until moved (`actual_start_ts`→`media_epoch`,
    `ts_offset`→`media_offset`, `start_ts`→`nominal_open_ts`).
 4. **Authoritative `media_epoch`**: writer ties it to its own ffmpeg's first
-   `.ts` PDT (1:1, not `MIN` over a fuzzy shared-dir window). Unknown → NULL,
-   surfaced as `no_anchor`. Backfill.
+   `.ts` PDT by segment id. Unknown → NULL, surfaced as `no_anchor`. Backfill.
 5. **Backend callers → resolver** (yolo frame read, notification candidates;
    already on the correct base — log round-trip ε to confirm zero regression).
 6. **Frontend seek → resolver**: UI calls `/api/video/resolve?source=&ts=`;

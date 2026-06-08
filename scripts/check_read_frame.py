@@ -19,10 +19,11 @@ now = time.time()
 
 # ── smoke: each provider/status ──────────────────────────────────────────────
 rec = conn.execute(
-    "SELECT s.source_id src, (s.actual_start_ts+vd.ts_offset) wt"
-    " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
+    "SELECT vd.source_id src, vd.abs_ts wt"
+    " FROM video_detections vd"
+    " JOIN segments s ON s.id=vd.segment_id"
     " WHERE vd.has_human=1 AND vd.ts_offset>=0 AND s.end_ts IS NOT NULL"
-    "   AND s.actual_start_ts IS NOT NULL AND (s.actual_start_ts+vd.ts_offset)<?"
+    "   AND vd.abs_ts<?"
     " ORDER BY vd.id DESC LIMIT 1", (now - 1200,)).fetchone()
 fr = M.read_frame(conn, VID, rec["src"], rec["wt"])
 print("recorded :", fr.status, fr.provider, None if fr.frame is None else fr.frame.shape)
@@ -36,10 +37,11 @@ print("future   :", frf.status, frf.provider)
 from ultralytics import YOLO  # noqa: E402
 model = YOLO(os.environ.get("YOLO_MODEL_PATH", "/app/models/yolo11m.pt"))
 rows = conn.execute(
-    "SELECT vd.id, s.source_id src, (s.actual_start_ts+vd.ts_offset) wt"
-    " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
+    "SELECT vd.id, vd.source_id src, vd.abs_ts wt"
+    " FROM video_detections vd"
+    " JOIN segments s ON s.id=vd.segment_id"
     " WHERE vd.has_human=1 AND vd.ts_offset>=0 AND s.end_ts IS NOT NULL"
-    "   AND s.actual_start_ts IS NOT NULL"
+    "   AND vd.abs_ts IS NOT NULL"
     " ORDER BY vd.id DESC LIMIT 15").fetchall()
 ok = tot = 0
 for row in rows:
