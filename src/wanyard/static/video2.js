@@ -105,11 +105,15 @@ class V2Player {
     if (!url || !Number.isFinite(mediaEpoch)) return null;
 
     const actualTs = mediaEpoch + startPosition;
+    const detectionStartTs = Number.isFinite(Number(opts.detectionStartTs))
+      ? Number(opts.detectionStartTs)
+      : mediaEpoch;
     const seg = {
       id: opts.segmentId ?? `replay:${url}`,
       source_id: opts.sourceId ?? null,
       start_ts: mediaEpoch,
       end_ts: Number.isFinite(duration) ? mediaEpoch + duration : null,
+      detection_start_ts: detectionStartTs,
       path: null,
       replay_hls: true,
     };
@@ -1987,6 +1991,7 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
         startPosition,
         sourceId: resolved.source_id ?? srcId,
         segmentId: resolved.segment_id,
+        detectionStartTs: Number(resolved.segment_media_epoch),
         requestedTs: desiredTs,
         autoplay,
       });
@@ -3647,7 +3652,10 @@ function drawBoxes(ts) {
   if (!seg) { drawBoxList(v, []); return; }
   if (!st.dets[seg.id]) { loadDets(seg.id); drawBoxList(v, []); return; }
 
-  const off = ts - seg.start_ts;
+  const detStartTs = Number.isFinite(Number(seg.detection_start_ts))
+    ? Number(seg.detection_start_ts)
+    : seg.start_ts;
+  const off = ts - detStartTs;
   const nearest = (st.dets[seg.id] || []).reduce((best, d) =>
     Math.abs(d.ts_offset - off) < Math.abs((best?.ts_offset ?? Infinity) - off) ? d : best, null);
   if (!nearest || Math.abs(nearest.ts_offset - off) > 1.5) { drawBoxList(v, []); return; }

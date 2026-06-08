@@ -664,6 +664,7 @@ def make_app(
             "url": url,
             "media_offset": loc.media_offset,
             "media_epoch": media_epoch,
+            "segment_media_epoch": loc.anchor.media_epoch if loc.anchor else None,
             "duration": duration,
             "start_position": replay["start_position"] if replay else None,
             "replay_hls": replay,
