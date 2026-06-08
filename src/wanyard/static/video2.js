@@ -23,7 +23,7 @@ class V2Player {
 
   setSegments(segs) {
     this.#segs = [...segs].sort((a, b) => a.start_ts - b.start_ts);
-    if (this.#activeSeg) {
+    if (this.#activeSeg && !this.#activeSeg.replay_hls) {
       this.#activeSeg = this.#segs.find(s => s.id === this.#activeSeg.id) ?? this.#activeSeg;
     }
   }
@@ -3656,11 +3656,20 @@ function drawBoxes(ts) {
     ? Number(seg.detection_start_ts)
     : seg.start_ts;
   const off = ts - detStartTs;
-  const nearest = (st.dets[seg.id] || []).reduce((best, d) =>
-    Math.abs(d.ts_offset - off) < Math.abs((best?.ts_offset ?? Infinity) - off) ? d : best, null);
-  if (!nearest || Math.abs(nearest.ts_offset - off) > 1.5) { drawBoxList(v, []); return; }
+  let nearestBoxes = [];
+  let bestDist = Infinity;
+  for (const d of st.dets[seg.id] || []) {
+    const boxes = _filterBoxes(d.boxes);
+    if (!boxes.length) continue;
+    const dist = Math.abs(d.ts_offset - off);
+    if (dist < bestDist) {
+      bestDist = dist;
+      nearestBoxes = boxes;
+    }
+  }
+  if (bestDist > 1.5) { drawBoxList(v, []); return; }
 
-  drawBoxList(v, _filterBoxes(nearest.boxes));
+  drawBoxList(v, nearestBoxes);
 }
 
 function drawLiveBoxes() {
