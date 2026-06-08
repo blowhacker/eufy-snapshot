@@ -3754,65 +3754,98 @@ function interpolateBox(a, b, t) {
   };
 }
 
-function interpolateBoxSamples(prev, next, ts) {
-  if (!prev || !next || prev === next) return prev?.boxes || next?.boxes || [];
-  const span = next.ts - prev.ts;
-  if (!(span > 0)) return prev.boxes || [];
-  const t = Math.max(0, Math.min(1, (ts - prev.ts) / span));
-  const used = new Set();
-  const out = [];
-  for (const a of prev.boxes) {
-    let bestIdx = -1;
-    let bestDist = Infinity;
-    for (let i = 0; i < next.boxes.length; i++) {
-      if (used.has(i)) continue;
-      const b = next.boxes[i];
-      if (b.cls !== a.cls) continue;
-      const dist = boxCenterDistance(a, b);
-      if (dist < bestDist) {
-        bestDist = dist;
-        bestIdx = i;
+// Overlay association: chain per-frame boxes into short tracklets so a box only
+// interpolates toward the SAME object. Greedy nearest-center glides one box onto
+// a different object across the frame (busy road). Two cheap, ML-free gates fix it:
+//   mutual-NN  — link a->b only if b is a's nearest AND a is b's nearest (no hijack)
+//   CV-gate    — predict next pos from velocity; reject if the miss (2nd derivative)
+//                is implausible. Fast-but-straight stays; teleport/heading-flip cut.
+const _OVL_MAX_GAP    = 2.5;   // s — never bridge a bigger hole
+const _OVL_SNAP       = 0.8;   // s — show a lone/edge sample within this window
+const _OVL_GATE_FLOOR = 0.06;  // normalized center units (min gate)
+const _OVL_GATE_K     = 1.5;   // gate grows with speed*dt (fast objects get slack)
+const _OVL_WARM_GATE  = 0.14;  // first link has no velocity yet — plain distance gate
+
+function overlayTracklets() {
+  const o = st.overlays;
+  if (o._tracklets && o._trackletsSeq === o.seq) return o._tracklets;
+  const samples = (o.detections || [])
+    .map(d => ({ ts: Number(d.abs_ts), boxes: (d.boxes || []) }))   // unfiltered; filtered at draw
+    .filter(s => Number.isFinite(s.ts) && s.boxes.length)
+    .sort((a, b) => a.ts - b.ts);
+  const tracks = [];   // {cls, vx, vy, pts:[{ts,box,cx,cy}]}
+  for (const s of samples) {
+    const heads = tracks.filter(t => s.ts - t.pts[t.pts.length - 1].ts <= _OVL_MAX_GAP);
+    const cands = s.boxes.map(box => {
+      const c = boxCenter(box);
+      return { box, cx: c.x, cy: c.y, cls: box.cls, used: false, bestHead: null };
+    });
+    const preds = heads.map(t => {
+      const h = t.pts[t.pts.length - 1];
+      const dt = s.ts - h.ts;
+      const moving = t.vx != null;
+      const px = moving ? h.cx + t.vx * dt : h.cx;
+      const py = moving ? h.cy + t.vy * dt : h.cy;
+      const gate = moving ? Math.max(_OVL_GATE_FLOOR, _OVL_GATE_K * Math.hypot(t.vx, t.vy) * dt)
+                          : _OVL_WARM_GATE;
+      return { t, h, dt, px, py, gate, best: null, bestDist: Infinity };
+    });
+    // forward: each head's best candidate = min residual to its CV prediction
+    for (const p of preds)
+      for (const cand of cands) {
+        if (cand.cls !== p.t.cls) continue;
+        const d = Math.hypot(cand.cx - p.px, cand.cy - p.py);
+        if (d < p.bestDist) { p.bestDist = d; p.best = cand; }
+      }
+    // backward: each candidate's best head = nearest head center (same class)
+    for (const cand of cands) {
+      let bd = Infinity;
+      for (const p of preds) {
+        if (p.t.cls !== cand.cls) continue;
+        const d = Math.hypot(cand.cx - p.h.cx, cand.cy - p.h.cy);
+        if (d < bd) { bd = d; cand.bestHead = p; }
       }
     }
-    if (bestIdx >= 0 && bestDist <= 0.45) {
-      used.add(bestIdx);
-      out.push(interpolateBox(a, next.boxes[bestIdx], t));
+    // link only mutual pairs that pass the gate
+    for (const p of preds) {
+      const b = p.best;
+      if (b && !b.used && b.bestHead === p && p.bestDist <= p.gate) {
+        p.t.vx = (b.cx - p.h.cx) / p.dt;
+        p.t.vy = (b.cy - p.h.cy) / p.dt;
+        p.t.pts.push({ ts: s.ts, box: b.box, cx: b.cx, cy: b.cy });
+        b.used = true;
+      }
     }
+    // unmatched detections start their own tracklet
+    for (const cand of cands)
+      if (!cand.used)
+        tracks.push({ cls: cand.cls, vx: null, vy: null,
+                      pts: [{ ts: s.ts, box: cand.box, cx: cand.cx, cy: cand.cy }] });
   }
-  return out.length ? out : (t < 0.5 ? prev.boxes : next.boxes);
+  o._tracklets = tracks;
+  o._trackletsSeq = o.seq;
+  return tracks;
 }
 
 function boxesAtOverlayTime(ts) {
-  const samples = (st.overlays.detections || [])
-    .map(d => ({ ts: Number(d.abs_ts), boxes: _filterBoxes(d.boxes) }))
-    .filter(s => Number.isFinite(s.ts) && s.boxes.length)
-    .sort((a, b) => a.ts - b.ts);
-  if (!samples.length) return [];
-
-  let prev = null;
-  let next = null;
-  for (const sample of samples) {
-    if (sample.ts <= ts) prev = sample;
-    if (sample.ts >= ts) {
-      next = sample;
-      break;
+  if (!Number.isFinite(Number(ts))) return [];
+  const out = [];
+  for (const t of overlayTracklets()) {
+    const pts = t.pts;
+    let drawn = false;
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const a = pts[i], b = pts[i + 1];
+      if (ts >= a.ts && ts <= b.ts && (b.ts - a.ts) <= _OVL_MAX_GAP) {
+        out.push(interpolateBox(a.box, b.box, (ts - a.ts) / ((b.ts - a.ts) || 1)));
+        drawn = true; break;
+      }
     }
+    if (drawn) continue;                       // interpolated within the tracklet
+    let nearest = null, nd = Infinity;          // else snap to a lone/edge sample
+    for (const p of pts) { const d = Math.abs(p.ts - ts); if (d < nd) { nd = d; nearest = p; } }
+    if (nearest && nd <= _OVL_SNAP) out.push(nearest.box);
   }
-
-  if (prev && next && prev !== next && ts - prev.ts <= 2.5 && next.ts - ts <= 2.5) {
-    return interpolateBoxSamples(prev, next, ts);
-  }
-
-  let nearest = null;
-  let bestDist = Infinity;
-  for (const sample of samples) {
-    const dist = Math.abs(sample.ts - ts);
-    if (dist < bestDist) {
-      nearest = sample;
-      bestDist = dist;
-    }
-  }
-  return nearest && bestDist <= 1.5 ? nearest.boxes : [];
+  return _filterBoxes(out);                     // class/zone filter applied at draw
 }
 
 function drawBoxes(ts) {
