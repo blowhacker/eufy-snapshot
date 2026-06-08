@@ -7,7 +7,7 @@ crosses module boundaries. Media time = (asset, offset), exists only inside this
 module and the player/decoder.
 
 Hard rule: world time is the only public point-in-time coordinate. Recorded
-media is anchored by segments.media_start_ts, and media offsets stay private to
+media is anchored by segments.media_epoch, and media offsets stay private to
 this resolver/player boundary.
 """
 
@@ -38,9 +38,7 @@ _COVERAGE_TAIL_GRACE_SECONDS = 0.5
 
 
 def _recorded_media_epoch(row: sqlite3.Row) -> float | None:
-    value = row["media_start_ts"]
-    if value is None:
-        value = row["actual_start_ts"]
+    value = row["media_epoch"]
     if value is None:
         return None
     return float(value)
@@ -57,7 +55,7 @@ def _recorded_duration(row: sqlite3.Row) -> float | None:
 
 def _recorded_media_epoch_sql(alias: str | None = None) -> str:
     p = f"{alias}." if alias else ""
-    return f"COALESCE({p}media_start_ts, {p}actual_start_ts)"
+    return f"{p}media_epoch"
 
 
 @dataclass(frozen=True)
@@ -114,13 +112,13 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
     """Closed segment covering t. None = not recorded (caller tries live); a
     'none' MediaLocation = recorded region but unusable (no anchor).
 
-    Single basis anchored at media_epoch = media_start_ts. Duration is private
-    media metadata. Coverage = [media_start_ts, media_start_ts + duration].
+    Single basis anchored at media_epoch. Duration is private
+    media metadata. Coverage = [media_epoch, media_epoch + duration].
     """
     epoch = _recorded_media_epoch_sql()
     duration = "COALESCE(duration_sec, end_ts - start_ts)"
     row = conn.execute(
-        "SELECT id, path, start_ts, end_ts, media_start_ts, actual_start_ts,"
+        "SELECT id, path, start_ts, end_ts,"
         f" duration_sec, {epoch} AS media_epoch"
         " FROM segments"
         " WHERE source_id=? AND end_ts IS NOT NULL"
@@ -249,7 +247,7 @@ def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
                       t: float) -> Coverage | None:
     epoch = _recorded_media_epoch_sql()
     before = conn.execute(
-        "SELECT media_start_ts, actual_start_ts, start_ts, end_ts, duration_sec,"
+        "SELECT start_ts, end_ts, duration_sec,"
         f" {epoch} AS media_epoch"
         " FROM segments"
         f" WHERE source_id=? AND {epoch} IS NOT NULL AND {epoch}<=?"
@@ -257,7 +255,7 @@ def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
         (source_id, t),
     ).fetchone()
     after = conn.execute(
-        "SELECT media_start_ts, actual_start_ts, start_ts, end_ts, duration_sec,"
+        "SELECT start_ts, end_ts, duration_sec,"
         f" {epoch} AS media_epoch"
         " FROM segments"
         f" WHERE source_id=? AND {epoch} IS NOT NULL AND {epoch}>?"

@@ -50,9 +50,8 @@ CREATE TABLE IF NOT EXISTS segments (
     path            TEXT    NOT NULL UNIQUE,
     start_ts        REAL    NOT NULL,
     end_ts          REAL,
-    media_start_ts  REAL,        -- camera/world time of media offset 0
+    media_epoch     REAL,        -- world time (unix UTC) of media offset 0; the one anchor
     duration_sec    REAL,        -- playable media duration; private media metadata
-    actual_start_ts REAL,        -- legacy alias for media_start_ts during rollout
     spritesheet     TEXT,
     webvtt          TEXT
 );
@@ -274,9 +273,7 @@ def _row_value(row, key: str, default=None):
 
 
 def _seg_media_start(row) -> float | None:
-    value = _row_value(row, "media_start_ts")
-    if value is None:
-        value = _row_value(row, "actual_start_ts")
+    value = _row_value(row, "media_epoch")
     if value is None:
         return None
     try:
@@ -304,19 +301,16 @@ def _seg_duration(row) -> float | None:
 
 def _segment_media_epoch_sql(alias: str | None = None) -> str:
     p = f"{alias}." if alias else ""
-    return f"COALESCE({p}media_start_ts, {p}actual_start_ts)"
+    return f"{p}media_epoch"
 
 
 def _worldize_event_row(r: dict) -> dict:
     """Public event row: abs_ts/display_ts are already universal time.
 
-    Segment start is rewritten to media_start_ts for consumers that need private
+    Segment start is rewritten to media_epoch for consumers that need private
     media offset math, such as thumbnails and clip export.
     """
-    media_start = _seg_media_start({
-        "media_start_ts": r.get("seg_media_start_ts"),
-        "actual_start_ts": r.get("seg_actual_start_ts"),
-    })
+    media_start = _seg_media_start({"media_epoch": r.get("seg_media_epoch")})
     if media_start is None:
         return r
     r["seg_start_ts"] = media_start
@@ -329,7 +323,7 @@ def _worldize_segment_row(r: dict) -> dict:
     """Segment row exposed in universal time.
 
     `start_ts` remains the field name expected by the UI, but its public value is
-    media_start_ts. The original recorder-open value is retained as
+    media_epoch. The original recorder-open value is retained as
     recording_start_ts for debugging/storage-only paths.
     """
     media_start = _seg_media_start(r)
@@ -351,8 +345,7 @@ class VideoSegmentDB:
             # Additive migrations — safe to re-run, fail silently if column exists
             for migration in [
                 "ALTER TABLE hls_events ADD COLUMN thumb_jpeg BLOB",
-                "ALTER TABLE segments  ADD COLUMN actual_start_ts REAL",
-                "ALTER TABLE segments  ADD COLUMN media_start_ts REAL",
+                "ALTER TABLE segments  ADD COLUMN media_epoch REAL",
                 "ALTER TABLE segments  ADD COLUMN duration_sec REAL",
                 "ALTER TABLE video_detections ADD COLUMN source_id TEXT",
                 "ALTER TABLE video_detections ADD COLUMN abs_ts REAL",
@@ -361,6 +354,28 @@ class VideoSegmentDB:
                 "ALTER TABLE object_events ADD COLUMN display_ts REAL",
                 "ALTER TABLE video_zones ADD COLUMN uid TEXT",
                 "ALTER TABLE notification_events ADD COLUMN thumb_jpeg BLOB",
+            ]:
+                try:
+                    conn.execute(migration)
+                except Exception:
+                    pass
+            # One-time collapse to a single epoch column. Backfill media_epoch from
+            # the legacy dual columns, purge unanchored segments (the resolver never
+            # served them), then drop the legacy columns. Each step tolerates a fresh
+            # DB where the legacy columns never existed.
+            for migration in [
+                "UPDATE segments SET media_epoch = COALESCE(media_start_ts, actual_start_ts)"
+                " WHERE media_epoch IS NULL",
+                "DELETE FROM video_detections WHERE segment_id IN"
+                " (SELECT id FROM segments WHERE media_epoch IS NULL)",
+                "DELETE FROM video_events WHERE segment_id IN"
+                " (SELECT id FROM segments WHERE media_epoch IS NULL)",
+                "DELETE FROM object_events WHERE segment_id IN"
+                " (SELECT id FROM segments WHERE media_epoch IS NULL)",
+                "DELETE FROM segments WHERE media_epoch IS NULL",
+                "DROP INDEX IF EXISTS seg_source_media_start",
+                "ALTER TABLE segments DROP COLUMN media_start_ts",
+                "ALTER TABLE segments DROP COLUMN actual_start_ts",
             ]:
                 try:
                     conn.execute(migration)
@@ -378,8 +393,8 @@ class VideoSegmentDB:
                 " ON video_zones(source_id, uid)"
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS seg_source_media_start"
-                " ON segments(source_id, media_start_ts)"
+                "CREATE INDEX IF NOT EXISTS seg_source_media_epoch"
+                " ON segments(source_id, media_epoch)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS vdet_source_abs"
@@ -426,21 +441,21 @@ class VideoSegmentDB:
                 (end_ts, duration, spritesheet, webvtt, segment_id),
             )
 
-    def set_segment_media_start(self, segment_id: int, media_start_ts: float) -> None:
-        """Attach the world-time anchor for media offset 0 of one segment."""
+    def set_segment_media_start(self, segment_id: int, media_epoch: float) -> None:
+        """Attach the world-time anchor for media offset 0 of one segment.
+
+        Keeps the earliest observed frame time: the anchor is frame 0, and later
+        observations can only confirm or push it earlier, never later.
+        """
         with self._connect() as conn:
             conn.execute(
                 "UPDATE segments"
-                " SET media_start_ts = CASE"
-                "   WHEN media_start_ts IS NULL THEN ?"
-                "   ELSE MIN(media_start_ts, ?)"
-                " END,"
-                " actual_start_ts = CASE"
-                "   WHEN actual_start_ts IS NULL THEN ?"
-                "   ELSE MIN(actual_start_ts, ?)"
+                " SET media_epoch = CASE"
+                "   WHEN media_epoch IS NULL THEN ?"
+                "   ELSE MIN(media_epoch, ?)"
                 " END"
                 " WHERE id=?",
-                (media_start_ts, media_start_ts, media_start_ts, media_start_ts, segment_id),
+                (media_epoch, media_epoch, segment_id),
             )
 
     def add_detection(self, segment_id: int, ts_offset: float,
@@ -448,7 +463,7 @@ class VideoSegmentDB:
                       boxes: list | None, classes: list | None) -> None:
         with self._connect() as conn:
             seg = conn.execute(
-                "SELECT source_id, start_ts, media_start_ts, actual_start_ts"
+                "SELECT source_id, start_ts, media_epoch"
                 " FROM segments WHERE id=?",
                 (segment_id,),
             ).fetchone()
@@ -456,7 +471,7 @@ class VideoSegmentDB:
                 raise ValueError(f"unknown segment_id {segment_id}")
             media_start = _seg_media_start(seg)
             if media_start is None:
-                raise ValueError(f"segment {segment_id} has no media_start_ts")
+                raise ValueError(f"segment {segment_id} has no media_epoch")
             conn.execute(
                 "INSERT INTO video_detections"
                 "(segment_id, source_id, abs_ts, ts_offset, has_human,"
@@ -471,7 +486,7 @@ class VideoSegmentDB:
     def replace_detections(self, segment_id: int, detections: list[dict]) -> None:
         with self._connect() as conn:
             seg = conn.execute(
-                "SELECT source_id, start_ts, media_start_ts, actual_start_ts"
+                "SELECT source_id, start_ts, media_epoch"
                 " FROM segments WHERE id=?",
                 (segment_id,),
             ).fetchone()
@@ -480,7 +495,7 @@ class VideoSegmentDB:
             media_start = _seg_media_start(seg)
             has_real = any(float(d.get("ts_offset", 0.0)) >= 0 for d in detections)
             if media_start is None and has_real:
-                raise ValueError(f"segment {segment_id} has no media_start_ts")
+                raise ValueError(f"segment {segment_id} has no media_epoch")
             sentinel_ts = media_start if media_start is not None else float(seg["start_ts"])
             conn.execute("DELETE FROM video_detections WHERE segment_id=?", (segment_id,))
             conn.executemany(
@@ -541,7 +556,7 @@ class VideoSegmentDB:
             rows = conn.execute(
                 "SELECT vd.segment_id, vd.source_id, vd.abs_ts, vd.ts_offset,"
                 " vd.has_human, vd.confidence, vd.boxes_json, vd.classes_json,"
-                " COALESCE(s.media_start_ts, s.actual_start_ts) AS media_epoch"
+                " s.media_epoch AS media_epoch"
                 " FROM video_detections vd"
                 " JOIN segments s ON s.id=vd.segment_id"
                 " WHERE vd.source_id=?"
@@ -1118,8 +1133,7 @@ class VideoSegmentDB:
             query_limit = max(limit * 20, 200)
         sql = (
             "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts,"
-            " s.media_start_ts as seg_media_start_ts,"
-            " s.actual_start_ts as seg_actual_start_ts"
+            " s.media_epoch as seg_media_epoch"
             " FROM object_events e LEFT JOIN segments s ON s.id=e.segment_id"
             f" WHERE {' AND '.join(where)}"
             " ORDER BY e.display_ts DESC LIMIT ?"
@@ -1156,8 +1170,7 @@ class VideoSegmentDB:
         base = " AND ".join(where)
         select = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
-            " s.start_ts as seg_start_ts, s.media_start_ts as seg_media_start_ts,"
-            " s.actual_start_ts as seg_actual_start_ts"
+            " s.start_ts as seg_start_ts, s.media_epoch as seg_media_epoch"
             " FROM object_events e LEFT JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
@@ -1385,8 +1398,7 @@ class VideoSegmentDB:
             query_limit = max(limit * 20, 200)
         sql = (
             "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts,"
-            " s.media_start_ts as seg_media_start_ts,"
-            " s.actual_start_ts as seg_actual_start_ts"
+            " s.media_epoch as seg_media_epoch"
             " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {' AND '.join(where)}"
             " ORDER BY e.abs_ts DESC LIMIT ?"
@@ -1422,8 +1434,7 @@ class VideoSegmentDB:
         base = " AND ".join(where)
         select = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
-            " s.start_ts as seg_start_ts, s.media_start_ts as seg_media_start_ts,"
-            " s.actual_start_ts as seg_actual_start_ts"
+            " s.start_ts as seg_start_ts, s.media_epoch as seg_media_epoch"
             " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
@@ -1459,9 +1470,8 @@ class VideoSegmentDB:
                     "SELECT vd.boxes_json AS boxes_json, vd.confidence AS confidence,"
                     " vd.abs_ts AS abs_ts,"
                     " s.path AS seg_path,"
-                    " COALESCE(s.media_start_ts, s.actual_start_ts) AS seg_start_ts,"
-                    " s.media_start_ts AS seg_media_start_ts,"
-                    " s.actual_start_ts AS seg_actual_start_ts,"
+                    " s.media_epoch AS seg_start_ts,"
+                    " s.media_epoch AS seg_media_epoch,"
                     " s.end_ts AS seg_end_ts,"
                     " NULL AS class"
                     " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
@@ -1477,8 +1487,7 @@ class VideoSegmentDB:
             with self._connect() as conn:
                 row = conn.execute(
                     "SELECT e.*, s.path as seg_path, s.start_ts as seg_start_ts,"
-                    " s.media_start_ts as seg_media_start_ts,"
-                    " s.actual_start_ts as seg_actual_start_ts, s.end_ts as seg_end_ts"
+                    " s.media_epoch as seg_media_epoch, s.end_ts as seg_end_ts"
                     " FROM object_events e JOIN segments s ON s.id=e.segment_id"
                     " WHERE e.id=?",
                     (object_event_id,),
@@ -1492,8 +1501,7 @@ class VideoSegmentDB:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT e.*, s.path as seg_path, s.start_ts as seg_start_ts,"
-                " s.media_start_ts as seg_media_start_ts,"
-                " s.actual_start_ts as seg_actual_start_ts, s.end_ts as seg_end_ts"
+                " s.media_epoch as seg_media_epoch, s.end_ts as seg_end_ts"
                 " FROM video_events e JOIN segments s ON s.id=e.segment_id"
                 " WHERE e.id=?",
                 (legacy_event_id,),
@@ -1747,8 +1755,7 @@ class VideoSegmentDB:
                 row["seg_path"] = seg["path"]
                 row["spritesheet"] = seg.get("spritesheet")
                 row["seg_start_ts"] = seg["start_ts"]
-                row["seg_media_start_ts"] = seg.get("media_start_ts")
-                row["seg_actual_start_ts"] = seg.get("actual_start_ts")
+                row["seg_media_epoch"] = seg.get("media_epoch")
                 _worldize_event_row(row)
                 events.append(row)
         events = _filter_with_polygons(events, polygons)
@@ -1862,22 +1869,12 @@ class VideoSegmentDB:
                 return
             conn.execute(
                 "UPDATE segments"
-                " SET media_start_ts = CASE"
-                "   WHEN media_start_ts IS NULL THEN ?"
-                "   ELSE MIN(media_start_ts, ?)"
-                " END,"
-                " actual_start_ts = CASE"
-                "   WHEN actual_start_ts IS NULL THEN ?"
-                "   ELSE MIN(actual_start_ts, ?)"
+                " SET media_epoch = CASE"
+                "   WHEN media_epoch IS NULL THEN ?"
+                "   ELSE MIN(media_epoch, ?)"
                 " END"
                 " WHERE id=?",
-                (
-                    abs_ts,
-                    abs_ts,
-                    abs_ts,
-                    abs_ts,
-                    row["id"],
-                ),
+                (abs_ts, abs_ts, row["id"]),
             )
 
     def live_status(self, source_id: str | None = None, zone_id=None) -> dict:
@@ -2061,7 +2058,7 @@ def backfill_events(db: VideoSegmentDB, video_dir: Path | None = None,
     with db._connect() as conn:
         segs = conn.execute(
             "SELECT s.* FROM segments s WHERE s.end_ts IS NOT NULL"
-            " AND COALESCE(s.media_start_ts, s.actual_start_ts) IS NOT NULL"
+            " AND s.media_epoch IS NOT NULL"
             " AND NOT EXISTS (SELECT 1 FROM video_detections WHERE segment_id=s.id)"
             " ORDER BY s.start_ts"
         ).fetchall()
@@ -3214,7 +3211,7 @@ class VideoWorker:
         try:
             self.db.set_segment_media_start(seg_id, min(candidates))
         except Exception:
-            LOG.exception("failed to set media_start_ts for segment %s", seg_id)
+            LOG.exception("failed to set media_epoch for segment %s", seg_id)
 
     def run(self) -> None:
         """Continuous recording loop — call from a daemon thread."""

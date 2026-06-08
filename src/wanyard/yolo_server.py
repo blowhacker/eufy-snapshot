@@ -545,7 +545,7 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
             with video_db._connect() as conn:
                 segs = conn.execute(
                     "SELECT s.* FROM segments s WHERE s.end_ts IS NOT NULL"
-                    " AND COALESCE(s.media_start_ts, s.actual_start_ts) IS NOT NULL"
+                    " AND s.media_epoch IS NOT NULL"
                     " AND NOT EXISTS (SELECT 1 FROM video_detections WHERE segment_id=s.id)"
                     " ORDER BY s.start_ts"
                     " LIMIT 5"
@@ -560,7 +560,7 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                     break
                 seg = dict(row)
                 seg_path = video_dir / seg["path"]
-                media_start = seg.get("media_start_ts") or seg.get("actual_start_ts")
+                media_start = seg.get("media_epoch")
                 duration = seg.get("duration_sec")
                 if duration is None:
                     duration = float(seg["end_ts"]) - float(seg["start_ts"])
