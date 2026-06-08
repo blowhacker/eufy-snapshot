@@ -97,32 +97,37 @@ class V2Player {
     return landing;
   }
 
-  async seekHls(opts = {}) {
+  // Recorded seek seeded by the server resolver: play the MP4 file directly.
+  // currentTs = media_epoch + presentedMediaTime, the same media_epoch detections
+  // are anchored to, so overlay boxes enclose the on-screen frame. No HLS rewrap,
+  // no PDT, no second clock — nothing to drift.
+  async seekRecorded(opts = {}) {
     this.#abort?.abort();
     this.#abort = new AbortController();
     const { signal } = this.#abort;
 
     const url = String(opts.url || "");
     const mediaEpoch = Number(opts.mediaEpoch);
-    const startPosition = Math.max(0, Number(opts.startPosition) || 0);
     const duration = Number.isFinite(Number(opts.duration)) ? Math.max(0, Number(opts.duration)) : Infinity;
     if (!url || !Number.isFinite(mediaEpoch)) return null;
+    const maxOff = Number.isFinite(duration) ? Math.max(0, duration - 0.25) : Infinity;
+    const startPosition = Math.max(0, Math.min(maxOff, Number(opts.startPosition) || 0));
 
     const actualTs = mediaEpoch + startPosition;
     const seg = {
-      id: opts.segmentId ?? `replay:${url}`,
+      id: opts.segmentId ?? `seg:${url}`,
       source_id: opts.sourceId ?? null,
       start_ts: mediaEpoch,
       end_ts: Number.isFinite(duration) ? mediaEpoch + duration : null,
-      path: null,
-      replay_hls: true,
+      path: url.replace(/^\/video\/files\//, ""),
+      replay_hls: false,
     };
     const landing = {
       requestedTs: Number.isFinite(Number(opts.requestedTs)) ? Number(opts.requestedTs) : actualTs,
       actualTs,
       offsetSecs: startPosition,
       remainingSecs: Number.isFinite(duration) ? Math.max(0, duration - startPosition) : Infinity,
-      reason: "replay-hls",
+      reason: "recorded",
       sourceId: seg.source_id,
       segmentId: seg.id,
       segment: seg,
@@ -132,35 +137,19 @@ class V2Player {
 
     try {
       this.#destroyHls();
-      const canNative = this.#v.canPlayType("application/vnd.apple.mpegurl");
-      const preferNative = Boolean(canNative && shouldUseNativeHls());
-      const HlsCtor = preferNative ? null : await loadHlsJs().catch(() => null);
-      const canUseHlsJs = Boolean(HlsCtor?.isSupported?.());
-      if (signal.aborted) return null;
-
-      if (canUseHlsJs) {
-        const hls = new HlsCtor({ lowLatencyMode: false, startPosition });
-        this.#hls = hls;
-        this.#hlsUrl = url;
+      if (this.#v.dataset.src !== url) {
+        this.#v.src         = url;
         this.#v.dataset.src = url;
-        const parsed = this.#waitForHls(hls, HlsCtor, HlsCtor.Events.MANIFEST_PARSED, signal);
-        hls.loadSource(url);
-        hls.attachMedia(this.#v);
-        await parsed;
-      } else if (canNative) {
-        this.#v.src = url;
-        this.#v.dataset.src = url;
+        this.#applyRate();
         this.#v.load();
         await this.#waitFor("loadedmetadata", signal);
-      } else {
-        throw new Error("HLS playback is not supported in this browser");
+        this.#applyRate();
       }
 
       if (signal.aborted) return null;
       this.#activeSeg = seg;
-      this.#applyRate();
-      if (Math.abs((this.#v.currentTime || 0) - startPosition) > 0.15) {
-        const seeked = this.#waitFor("seeked", signal, 3000).catch(() => {});
+      if (Math.abs((this.#v.currentTime || 0) - startPosition) > 0.05) {
+        const seeked = this.#waitFor("seeked", signal);
         this.#v.currentTime = startPosition;
         await seeked;
       } else {
@@ -168,7 +157,6 @@ class V2Player {
       }
     } catch {
       if (this.#abort?.signal === signal && this.#intendedTs === actualTs) this.#intendedTs = null;
-      this.#destroyHls();
       return null;
     }
 
@@ -1957,12 +1945,10 @@ async function resolveVideoTimestamp(sourceId, ts, opts = {}) {
   return await r.json().catch(() => null);
 }
 
-function isReplayHlsResolution(resolved) {
+function isRecordedResolution(resolved) {
   return Boolean(
     resolved &&
-    resolved.provider === "hls" &&
-    resolved.reason === "replay_hls" &&
-    resolved.storage_provider === "mp4" &&
+    (resolved.storage_provider === "mp4" || resolved.provider === "mp4") &&
     resolved.url &&
     Number.isFinite(Number(resolved.media_epoch))
   );
@@ -2003,7 +1989,7 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
     }
     if (seq !== absoluteSeekSeq) return false;
 
-    if (isReplayHlsResolution(resolved)) {
+    if (isRecordedResolution(resolved)) {
       const mediaEpoch = Number(resolved.media_epoch);
       const duration = Number(resolved.duration);
       const maxPosition = Number.isFinite(duration) ? Math.max(0, duration - 0.25) : Infinity;
@@ -2013,7 +1999,7 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
       el.liveVideo.style.display = "none";
       el.empty.style.display = "none";
       el.video.style.display = "block";
-      const landing = await player.seekHls({
+      const landing = await player.seekRecorded({
         url: resolved.url,
         mediaEpoch,
         duration,
