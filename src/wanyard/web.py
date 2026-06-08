@@ -173,6 +173,71 @@ def _add_program_date_time_tags(playlist: Path, media_epoch: float) -> None:
     playlist.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
+def _playlist_duration(playlist: Path) -> float | None:
+    total = 0.0
+    found = False
+    for line in playlist.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("#EXTINF:"):
+            continue
+        try:
+            total += max(0.0, float(line.split(":", 1)[1].split(",", 1)[0]))
+            found = True
+        except (IndexError, ValueError):
+            continue
+    return total if found else None
+
+
+def _source_keyframe_offset(src: Path, start_offset: float) -> float:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or start_offset <= 0:
+        return max(0.0, start_offset)
+    scan_from = max(0.0, start_offset - 90.0)
+    cmd = [
+        ffprobe, "-v", "error",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-read_intervals", f"{scan_from:.3f}%{start_offset + 0.1:.3f}",
+        "-show_frames",
+        "-show_entries", "frame=best_effort_timestamp_time",
+        "-of", "csv=p=0",
+        str(src),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=15, check=False)
+    if proc.returncode != 0:
+        return max(0.0, start_offset)
+    best = None
+    for raw in proc.stdout.decode("utf-8", "replace").splitlines():
+        try:
+            ts = float(raw.split(",", 1)[0])
+        except ValueError:
+            continue
+        if ts <= start_offset + 0.001:
+            best = ts
+    return max(0.0, best if best is not None else start_offset)
+
+
+def _first_video_media_time(segment: Path) -> float:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0.0
+    cmd = [
+        ffprobe, "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=start_time",
+        "-of", "default=nw=1:nk=1",
+        str(segment),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=10, check=False)
+    if proc.returncode != 0:
+        return 0.0
+    for raw in proc.stdout.decode("utf-8", "replace").splitlines():
+        try:
+            return max(0.0, float(raw.strip()))
+        except ValueError:
+            continue
+    return 0.0
+
+
 def _prepare_replay_hls(
     video_dir: Path,
     source_id: str,
@@ -219,12 +284,17 @@ def _prepare_replay_hls(
         if window_seconds is None else float(window_seconds),
     )
     window = min(window, max(2.0, _REPLAY_HLS_MAX_WINDOW_SECONDS))
-    start_offset = max(0.0, media_offset - pre_roll)
+    requested_start_offset = max(0.0, media_offset - pre_roll)
     if media_duration is not None:
-        remaining = max(0.0, media_duration - start_offset)
+        remaining = max(0.0, media_duration - requested_start_offset)
         window = min(window, max(2.0, remaining))
-    start_position = max(0.0, media_offset - start_offset)
-    media_epoch = float(loc.anchor.media_epoch) + start_offset
+
+    emitted_start_offset = _source_keyframe_offset(src, requested_start_offset)
+    emitted_shift = max(0.0, requested_start_offset - emitted_start_offset)
+    hls_window = window + emitted_shift
+    if media_duration is not None:
+        remaining = max(0.0, media_duration - emitted_start_offset)
+        hls_window = min(hls_window, max(2.0, remaining))
 
     _cleanup_replay_hls_root()
     token = uuid.uuid4().hex
@@ -235,9 +305,9 @@ def _prepare_replay_hls(
 
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error",
-        "-ss", f"{start_offset:.3f}",
+        "-ss", f"{emitted_start_offset:.3f}",
         "-i", str(src),
-        "-t", f"{window:.3f}",
+        "-t", f"{hls_window:.3f}",
         "-map", "0:v:0",
         "-map", "0:a:0?",
         "-c", "copy",
@@ -268,6 +338,10 @@ def _prepare_replay_hls(
         shutil.rmtree(out_dir, ignore_errors=True)
         err = proc.stderr.decode("utf-8", "replace")[-500:] if proc.stderr else ""
         raise RuntimeError(err or "ffmpeg replay HLS generation failed")
+    first_video_time = _first_video_media_time(segments[0])
+    media_epoch = float(loc.anchor.media_epoch) + emitted_start_offset - first_video_time
+    start_position = max(0.0, media_offset + float(loc.anchor.media_epoch) - media_epoch)
+    duration = _playlist_duration(playlist) or hls_window
     _add_program_date_time_tags(playlist, media_epoch)
 
     return {
@@ -275,7 +349,7 @@ def _prepare_replay_hls(
         "url": f"/video/replay/{token}/stream.m3u8",
         "media_epoch": media_epoch,
         "start_position": start_position,
-        "duration": window,
+        "duration": duration,
         "segment_count": len(segments),
         "generation_ms": round(elapsed_ms, 1),
         "expires_in": _REPLAY_HLS_TTL_SECONDS,
@@ -283,6 +357,9 @@ def _prepare_replay_hls(
         "source_id": source_id,
         "segment_id": loc.segment_id,
         "storage_provider": "mp4",
+        "emitted_start_offset": emitted_start_offset,
+        "requested_start_offset": requested_start_offset,
+        "first_video_media_time": first_video_time,
     }
 
 

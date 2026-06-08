@@ -443,7 +443,15 @@ class VideoSegmentDB:
                 f" ORDER BY {abs_expr}",
                 (source_id, since, until),
             ).fetchall()
-        return [{
+            hls_rows = conn.execute(
+                "SELECT source_id, abs_ts, class, confidence, boxes_json"
+                " FROM hls_events"
+                " WHERE source_id=? AND abs_ts>=? AND abs_ts<=?"
+                " ORDER BY abs_ts",
+                (source_id, since, until),
+            ).fetchall()
+
+        detections = [{
             "segment_id":  r["segment_id"],
             "source_id":   r["source_id"],
             "abs_ts":      r["abs_ts"],
@@ -454,6 +462,32 @@ class VideoSegmentDB:
             "boxes":       json.loads(r["boxes_json"])   if r["boxes_json"]   else [],
             "classes":     json.loads(r["classes_json"]) if r["classes_json"] else [],
         } for r in rows]
+        by_frame: dict[tuple[str, float], dict] = {}
+        for r in hls_rows:
+            key = (r["source_id"], round(float(r["abs_ts"]), 2))
+            if key not in by_frame:
+                by_frame[key] = {
+                    "segment_id": None,
+                    "source_id": r["source_id"],
+                    "abs_ts": r["abs_ts"],
+                    "media_epoch": None,
+                    "ts_offset": None,
+                    "has_human": False,
+                    "confidence": 0.0,
+                    "boxes": [],
+                    "classes": [],
+                    "provisional": True,
+                }
+            det = by_frame[key]
+            boxes = json.loads(r["boxes_json"]) if r["boxes_json"] else []
+            det["boxes"].extend(boxes)
+            det["classes"].append(r["class"])
+            det["confidence"] = max(det["confidence"], r["confidence"])
+            if r["class"] == "person":
+                det["has_human"] = True
+        detections.extend(by_frame.values())
+        detections.sort(key=lambda d: d["abs_ts"])
+        return detections
 
     def list_zones(self, source_id: str | None = None,
                    zone_type: str | None = None) -> list[dict]:
