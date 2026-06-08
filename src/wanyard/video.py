@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 CREATE INDEX IF NOT EXISTS seg_source_ts ON segments(source_id, start_ts);
 CREATE INDEX IF NOT EXISTS seg_source_end_ts ON segments(source_id, end_ts, start_ts);
+CREATE INDEX IF NOT EXISTS seg_source_media_epoch ON segments(source_id, media_epoch);
 
 CREATE TABLE IF NOT EXISTS video_detections (
     id          INTEGER PRIMARY KEY,
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS video_detections (
     classes_json TEXT
 );
 CREATE INDEX IF NOT EXISTS vdet_seg ON video_detections(segment_id, abs_ts);
+CREATE INDEX IF NOT EXISTS vdet_source_abs ON video_detections(source_id, abs_ts);
 
 CREATE TABLE IF NOT EXISTS video_events (
     id          INTEGER PRIMARY KEY,
@@ -80,7 +82,9 @@ CREATE TABLE IF NOT EXISTS video_events (
     start_off   REAL    NOT NULL,
     end_off     REAL    NOT NULL,
     confidence  REAL    NOT NULL DEFAULT 0,
-    boxes_json  TEXT
+    boxes_json  TEXT,
+    event_type  TEXT    NOT NULL DEFAULT 'detection',
+    track_id    TEXT
 );
 CREATE INDEX IF NOT EXISTS vevt_source_ts ON video_events(source_id, abs_ts);
 CREATE INDEX IF NOT EXISTS vevt_class     ON video_events(class, abs_ts);
@@ -129,6 +133,7 @@ CREATE TABLE IF NOT EXISTS object_events (
     boxes_json  TEXT
 );
 CREATE INDEX IF NOT EXISTS oevt_source_ts ON object_events(source_id, abs_ts);
+CREATE INDEX IF NOT EXISTS oevt_source_display_ts ON object_events(source_id, display_ts);
 CREATE INDEX IF NOT EXISTS oevt_class_ts ON object_events(class, abs_ts);
 CREATE INDEX IF NOT EXISTS oevt_track ON object_events(track_id, abs_ts);
 CREATE INDEX IF NOT EXISTS oevt_seg ON object_events(segment_id, class);
@@ -153,6 +158,8 @@ CREATE TABLE IF NOT EXISTS video_zones (
 );
 CREATE INDEX IF NOT EXISTS vzone_source_type
     ON video_zones(source_id, zone_type, enabled);
+CREATE UNIQUE INDEX IF NOT EXISTS vzone_source_uid
+    ON video_zones(source_id, uid);
 
 CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
@@ -307,13 +314,10 @@ def _segment_media_epoch_sql(alias: str | None = None) -> str:
 def _worldize_event_row(r: dict) -> dict:
     """Public event row: abs_ts/display_ts are already universal time.
 
-    Segment start is rewritten to media_epoch for consumers that need private
-    media offset math, such as thumbnails and clip export.
+    The segment anchor for private offset math (thumbnails, clip export) is
+    seg_media_epoch, carried straight from the segment's media_epoch. display_ts
+    defaults to abs_ts when a row has no distinct display time.
     """
-    media_start = _seg_media_start({"media_epoch": r.get("seg_media_epoch")})
-    if media_start is None:
-        return r
-    r["seg_start_ts"] = media_start
     if r.get("display_ts") is None and r.get("abs_ts") is not None:
         r["display_ts"] = r["abs_ts"]
     return r
@@ -324,86 +328,10 @@ class VideoSegmentDB:
         self._path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            # _DDL is the single source of truth: one pure schema, no migrations,
+            # no backfill. A point in time is a point on video; media_epoch is the
+            # only anchor and abs_ts the only detection time.
             conn.executescript(_DDL)
-            # Additive migrations — safe to re-run, fail silently if column exists
-            for migration in [
-                "ALTER TABLE hls_events ADD COLUMN thumb_jpeg BLOB",
-                "ALTER TABLE segments  ADD COLUMN media_epoch REAL",
-                "ALTER TABLE segments  ADD COLUMN duration_sec REAL",
-                "ALTER TABLE segments  ADD COLUMN scanned_at REAL",
-                "ALTER TABLE video_detections ADD COLUMN source_id TEXT",
-                "ALTER TABLE video_detections ADD COLUMN abs_ts REAL",
-                "ALTER TABLE video_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'detection'",
-                "ALTER TABLE video_events ADD COLUMN track_id TEXT",
-                "ALTER TABLE object_events ADD COLUMN display_ts REAL",
-                "ALTER TABLE video_zones ADD COLUMN uid TEXT",
-                "ALTER TABLE notification_events ADD COLUMN thumb_jpeg BLOB",
-            ]:
-                try:
-                    conn.execute(migration)
-                except Exception:
-                    pass
-            # One-time collapse to a single epoch column. Backfill media_epoch from
-            # the legacy dual columns, purge unanchored segments (the resolver never
-            # served them), then drop the legacy columns. Each step tolerates a fresh
-            # DB where the legacy columns never existed.
-            for migration in [
-                "UPDATE segments SET media_epoch = COALESCE(media_start_ts, actual_start_ts)"
-                " WHERE media_epoch IS NULL",
-                "DELETE FROM video_detections WHERE segment_id IN"
-                " (SELECT id FROM segments WHERE media_epoch IS NULL)",
-                "DELETE FROM video_events WHERE segment_id IN"
-                " (SELECT id FROM segments WHERE media_epoch IS NULL)",
-                "DELETE FROM object_events WHERE segment_id IN"
-                " (SELECT id FROM segments WHERE media_epoch IS NULL)",
-                "DELETE FROM segments WHERE media_epoch IS NULL",
-                "DROP INDEX IF EXISTS seg_source_media_start",
-                "ALTER TABLE segments DROP COLUMN media_start_ts",
-                "ALTER TABLE segments DROP COLUMN actual_start_ts",
-            ]:
-                try:
-                    conn.execute(migration)
-                except Exception:
-                    pass
-            # One-time drop of the redundant file-relative offset. abs_ts (world
-            # time) is the only detection time. A scanned-but-empty segment was
-            # marked by a sentinel row (ts_offset<0); that role moves to
-            # segments.scanned_at. Tolerant of a fresh DB without ts_offset.
-            for migration in [
-                "UPDATE segments SET scanned_at = COALESCE(scanned_at, end_ts, start_ts)"
-                " WHERE id IN (SELECT DISTINCT segment_id FROM video_detections)",
-                "DELETE FROM video_detections WHERE ts_offset < 0",
-                "DROP INDEX IF EXISTS vdet_seg",
-                "ALTER TABLE video_detections DROP COLUMN ts_offset",
-                "CREATE INDEX IF NOT EXISTS vdet_seg ON video_detections(segment_id, abs_ts)",
-            ]:
-                try:
-                    conn.execute(migration)
-                except Exception:
-                    pass
-            for row in conn.execute(
-                "SELECT id FROM video_zones WHERE uid IS NULL OR uid=''"
-            ).fetchall():
-                conn.execute(
-                    "UPDATE video_zones SET uid=? WHERE id=?",
-                    (_new_zone_uid(), row["id"]),
-                )
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS vzone_source_uid"
-                " ON video_zones(source_id, uid)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS seg_source_media_epoch"
-                " ON segments(source_id, media_epoch)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS vdet_source_abs"
-                " ON video_detections(source_id, abs_ts)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS oevt_source_display_ts"
-                " ON object_events(source_id, display_ts)"
-            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._path), timeout=10)
@@ -1108,7 +1036,7 @@ class VideoSegmentDB:
         if polygons and limit < 100000:
             query_limit = max(limit * 20, 200)
         sql = (
-            "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts,"
+            "SELECT e.*, s.path as seg_path, s.spritesheet,"
             " s.media_epoch as seg_media_epoch"
             " FROM object_events e LEFT JOIN segments s ON s.id=e.segment_id"
             f" WHERE {' AND '.join(where)}"
@@ -1146,7 +1074,7 @@ class VideoSegmentDB:
         base = " AND ".join(where)
         select = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
-            " s.start_ts as seg_start_ts, s.media_epoch as seg_media_epoch"
+            " s.media_epoch as seg_media_epoch"
             " FROM object_events e LEFT JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
@@ -1373,7 +1301,7 @@ class VideoSegmentDB:
         if polygons and limit < 100000:
             query_limit = max(limit * 20, 200)
         sql = (
-            "SELECT e.*, s.path as seg_path, s.spritesheet, s.start_ts as seg_start_ts,"
+            "SELECT e.*, s.path as seg_path, s.spritesheet,"
             " s.media_epoch as seg_media_epoch"
             " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {' AND '.join(where)}"
@@ -1410,7 +1338,7 @@ class VideoSegmentDB:
         base = " AND ".join(where)
         select = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
-            " s.start_ts as seg_start_ts, s.media_epoch as seg_media_epoch"
+            " s.media_epoch as seg_media_epoch"
             " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {base}"
         )
@@ -1434,9 +1362,9 @@ class VideoSegmentDB:
     def get_event_with_segment(self, event_id) -> dict | None:
         raw_id = str(event_id)
         if raw_id.startswith("d:"):
-            # Per-frame detection: the thumb seek is ts_offset into the MP4, so
-            # report seg_start_ts/abs_ts such that (abs_ts - seg_start_ts) lands
-            # exactly on the tagged frame.
+            # Per-frame detection: the thumb seek is (abs_ts - media_epoch) into
+            # the MP4, so report seg_media_epoch/abs_ts such that
+            # (abs_ts - seg_media_epoch) lands exactly on the tagged frame.
             try:
                 det_id = int(raw_id[2:])
             except ValueError:
@@ -1446,7 +1374,6 @@ class VideoSegmentDB:
                     "SELECT vd.boxes_json AS boxes_json, vd.confidence AS confidence,"
                     " vd.abs_ts AS abs_ts,"
                     " s.path AS seg_path,"
-                    " s.media_epoch AS seg_start_ts,"
                     " s.media_epoch AS seg_media_epoch,"
                     " s.end_ts AS seg_end_ts,"
                     " NULL AS class"
@@ -1462,7 +1389,7 @@ class VideoSegmentDB:
                 return None
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT e.*, s.path as seg_path, s.start_ts as seg_start_ts,"
+                    "SELECT e.*, s.path as seg_path,"
                     " s.media_epoch as seg_media_epoch, s.end_ts as seg_end_ts"
                     " FROM object_events e JOIN segments s ON s.id=e.segment_id"
                     " WHERE e.id=?",
@@ -1476,7 +1403,7 @@ class VideoSegmentDB:
             return None
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT e.*, s.path as seg_path, s.start_ts as seg_start_ts,"
+                "SELECT e.*, s.path as seg_path,"
                 " s.media_epoch as seg_media_epoch, s.end_ts as seg_end_ts"
                 " FROM video_events e JOIN segments s ON s.id=e.segment_id"
                 " WHERE e.id=?",
@@ -1730,7 +1657,6 @@ class VideoSegmentDB:
                 row["provisional"] = True
                 row["seg_path"] = seg["path"]
                 row["spritesheet"] = seg.get("spritesheet")
-                row["seg_start_ts"] = seg["start_ts"]
                 row["seg_media_epoch"] = seg.get("media_epoch")
                 _worldize_event_row(row)
                 events.append(row)

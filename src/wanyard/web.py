@@ -405,7 +405,7 @@ def make_app(
         if not seg_path.is_file():
             return Response(status_code=404)
 
-        t = max(0.0, float(evt["abs_ts"]) - float(evt["seg_start_ts"]))
+        t = max(0.0, float(evt["abs_ts"]) - float(evt["seg_media_epoch"]))
         try:
             boxes = json.loads(evt["boxes_json"]) if evt.get("boxes_json") else []
         except (TypeError, json.JSONDecodeError):
