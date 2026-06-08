@@ -1613,10 +1613,29 @@ function replaceProvisionalEvents(events, srcId = null) {
   mergeEvents(events);
 }
 
+// The server sends each segment's honest recorder-open start_ts plus the world
+// anchor media_epoch. The timeline and player index everything by world time, so
+// here we set start_ts/end_ts to the segment's world coverage
+// [media_epoch, media_epoch + duration]. One value (media_epoch) places the file
+// in the universe; offsets into it are derived, never stored.
+function worldizeSeg(s) {
+  const epoch = Number(s.media_epoch);
+  if (!Number.isFinite(epoch)) return s;        // unanchored (e.g. open live edge)
+  const dur = Number(s.duration_sec);
+  return {
+    ...s,
+    start_ts: epoch,
+    end_ts: Number.isFinite(dur) ? epoch + dur : (s.end_ts ?? null),
+  };
+}
+
 function mergeSegments(segments) {
   if (!segments?.length) return;
   const byId = new Map(st.segments.map(s => [s.id, s]));
-  segments.forEach(s => byId.set(s.id, { ...(byId.get(s.id) || {}), ...s }));
+  segments.forEach(s => {
+    const w = worldizeSeg(s);
+    byId.set(w.id, { ...(byId.get(w.id) || {}), ...w });
+  });
   st.segments = [...byId.values()].sort((a, b) => b.start_ts - a.start_ts);
   player.setSegments(st.segments);
 }
@@ -2267,7 +2286,7 @@ async function load() {
     fetchZonesForSource(),
   ]);
 
-  st.segments = sr.segments || [];
+  st.segments = (sr.segments || []).map(worldizeSeg);
   if (sr.bounds) st.segmentBounds = sr.bounds;
   st.classes  = cr.classes  || {};
   if (zr) {

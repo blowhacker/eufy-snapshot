@@ -987,7 +987,6 @@ def make_app(
             return None
 
         duration = max(0.0, clip_end - clip_start)
-        seg_start = float(seg["start_ts"])
         samples: list[tuple[float, list[tuple[str, float, float, float, float, float]]]] = []
         for det in dets:
             try:
@@ -1085,8 +1084,11 @@ def make_app(
                 continue
             if not seg_path.is_file():
                 continue
-            clip_start = max(start_ts, float(seg["start_ts"]))
-            clip_end = min(end_ts, float(seg["end_ts"]))
+            seg_epoch = float(seg["media_epoch"])
+            seg_dur = (float(seg["duration_sec"]) if seg["duration_sec"] is not None
+                       else float(seg["end_ts"]) - float(seg["start_ts"]))
+            clip_start = max(start_ts, seg_epoch)
+            clip_end = min(end_ts, seg_epoch + seg_dur)
             if clip_end <= clip_start:
                 continue
             out = tmpdir / f"part_{i:03d}.mp4"
@@ -1100,7 +1102,7 @@ def make_app(
                 filter_file.write_text(vf, encoding="utf-8")
             cmd = [
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", f"{max(0.0, clip_start - float(seg['start_ts'])):.3f}",
+                "-ss", f"{max(0.0, clip_start - seg_epoch):.3f}",
                 "-i", str(seg_path),
                 "-t", f"{clip_end - clip_start:.3f}",
                 "-map", "0:v:0?", "-map", "0:a:0?",

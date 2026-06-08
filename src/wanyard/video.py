@@ -319,23 +319,6 @@ def _worldize_event_row(r: dict) -> dict:
     return r
 
 
-def _worldize_segment_row(r: dict) -> dict:
-    """Segment row exposed in universal time.
-
-    `start_ts` remains the field name expected by the UI, but its public value is
-    media_epoch. The original recorder-open value is retained as
-    recording_start_ts for debugging/storage-only paths.
-    """
-    media_start = _seg_media_start(r)
-    r["recording_start_ts"] = r.get("start_ts")
-    if media_start is not None:
-        duration = _seg_duration(r)
-        r["start_ts"] = media_start
-        if r.get("end_ts") is not None and duration is not None:
-            r["end_ts"] = media_start + duration
-    return r
-
-
 class VideoSegmentDB:
     def __init__(self, db_path: Path) -> None:
         self._path = db_path
@@ -1652,7 +1635,7 @@ class VideoSegmentDB:
         sql += f" ORDER BY {epoch} DESC"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [_worldize_segment_row(dict(r)) for r in rows]
+        return [dict(r) for r in rows]
 
     def segments_overlapping(self, source_id: str | None,
                              start_ts: float, end_ts: float) -> list[dict]:
@@ -1673,7 +1656,7 @@ class VideoSegmentDB:
         )
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [_worldize_segment_row(dict(r)) for r in rows]
+        return [dict(r) for r in rows]
 
     def segment_at(self, source_id: str | None, ts: float, *,
                    exact: bool = True) -> dict | None:
@@ -1708,7 +1691,7 @@ class VideoSegmentDB:
                     f" ORDER BY {coverage_end} DESC LIMIT 1",
                     params2,
                 ).fetchone()
-        return _worldize_segment_row(dict(row)) if row else None
+        return dict(row) if row else None
 
     def provisional_events(self, source_id: str | None = None,
                            since: float | None = None,
@@ -1878,7 +1861,7 @@ class VideoSegmentDB:
             ], [time.time() - _PROVISIONAL_GRACE_SECONDS]
             if source_id and source_id != "all":
                 where.append("s.source_id=?"); params.append(source_id)
-            segs = [_worldize_segment_row(dict(r)) for r in conn.execute(
+            segs = [dict(r) for r in conn.execute(
                 "SELECT s.* FROM segments s"
                 f" WHERE {' AND '.join(where)}"
                 " ORDER BY s.start_ts DESC",
