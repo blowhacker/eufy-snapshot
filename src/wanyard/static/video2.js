@@ -6,6 +6,8 @@ class V2Player {
   #segs = [];
   #abort = null;
   #activeSeg = null;
+  #hls = null;
+  #hlsUrl = null;
   #lastSeek = null;
   #rate = 1;
   #intendedTs = null;  // display target while async seek/load is in flight
@@ -59,6 +61,7 @@ class V2Player {
     this.#intendedTs = actualTs;
 
     try {
+      this.#destroyHls();
       if (this.#v.dataset.src !== url) {
         this.#v.src         = url;
         this.#v.dataset.src = url;
@@ -80,6 +83,87 @@ class V2Player {
       }
     } catch {
       if (this.#abort?.signal === signal && this.#intendedTs === actualTs) this.#intendedTs = null;
+      return null;
+    }
+
+    if (signal.aborted) return null;
+    if (this.#intendedTs === actualTs) this.#intendedTs = null;
+    this.#lastSeek = landing;
+    this.#emit("timeupdate");
+    return landing;
+  }
+
+  async seekHls(opts = {}) {
+    this.#abort?.abort();
+    this.#abort = new AbortController();
+    const { signal } = this.#abort;
+
+    const url = String(opts.url || "");
+    const mediaEpoch = Number(opts.mediaEpoch);
+    const startPosition = Math.max(0, Number(opts.startPosition) || 0);
+    const duration = Number.isFinite(Number(opts.duration)) ? Math.max(0, Number(opts.duration)) : Infinity;
+    if (!url || !Number.isFinite(mediaEpoch)) return null;
+
+    const actualTs = mediaEpoch + startPosition;
+    const seg = {
+      id: opts.segmentId ?? `replay:${url}`,
+      source_id: opts.sourceId ?? null,
+      start_ts: mediaEpoch,
+      end_ts: Number.isFinite(duration) ? mediaEpoch + duration : null,
+      path: null,
+      replay_hls: true,
+    };
+    const landing = {
+      requestedTs: Number.isFinite(Number(opts.requestedTs)) ? Number(opts.requestedTs) : actualTs,
+      actualTs,
+      offsetSecs: startPosition,
+      remainingSecs: Number.isFinite(duration) ? Math.max(0, duration - startPosition) : Infinity,
+      reason: "replay-hls",
+      sourceId: seg.source_id,
+      segmentId: seg.id,
+      segment: seg,
+    };
+    this.#intendedTs = actualTs;
+
+    try {
+      this.#destroyHls();
+      const canNative = this.#v.canPlayType("application/vnd.apple.mpegurl");
+      const preferNative = Boolean(canNative && shouldUseNativeHls());
+      const HlsCtor = preferNative ? null : await loadHlsJs().catch(() => null);
+      const canUseHlsJs = Boolean(HlsCtor?.isSupported?.());
+      if (signal.aborted) return null;
+
+      if (canUseHlsJs) {
+        const hls = new HlsCtor({ lowLatencyMode: false, startPosition });
+        this.#hls = hls;
+        this.#hlsUrl = url;
+        this.#v.dataset.src = url;
+        const parsed = this.#waitForHls(hls, HlsCtor, HlsCtor.Events.MANIFEST_PARSED, signal);
+        hls.loadSource(url);
+        hls.attachMedia(this.#v);
+        await parsed;
+      } else if (canNative) {
+        this.#v.src = url;
+        this.#v.dataset.src = url;
+        this.#v.load();
+        await this.#waitFor("loadedmetadata", signal);
+      } else {
+        throw new Error("HLS playback is not supported in this browser");
+      }
+
+      if (signal.aborted) return null;
+      this.#activeSeg = seg;
+      this.#applyRate();
+      if (Math.abs((this.#v.currentTime || 0) - startPosition) > 0.15) {
+        const seeked = this.#waitFor("seeked", signal, 3000).catch(() => {});
+        this.#v.currentTime = startPosition;
+        await seeked;
+      } else {
+        this.#v.currentTime = startPosition;
+      }
+    } catch {
+      if (this.#abort?.signal === signal && this.#intendedTs === actualTs) this.#intendedTs = null;
+      this.#destroyHls();
       return null;
     }
 
@@ -149,6 +233,14 @@ class V2Player {
     this.#v.playbackRate = this.#rate;
   }
 
+  #destroyHls() {
+    if (this.#hls) {
+      this.#hls.destroy();
+      this.#hls = null;
+    }
+    this.#hlsUrl = null;
+  }
+
   // ── Private helpers ───────────────────────────────────
   #segFor(ts, srcId) {
     // Only closed segments (end_ts set) are playable; open files lack moov atom
@@ -172,12 +264,43 @@ class V2Player {
     return pool.reduce((best, s) => !best || dist(s) < dist(best) ? s : best, null);
   }
 
-  #waitFor(event, signal) {
+  #waitFor(event, signal, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
       if (signal.aborted) { reject(new DOMException("aborted")); return; }
-      const onEvent = () => { signal.removeEventListener("abort", onAbort); resolve(); };
-      const onAbort = () => { this.#v.removeEventListener(event, onEvent); reject(new DOMException("aborted")); };
+      let timer = null;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        this.#v.removeEventListener(event, onEvent);
+      };
+      const onEvent = () => { cleanup(); resolve(); };
+      const onAbort = () => { cleanup(); reject(new DOMException("aborted")); };
+      timer = setTimeout(() => { cleanup(); reject(new Error(`${event} timeout`)); }, timeoutMs);
       this.#v.addEventListener(event, onEvent, { once: true });
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  #waitForHls(hls, HlsCtor, event, signal, timeoutMs = 10000) {
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) { reject(new DOMException("aborted")); return; }
+      let timer = null;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        hls.off(event, onEvent);
+        hls.off(HlsCtor.Events.ERROR, onError);
+      };
+      const onEvent = () => { cleanup(); resolve(); };
+      const onAbort = () => { cleanup(); reject(new DOMException("aborted")); };
+      const onError = (_, data) => {
+        if (!data?.fatal) return;
+        cleanup();
+        reject(new Error(data.details || "HLS error"));
+      };
+      timer = setTimeout(() => { cleanup(); reject(new Error(`${event} timeout`)); }, timeoutMs);
+      hls.on(event, onEvent);
+      hls.on(HlsCtor.Events.ERROR, onError);
       signal.addEventListener("abort", onAbort, { once: true });
     });
   }
@@ -985,6 +1108,8 @@ const st = {
     toolbarOpen: false,
     downloading: false,
     previewing: false,
+    previewSeq: 0,
+    previewRestarting: false,
     downloadTimer: null,
     start: null,
     end: null,
@@ -1784,6 +1909,32 @@ async function fetchRecordedSegmentForTimestamp(sourceId, ts) {
   return segment;
 }
 
+async function resolveVideoTimestamp(sourceId, ts, opts = {}) {
+  const srcId = normalizedSourceId(sourceId);
+  if (!srcId || !Number.isFinite(ts)) return null;
+  const p = new URLSearchParams({
+    source: srcId,
+    ts: String(ts),
+    playback: "hls",
+  });
+  if (Number.isFinite(Number(opts.preRoll))) p.set("pre_roll", String(Math.max(0, Number(opts.preRoll))));
+  if (Number.isFinite(Number(opts.window))) p.set("window", String(Math.max(2, Number(opts.window))));
+  const r = await fetch(`/api/video/resolve?${p}`, { cache: "no-store" }).catch(() => null);
+  if (!r?.ok) return null;
+  return await r.json().catch(() => null);
+}
+
+function isReplayHlsResolution(resolved) {
+  return Boolean(
+    resolved &&
+    resolved.provider === "hls" &&
+    resolved.reason === "replay_hls" &&
+    resolved.storage_provider === "mp4" &&
+    resolved.url &&
+    Number.isFinite(Number(resolved.media_epoch))
+  );
+}
+
 async function seekLiveTimestamp(sourceId, lookupTs, desiredTs) {
   const chosen = chooseLiveSource(sourceId);
   if (!chosen) return false;
@@ -1808,6 +1959,46 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (seq !== absoluteSeekSeq) return false;
+
+    let resolved = null;
+    if (srcId) {
+      setStatus("BUFFERING");
+      resolved = await resolveVideoTimestamp(srcId, lookupTs, {
+        preRoll: options.resolvePreRoll,
+        window: options.resolveWindow,
+      });
+    }
+    if (seq !== absoluteSeekSeq) return false;
+
+    if (isReplayHlsResolution(resolved)) {
+      const mediaEpoch = Number(resolved.media_epoch);
+      const duration = Number(resolved.duration);
+      const maxPosition = Number.isFinite(duration) ? Math.max(0, duration - 0.25) : Infinity;
+      const startPosition = Math.max(0, Math.min(maxPosition, desiredTs - mediaEpoch));
+      stopLiveTail(false);
+      mode.stop();
+      el.liveVideo.style.display = "none";
+      el.empty.style.display = "none";
+      el.video.style.display = "block";
+      const landing = await player.seekHls({
+        url: resolved.url,
+        mediaEpoch,
+        duration,
+        startPosition,
+        sourceId: resolved.source_id ?? srcId,
+        segmentId: resolved.segment_id,
+        requestedTs: desiredTs,
+        autoplay,
+      });
+      if (seq !== absoluteSeekSeq) return false;
+      if (landing) {
+        setStatus("REPLAY");
+        if (autoplay) player.play();
+        if (updateHistory) pushState();
+        if (options.scroll) scrollTimelineToTs(scrollTs);
+        return true;
+      }
+    }
 
     let recorded = recordedSegmentForTimestamp(srcId, lookupTs);
     if (!recorded) {
@@ -2125,7 +2316,11 @@ async function load() {
     if (latest) {
       el.empty.style.display = "none";
       el.video.style.display = "block";
-      mode.seekTo(Math.max(latest.start_ts, latest.end_ts - 1), latest.source_id, "backward");
+      seekToTimestamp(latest.source_id, Math.max(latest.start_ts, latest.end_ts - 1), {
+        autoplay: true,
+        retries: 0,
+        updateHistory: false,
+      });
     }
   }
   _loadEnd();
@@ -2346,6 +2541,10 @@ function startClipSelection({ showToolbar = false } = {}) {
 
 function setClipPreviewing(previewing) {
   st.clip.previewing = !!previewing;
+  if (!st.clip.previewing) {
+    st.clip.previewSeq++;
+    st.clip.previewRestarting = false;
+  }
   if (!el.clipPreview) return;
   if (!el.clipPreview.dataset.idleText) {
     el.clipPreview.dataset.idleText = el.clipPreview.textContent || "Preview";
@@ -2419,12 +2618,40 @@ function previewSelectedClip() {
   const end = Math.max(st.clip.start, st.clip.end);
   if (end <= start) return;
   stopLiveTail(false);
-  const handle = mode.playClipRange(start, end, st.clip.sourceId, { loop: true });
-  if (!handle) return;
+  mode.stop();
+  const seq = ++st.clip.previewSeq;
+  st.clip.previewRestarting = false;
   setClipPreviewing(true);
   centerWindowOn(start);
   scrollTimelineToTs(start);
   setStatus("PREVIEW");
+  seekResolvedClipPreview(start, end, st.clip.sourceId, seq);
+}
+
+async function seekResolvedClipPreview(start, end, sourceId, seq = st.clip.previewSeq) {
+  if (!st.clip.previewing || seq !== st.clip.previewSeq) return false;
+  const duration = Math.max(2, end - start);
+  const ok = await seekToTimestamp(sourceId, start, {
+    autoplay: true,
+    retries: 0,
+    updateHistory: false,
+    resolvePreRoll: 0,
+    resolveWindow: duration,
+  });
+  if (!st.clip.previewing || seq !== st.clip.previewSeq) return false;
+  st.clip.previewRestarting = false;
+  setStatus(ok ? "PREVIEW" : "NONE");
+  return ok;
+}
+
+function maybeLoopResolvedClipPreview(ts) {
+  if (!st.clip.previewing || st.clip.previewRestarting) return;
+  if (!st.clip.sourceId || st.clip.start == null || st.clip.end == null || ts == null) return;
+  const start = Math.min(st.clip.start, st.clip.end);
+  const end = Math.max(st.clip.start, st.clip.end);
+  if (ts < end - 0.15) return;
+  st.clip.previewRestarting = true;
+  seekResolvedClipPreview(start, end, st.clip.sourceId, st.clip.previewSeq);
 }
 
 function clipDownloadToken() {
@@ -3139,7 +3366,7 @@ el.rewind.addEventListener("click", () => {
   if (wasLive) stopLiveTail(false);
   if (ts != null) {
     const target = ts - 10;
-    mode.seekTo(target, src, "backward"); pushState();
+    seekToTimestamp(src, target, { scroll: false });
   }
 });
 el.loop.addEventListener("click",   () => {
@@ -3386,7 +3613,13 @@ el.zoneCanvas?.addEventListener("dblclick", e => {
 // ── Player events → UI ────────────────────────────────
 player.on("play",  () => { if (!liveTail.active) setPlayIcon(true); });
 player.on("pause", () => { if (!liveTail.active) setPlayIcon(false); });
-player.on("ended", () => { mode.handleEnded(st.source !== "all" ? st.source : null); });
+player.on("ended", () => {
+  if (st.clip.previewing) {
+    maybeLoopResolvedClipPreview(player.currentTs ?? st.clip.end);
+    return;
+  }
+  mode.handleEnded(st.source !== "all" ? st.source : null);
+});
 
 player.on("timeupdate", () => {
   const ts = player.currentTs;
@@ -3396,6 +3629,7 @@ player.on("timeupdate", () => {
   drawBoxes(ts);
   drawZones();
   scheduleNearestEvents();
+  maybeLoopResolvedClipPreview(ts);
 });
 
 // ── Box overlay ───────────────────────────────────────

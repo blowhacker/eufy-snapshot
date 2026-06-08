@@ -4,10 +4,17 @@
 python3 -c "
 import urllib.request, json, sys, os, time
 from pathlib import Path
+from wanyard.config import load_config
+
+config_path = os.environ.get('WANYARD_CONFIG', '/app/config.yaml')
+try:
+    port = int(os.environ.get('WANYARD_HEALTH_PORT') or load_config(config_path).web.port)
+except Exception:
+    port = 8091
 
 # Basic web check + thread health
 try:
-    r = urllib.request.urlopen('http://localhost:8091/api/settings/status', timeout=5)
+    r = urllib.request.urlopen(f'http://localhost:{port}/api/settings/status', timeout=5)
     d = json.load(r)
 except Exception as e:
     print('status check failed:', e)

@@ -7,7 +7,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +29,14 @@ LOG = logging.getLogger(__name__)
 
 _THUMB_W  = 160
 _IMG_CACHE = "public, max-age=604800, immutable"
-_GZIP_SKIP_PREFIXES = ("/video/live/",)
+_GZIP_SKIP_PREFIXES = ("/video/live/", "/video/replay/")
+_REPLAY_HLS_ROOT = Path(tempfile.gettempdir()) / "wanyard-replay-hls"
+_REPLAY_HLS_TTL_SECONDS = float(os.environ.get("REPLAY_HLS_TTL_SECONDS", "300"))
+_REPLAY_HLS_PRE_ROLL_SECONDS = float(os.environ.get("REPLAY_HLS_PRE_ROLL_SECONDS", "6"))
+_REPLAY_HLS_WINDOW_SECONDS = float(os.environ.get("REPLAY_HLS_WINDOW_SECONDS", "30"))
+_REPLAY_HLS_MAX_WINDOW_SECONDS = float(os.environ.get("REPLAY_HLS_MAX_WINDOW_SECONDS", "600"))
+_REPLAY_HLS_MAX_JOBS = max(1, int(os.environ.get("REPLAY_HLS_MAX_JOBS", "4")))
+_REPLAY_HLS_SEMAPHORE = threading.BoundedSemaphore(_REPLAY_HLS_MAX_JOBS)
 
 
 class _PathAwareGZipMiddleware:
@@ -116,6 +125,133 @@ def _read_live_hls_window(video_dir: Path | None, source_id: str | None) -> dict
         "segment_count": len(segments),
         "playlist_age_seconds": max(0.0, time.time() - stat.st_mtime),
         "segments": segments,
+    }
+
+
+def _cleanup_replay_hls_root(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    try:
+        _REPLAY_HLS_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    cutoff = now - _REPLAY_HLS_TTL_SECONDS
+    for path in _REPLAY_HLS_ROOT.iterdir():
+        try:
+            if not path.is_dir():
+                continue
+            if path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _prepare_replay_hls(
+    video_dir: Path,
+    source_id: str,
+    loc,
+    target_ts: float,
+    *,
+    pre_roll_seconds: float | None = None,
+    window_seconds: float | None = None,
+) -> dict:
+    """Generate a short replay HLS window from an MP4-backed resolver location.
+
+    This is intentionally ephemeral dynamic output. The browser needs a manifest
+    plus segment URLs, so the files live briefly under /tmp and are cleaned by
+    age. The source MP4 remains the archive of record.
+    """
+    if loc.provider != "mp4" or not loc.anchor or loc.media_offset is None:
+        raise ValueError("replay HLS requires an MP4 media location")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not available")
+
+    root = video_dir.resolve()
+    src = (video_dir / loc.anchor.asset_ref).resolve()
+    try:
+        src.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("resolved media path escaped video dir") from exc
+    if not src.is_file():
+        raise FileNotFoundError(src)
+
+    media_offset = max(0.0, float(loc.media_offset))
+    media_duration = (
+        max(0.0, float(loc.anchor.duration))
+        if loc.anchor.duration is not None else None
+    )
+    pre_roll = max(
+        0.0,
+        _REPLAY_HLS_PRE_ROLL_SECONDS
+        if pre_roll_seconds is None else float(pre_roll_seconds),
+    )
+    window = max(
+        2.0,
+        _REPLAY_HLS_WINDOW_SECONDS
+        if window_seconds is None else float(window_seconds),
+    )
+    window = min(window, max(2.0, _REPLAY_HLS_MAX_WINDOW_SECONDS))
+    start_offset = max(0.0, media_offset - pre_roll)
+    if media_duration is not None:
+        remaining = max(0.0, media_duration - start_offset)
+        window = min(window, max(2.0, remaining))
+    start_position = max(0.0, media_offset - start_offset)
+    media_epoch = float(loc.anchor.media_epoch) + start_offset
+
+    _cleanup_replay_hls_root()
+    token = uuid.uuid4().hex
+    out_dir = _REPLAY_HLS_ROOT / token
+    out_dir.mkdir(parents=True, exist_ok=False)
+    playlist = out_dir / "stream.m3u8"
+    segment_pattern = str(out_dir / "seg_%03d.ts")
+
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start_offset:.3f}",
+        "-i", str(src),
+        "-t", f"{window:.3f}",
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-c", "copy",
+        "-start_at_zero",
+        "-avoid_negative_ts", "make_zero",
+        "-f", "hls",
+        "-hls_time", "2",
+        "-hls_list_size", "0",
+        "-hls_flags", "independent_segments",
+        "-hls_segment_filename", segment_pattern,
+        str(playlist),
+    ]
+    start = time.perf_counter()
+    with _REPLAY_HLS_SEMAPHORE:
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, timeout=max(15.0, window * 2),
+                check=False,
+            )
+        except Exception:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            raise
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    segments = sorted(out_dir.glob("seg_*.ts"))
+    if proc.returncode != 0 or not playlist.exists() or not segments:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        err = proc.stderr.decode("utf-8", "replace")[-500:] if proc.stderr else ""
+        raise RuntimeError(err or "ffmpeg replay HLS generation failed")
+
+    return {
+        "token": token,
+        "url": f"/video/replay/{token}/stream.m3u8",
+        "media_epoch": media_epoch,
+        "start_position": start_position,
+        "duration": window,
+        "segment_count": len(segments),
+        "generation_ms": round(elapsed_ms, 1),
+        "expires_in": _REPLAY_HLS_TTL_SECONDS,
+        "target_ts": target_ts,
+        "source_id": source_id,
+        "segment_id": loc.segment_id,
+        "storage_provider": "mp4",
     }
 
 
@@ -451,30 +587,9 @@ def make_app(
             return JSONResponse({"error": "ts required"}, status_code=400)
         source_id = request.query_params.get("source") or None
         exact = request.query_params.get("exact", "").lower() in {"1", "true", "yes"}
-        with video_db._connect() as conn:
-            where = "start_ts <= ? AND end_ts > ? AND end_ts IS NOT NULL"
-            params = [ts, ts]
-            if source_id:
-                where += " AND source_id = ?"
-                params.append(source_id)
-            row = conn.execute(
-                f"SELECT * FROM segments WHERE {where} ORDER BY start_ts DESC LIMIT 1",
-                params
-            ).fetchone()
-            if not row and not exact:
-                # Nearest closed segment before ts
-                where2 = "end_ts IS NOT NULL AND end_ts <= ?"
-                params2 = [ts]
-                if source_id:
-                    where2 += " AND source_id = ?"
-                    params2.append(source_id)
-                row = conn.execute(
-                    f"SELECT * FROM segments WHERE {where2} ORDER BY end_ts DESC LIMIT 1",
-                    params2
-                ).fetchone()
-        from .video import _worldize_segment_row
-        return JSONResponse(
-            {"segment": _worldize_segment_row(dict(row)) if row else None})
+        segment = await asyncio.to_thread(
+            video_db.segment_at, source_id, ts, exact=exact)
+        return JSONResponse({"segment": segment})
 
     async def api_video_resolve(request: Request) -> JSONResponse:
         """World time -> media location. The single world<->media boundary.
@@ -492,6 +607,16 @@ def make_app(
         source_id = request.query_params.get("source") or None
         if not source_id:
             return JSONResponse({"error": "source required"}, status_code=400)
+        playback = (request.query_params.get("playback") or "hls").lower()
+        replay_pre_roll = None
+        replay_window = None
+        try:
+            if request.query_params.get("pre_roll") is not None:
+                replay_pre_roll = float(request.query_params["pre_roll"])
+            if request.query_params.get("window") is not None:
+                replay_window = float(request.query_params["window"])
+        except ValueError:
+            return JSONResponse({"error": "invalid replay window"}, status_code=400)
 
         from wanyard import media_time
 
@@ -500,15 +625,53 @@ def make_app(
                 return media_time.resolve(conn, video_dir, source_id, ts)
 
         loc = await asyncio.to_thread(_resolve)
+        replay = None
+        provider = loc.provider
+        url = loc.url
+        reason = loc.reason
+        media_epoch = loc.anchor.media_epoch if loc.anchor else None
+        duration = loc.anchor.duration if loc.anchor else None
+
+        if loc.provider == "mp4" and playback != "mp4":
+            try:
+                replay = await asyncio.to_thread(
+                    _prepare_replay_hls, video_dir, source_id, loc, ts,
+                    pre_roll_seconds=replay_pre_roll,
+                    window_seconds=replay_window,
+                )
+            except FileNotFoundError:
+                return JSONResponse({"error": "media file not found"}, status_code=404)
+            except RuntimeError as exc:
+                return JSONResponse(
+                    {"error": "could not generate replay HLS", "detail": str(exc)},
+                    status_code=502,
+                )
+            except Exception as exc:
+                LOG.exception("replay HLS generation failed")
+                return JSONResponse(
+                    {"error": "could not generate replay HLS", "detail": str(exc)},
+                    status_code=500,
+                )
+            provider = "hls"
+            url = replay["url"]
+            reason = "replay_hls"
+            media_epoch = replay["media_epoch"]
+            duration = replay["duration"]
+
         return JSONResponse({
-            "provider": loc.provider,
-            "url": loc.url,
+            "provider": provider,
+            "storage_provider": loc.provider,
+            "url": url,
             "media_offset": loc.media_offset,
-            "media_epoch": loc.anchor.media_epoch if loc.anchor else None,
-            "duration": loc.anchor.duration if loc.anchor else None,
+            "media_epoch": media_epoch,
+            "duration": duration,
+            "start_position": replay["start_position"] if replay else None,
+            "replay_hls": replay,
+            "segment_id": loc.segment_id,
+            "source_id": source_id,
             "coverage": ({"start": loc.coverage.start, "end": loc.coverage.end}
                          if loc.coverage else None),
-            "reason": loc.reason,
+            "reason": reason,
         })
 
     def _build_timeline(source_id, zone_id=None):
@@ -1308,6 +1471,28 @@ def make_app(
         return FileResponse(path, media_type=media,
                             headers={"Cache-Control": "no-cache, no-store"})
 
+    async def serve_replay_hls(request: Request) -> Response:
+        token = request.path_params.get("token", "")
+        filename = request.path_params.get("filename", "")
+        if (not token or not filename or ".." in filename
+                or not all(ch in "0123456789abcdef" for ch in token)):
+            return Response(status_code=404)
+        _cleanup_replay_hls_root()
+        path = _REPLAY_HLS_ROOT / token / filename
+        if not path.exists():
+            return Response(status_code=404)
+        is_m3u8 = filename.endswith(".m3u8")
+        media = "application/vnd.apple.mpegurl" if is_m3u8 else "video/mp2t"
+        if is_m3u8:
+            try:
+                content = path.read_bytes()
+            except OSError:
+                return Response(status_code=404)
+            return Response(content=content, media_type=media,
+                            headers={"Cache-Control": "no-cache, no-store"})
+        return FileResponse(path, media_type=media,
+                            headers={"Cache-Control": "no-cache, no-store"})
+
     routes = [
         Route("/",                           lambda r: FileResponse(static_dir / "video2.html", headers={"Cache-Control": "no-cache"})),
         Route("/settings",                  lambda r: FileResponse(static_dir / "settings.html", headers={"Cache-Control": "no-cache"})),
@@ -1337,6 +1522,7 @@ def make_app(
         Route("/api/video/clip",            api_video_clip),
         Route("/video/files/{path:path}",   serve_video_file),
         Route("/video/live/{source_id}/{filename}", serve_live_hls),
+        Route("/video/replay/{token}/{filename}", serve_replay_hls),
         Route("/api/sources",                    api_sources,             methods=["GET", "POST"]),
         Route("/api/sources/{source_id}",        api_delete_source,       methods=["DELETE"]),
         Route("/api/settings/status",            api_settings_status),

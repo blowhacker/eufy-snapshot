@@ -39,6 +39,28 @@ _CLOSE_READY_GRACE_SECONDS = 20.0
 # grace so a detection on that last fragment still resolves to its own file
 # rather than a gap. Far below real reconnect gaps.
 _COVERAGE_TAIL_GRACE_SECONDS = 0.5
+_ANCHOR_PRESTART_GRACE_SECONDS = 2.0
+
+
+def _recorded_media_epoch(row: sqlite3.Row) -> float | None:
+    actual = row["actual_start_ts"]
+    if actual is None:
+        return None
+    start = float(row["start_ts"])
+    epoch = float(actual)
+    if epoch < start - _ANCHOR_PRESTART_GRACE_SECONDS:
+        return start
+    return epoch
+
+
+def _recorded_media_epoch_sql(alias: str | None = None) -> str:
+    p = f"{alias}." if alias else ""
+    grace = f"{_ANCHOR_PRESTART_GRACE_SECONDS:.6f}"
+    return (
+        "(CASE WHEN "
+        f"{p}actual_start_ts >= {p}start_ts - {grace}"
+        f" THEN {p}actual_start_ts ELSE {p}start_ts END)"
+    )
 
 
 @dataclass(frozen=True)
@@ -78,6 +100,7 @@ class MediaLocation:
     coverage: Coverage | None
     anchor: Anchor | None
     reason: str                    # "recorded" | "live" | "gap" | "no_anchor"
+    segment_id: int | None = None  # DB segment id when provider is recorded MP4
 
 
 def _none(reason: str, coverage: Coverage | None = None) -> MediaLocation:
@@ -100,16 +123,20 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
     before the file's true end once anchored at media_epoch, so it must NOT be
     used as the coverage end. Coverage = [media_epoch, media_epoch + duration].
     """
+    epoch = _recorded_media_epoch_sql()
     row = conn.execute(
-        "SELECT id, path, start_ts, end_ts, actual_start_ts FROM segments"
+        f"SELECT id, path, start_ts, end_ts, actual_start_ts, {epoch} AS media_epoch"
+        " FROM segments"
         " WHERE source_id=? AND end_ts IS NOT NULL AND actual_start_ts IS NOT NULL"
-        "   AND actual_start_ts<=?"
-        "   AND actual_start_ts + (end_ts - start_ts) + ? >=?"
-        " ORDER BY actual_start_ts DESC LIMIT 1",
+        f"   AND {epoch}<=?"
+        f"   AND {epoch} + (end_ts - start_ts) + ? >=?"
+        f" ORDER BY {epoch} DESC LIMIT 1",
         (source_id, t, _COVERAGE_TAIL_GRACE_SECONDS, t),
     ).fetchone()
     if row:
-        media_epoch = float(row["actual_start_ts"])
+        media_epoch = _recorded_media_epoch(row)
+        if media_epoch is None:
+            return _none("no_anchor")
         # Include the final-GOP flush tail so a detection on the last fragment
         # both selects (above) and clamps (world_to_media) to its own file.
         duration = (float(row["end_ts"]) - float(row["start_ts"])
@@ -122,6 +149,7 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
             coverage=Coverage(media_epoch, media_epoch + duration),
             anchor=anchor,
             reason="recorded",
+            segment_id=int(row["id"]),
         )
 
     # No anchored coverage. If a closed segment nominally brackets t but has no
@@ -222,21 +250,26 @@ def _resolve_live(video_dir: Path, source_id: str,
 
 def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
                       t: float) -> Coverage | None:
+    epoch = _recorded_media_epoch_sql()
     before = conn.execute(
-        "SELECT actual_start_ts, start_ts, end_ts FROM segments"
-        " WHERE source_id=? AND start_ts<=? ORDER BY start_ts DESC LIMIT 1",
+        f"SELECT actual_start_ts, start_ts, end_ts, {epoch} AS media_epoch"
+        " FROM segments"
+        f" WHERE source_id=? AND actual_start_ts IS NOT NULL AND {epoch}<=?"
+        f" ORDER BY {epoch} DESC LIMIT 1",
         (source_id, t),
     ).fetchone()
     after = conn.execute(
-        "SELECT actual_start_ts, start_ts, end_ts FROM segments"
-        " WHERE source_id=? AND start_ts>? ORDER BY start_ts ASC LIMIT 1",
+        f"SELECT actual_start_ts, start_ts, end_ts, {epoch} AS media_epoch"
+        " FROM segments"
+        f" WHERE source_id=? AND actual_start_ts IS NOT NULL AND {epoch}>?"
+        f" ORDER BY {epoch} ASC LIMIT 1",
         (source_id, t),
     ).fetchone()
 
     def cov(row) -> Coverage | None:
         if not row:
             return None
-        epoch = row["actual_start_ts"]
+        epoch = _recorded_media_epoch(row)
         if epoch is None:
             return None
         end = row["end_ts"]

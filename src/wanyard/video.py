@@ -25,6 +25,7 @@ _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS = (
     _LIVE_HLS_SEGMENT_SECONDS * (_LIVE_HLS_LIST_SIZE + 30)
 )
 _LIVE_HLS_STALE_PLAYLIST_SECONDS = _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS
+_HLS_ANCHOR_PRESTART_GRACE_SECONDS = 2.0
 _SPRITE_FPS          = "1/5"
 _SPRITE_W            = 160
 _SPRITE_COLS         = 10
@@ -260,7 +261,27 @@ def _dominant_class(classes: list[str]) -> str:
 # notifications. Conversion happens once, at these read boundaries.
 
 def _seg_world_epoch(start_ts, actual_start_ts):
-    return actual_start_ts if actual_start_ts is not None else start_ts
+    if actual_start_ts is None:
+        return start_ts
+    try:
+        st = float(start_ts)
+        epoch = float(actual_start_ts)
+    except (TypeError, ValueError):
+        return start_ts
+    if epoch < st - _HLS_ANCHOR_PRESTART_GRACE_SECONDS:
+        return start_ts
+    return actual_start_ts
+
+
+def _segment_media_epoch_sql(alias: str | None = None) -> str:
+    p = f"{alias}." if alias else ""
+    grace = f"{_HLS_ANCHOR_PRESTART_GRACE_SECONDS:.6f}"
+    return (
+        "(CASE WHEN "
+        f"{p}actual_start_ts IS NOT NULL"
+        f" AND {p}actual_start_ts >= {p}start_ts - {grace}"
+        f" THEN {p}actual_start_ts ELSE {p}start_ts END)"
+    )
 
 
 def _worldize_event_row(r: dict) -> dict:
@@ -282,8 +303,8 @@ def _worldize_segment_row(r: dict) -> dict:
     """Segment row → media_epoch basis: start_ts becomes the camera-accurate
     first-frame time and end_ts is re-anchored to keep the recording span, so
     playback offset math (ts - start_ts) gives the true file offset."""
-    epoch = r.get("actual_start_ts")
-    if epoch is not None:
+    if r.get("actual_start_ts") is not None:
+        epoch = _seg_world_epoch(r.get("start_ts"), r.get("actual_start_ts"))
         if r.get("end_ts") is not None and r.get("start_ts") is not None:
             r["end_ts"] = epoch + (r["end_ts"] - r["start_ts"])
         r["start_ts"] = epoch
@@ -1253,13 +1274,14 @@ class VideoSegmentDB:
                 det_id = int(raw_id[2:])
             except ValueError:
                 return None
+            epoch = _segment_media_epoch_sql("s")
             with self._connect() as conn:
                 row = conn.execute(
                     "SELECT vd.boxes_json AS boxes_json, vd.confidence AS confidence,"
                     " s.path AS seg_path,"
-                    " COALESCE(s.actual_start_ts, s.start_ts) AS seg_start_ts,"
+                    f" {epoch} AS seg_start_ts,"
                     " s.end_ts AS seg_end_ts,"
-                    " (COALESCE(s.actual_start_ts, s.start_ts) + vd.ts_offset) AS abs_ts,"
+                    f" ({epoch} + vd.ts_offset) AS abs_ts,"
                     " NULL AS class"
                     " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
                     " WHERE vd.id=?",
@@ -1413,21 +1435,56 @@ class VideoSegmentDB:
 
     def segments_overlapping(self, source_id: str | None,
                              start_ts: float, end_ts: float) -> list[dict]:
+        epoch = _segment_media_epoch_sql()
+        coverage_end = f"({epoch} + (end_ts - start_ts))"
         where, params = [
             "end_ts IS NOT NULL",
-            "end_ts>?",
-            "start_ts<?",
+            f"{coverage_end}>?",
+            f"{epoch}<?",
         ], [start_ts, end_ts]
         if source_id and source_id != "all":
             where.append("source_id=?"); params.append(source_id)
         sql = (
             "SELECT * FROM segments"
             f" WHERE {' AND '.join(where)}"
-            " ORDER BY start_ts"
+            f" ORDER BY {epoch}"
         )
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        return [_worldize_segment_row(dict(r)) for r in rows]
+
+    def segment_at(self, source_id: str | None, ts: float, *,
+                   exact: bool = True) -> dict | None:
+        epoch = _segment_media_epoch_sql()
+        coverage_end = f"({epoch} + (end_ts - start_ts))"
+        where, params = [
+            "end_ts IS NOT NULL",
+            f"{epoch}<=?",
+            f"{coverage_end}>?",
+        ], [ts, ts]
+        if source_id and source_id != "all":
+            where.append("source_id=?"); params.append(source_id)
+        sql = (
+            "SELECT * FROM segments"
+            f" WHERE {' AND '.join(where)}"
+            f" ORDER BY {epoch} DESC LIMIT 1"
+        )
+        with self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+            if not row and not exact:
+                where2, params2 = [
+                    "end_ts IS NOT NULL",
+                    f"{coverage_end}<=?",
+                ], [ts]
+                if source_id and source_id != "all":
+                    where2.append("source_id=?"); params2.append(source_id)
+                row = conn.execute(
+                    "SELECT * FROM segments"
+                    f" WHERE {' AND '.join(where2)}"
+                    f" ORDER BY {coverage_end} DESC LIMIT 1",
+                    params2,
+                ).fetchone()
+        return _worldize_segment_row(dict(row)) if row else None
 
     def provisional_events(self, source_id: str | None = None,
                            since: float | None = None,
@@ -1562,16 +1619,30 @@ class VideoSegmentDB:
             conn.execute("DELETE FROM hls_events WHERE abs_ts<?", (cutoff,))
 
     def observe_frame_time(self, source_id: str, abs_ts: float) -> None:
-        """Update the open segment's actual_start_ts to MIN(existing, abs_ts).
-        Called for each HLS .ts frame seen — earliest abs_ts ≈ MP4 first frame time.
+        """Update the open segment's actual_start_ts from live HLS PDT.
+
+        Ignore playlist chunks that predate the open MP4. At segment rollover
+        the live HLS playlist can still contain old chunks; using one as the
+        MP4 media epoch makes recorded seeks land late after finalization.
         """
         with self._connect() as conn:
             conn.execute(
                 "UPDATE segments"
-                " SET actual_start_ts = MIN(COALESCE(actual_start_ts, ?), ?)"
+                " SET actual_start_ts = CASE"
+                "   WHEN actual_start_ts IS NULL"
+                "     OR actual_start_ts < start_ts - ? THEN ?"
+                "   ELSE MIN(actual_start_ts, ?)"
+                " END"
                 " WHERE source_id=? AND end_ts IS NULL"
-                "   AND start_ts <= ? + 5 AND start_ts >= ? - 30",
-                (abs_ts, abs_ts, source_id, abs_ts, abs_ts),
+                "   AND ? >= start_ts - ?",
+                (
+                    _HLS_ANCHOR_PRESTART_GRACE_SECONDS,
+                    abs_ts,
+                    abs_ts,
+                    source_id,
+                    abs_ts,
+                    _HLS_ANCHOR_PRESTART_GRACE_SECONDS,
+                ),
             )
 
     def live_status(self, source_id: str | None = None, zone_id=None) -> dict:
@@ -1588,11 +1659,12 @@ class VideoSegmentDB:
                 " ORDER BY s.start_ts DESC",
                 params,
             ).fetchall()]
+            epoch = _segment_media_epoch_sql("s")
             latest_rows = conn.execute(
                 "SELECT s.source_id, s.start_ts, s.actual_start_ts, d.*"
                 " FROM segments s JOIN video_detections d ON d.segment_id=s.id"
                 f" WHERE {' AND '.join(where)}"
-                " ORDER BY (COALESCE(s.actual_start_ts, s.start_ts) + d.ts_offset) DESC",
+                f" ORDER BY ({epoch} + d.ts_offset) DESC",
                 params,
             ).fetchall()
 
@@ -2499,10 +2571,11 @@ def _notification_det_events_after(
     """
     source_id = rule["source_id"]
     classes = set(rule.get("classes") or [])
+    epoch = _segment_media_epoch_sql("s")
     rows = conn.execute(
         "SELECT vd.id AS id, s.source_id AS source_id, vd.confidence AS confidence,"
         " vd.boxes_json AS boxes_json,"
-        " (COALESCE(s.actual_start_ts, s.start_ts) + vd.ts_offset) AS abs_ts"
+        f" ({epoch} + vd.ts_offset) AS abs_ts"
         " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
         " WHERE vd.id>? ORDER BY vd.id ASC LIMIT ?",
         (start_id, max(1, int(limit))),
