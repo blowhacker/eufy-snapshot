@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,10 +41,20 @@ class SourceDB:
         with self._connect() as conn:
             conn.execute(_DDL)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
+        # Closing context manager — `with sqlite3.connect()` commits but never closes,
+        # leaking a connection per call. Close it here.
         conn = sqlite3.connect(str(self._path))
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def list(self) -> list[RtspSourceRow]:
         with self._connect() as conn:

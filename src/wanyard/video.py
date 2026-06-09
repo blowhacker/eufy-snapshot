@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import logging
 import math
@@ -333,12 +334,24 @@ class VideoSegmentDB:
             # only anchor and abs_ts the only detection time.
             conn.executescript(_DDL)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
+        # Closing context manager. `with sqlite3.connect(...) as c` only commits the
+        # transaction on exit, it does NOT close the connection — every `with
+        # self._connect()` was leaking a connection (3 fds in WAL) until the process
+        # hit its open-file limit. Close it here.
         conn = sqlite3.connect(str(self._path), timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def open_segment(self, source_id: str, path: str, start_ts: float) -> int:
         with self._connect() as conn:
