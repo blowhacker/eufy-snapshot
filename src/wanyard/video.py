@@ -1717,11 +1717,12 @@ class VideoSegmentDB:
             segs = [dict(r) for r in conn.execute(sql, params).fetchall()]
 
         now = time.time()
-        qualifying_ids = {int(seg["id"]) for seg in segs}
-        with self._provisional_tracklet_cache_lock:
-            for seg_id in list(self._provisional_tracklet_cache):
-                if seg_id not in qualifying_ids:
-                    self._provisional_tracklet_cache.pop(seg_id, None)
+        if not source_id or source_id == "all":
+            qualifying_ids = {int(seg["id"]) for seg in segs}
+            with self._provisional_tracklet_cache_lock:
+                for seg_id in list(self._provisional_tracklet_cache):
+                    if seg_id not in qualifying_ids:
+                        self._provisional_tracklet_cache.pop(seg_id, None)
 
         polygons = self.zone_polygons(source_id, zone_id)
         events: list[dict] = []
@@ -1890,6 +1891,11 @@ class VideoSegmentDB:
                 "SELECT d.*, s.media_epoch AS media_epoch"
                 " FROM video_detections d JOIN segments s ON s.id=d.segment_id"
                 f" WHERE {' AND '.join(where)}"
+                " AND d.id=("
+                "   SELECT d2.id FROM video_detections d2"
+                "   WHERE d2.segment_id=d.segment_id"
+                "   ORDER BY d2.abs_ts DESC, d2.id DESC LIMIT 1"
+                " )"
                 " ORDER BY d.abs_ts DESC",
                 params,
             ).fetchall()
