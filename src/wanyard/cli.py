@@ -28,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_rebuild_events(args)
     if args.command == "derive-episodes":
         return cmd_derive_episodes(args)
+    if args.command == "gen-mediamtx":
+        return cmd_gen_mediamtx(args, config)
     parser.print_help()
     return 2
 
@@ -54,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     derive.add_argument("--until", type=float, default=None, help="Unix timestamp upper bound")
     derive.add_argument("--keep-tracks", action="store_true",
                         help="append to existing object tracking state instead of clearing it first")
+    gen_mediamtx = sub.add_parser("gen-mediamtx", help="generate mediamtx config from configured sources")
+    gen_mediamtx.add_argument("--out", default="/run/mediamtx/mediamtx.yml",
+                               help="output path for mediamtx config (default: /run/mediamtx/mediamtx.yml)")
     return parser
 
 
@@ -120,6 +125,57 @@ def cmd_derive_episodes(args) -> int:
         f" events={stats['events']}"
         f" sources={sources}"
     )
+    return 0
+
+
+def cmd_gen_mediamtx(args, config: AppConfig) -> int:
+    from .capture import resolve_rtsp_url
+
+    source_db = SourceDB(config.db_path) if config.db_path else None
+    if not source_db:
+        print("error: db_path not configured", file=sys.stderr)
+        return 1
+
+    sources = source_db.to_source_configs()
+    enabled_sources = [s for s in sources if s.type == "rtsp" and s.enabled]
+
+    # Build mediamtx config YAML
+    config_lines = []
+    config_lines.append("api: yes")
+    config_lines.append("apiAddress: :9997")
+    config_lines.append("metrics: yes")
+    config_lines.append("metricsAddress: :9998")
+    config_lines.append("")
+    config_lines.append("authInternalUsers:")
+    config_lines.append("  - user: any")
+    config_lines.append("    pass:")
+    config_lines.append("    ips: []")
+    config_lines.append("    permissions:")
+    config_lines.append("      - action: api")
+    config_lines.append("      - action: metrics")
+    config_lines.append("      - action: read")
+    config_lines.append("      - action: publish")
+    config_lines.append("      - action: playback")
+    config_lines.append("")
+    config_lines.append("paths:")
+
+    for source in enabled_sources:
+        rtsp_url = resolve_rtsp_url(source)
+        if rtsp_url is None:
+            logging.warning("skipping source %s: resolve_rtsp_url returned None", source.id)
+            continue
+        config_lines.append(f"  {source.id}:")
+        config_lines.append(f"    source: {rtsp_url}")
+        config_lines.append("    sourceProtocol: tcp")
+        config_lines.append("    sourceOnDemand: yes")
+
+    config_text = "\n".join(config_lines) + "\n"
+
+    # Write to output path
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(config_text, encoding="utf-8")
+    logging.info("wrote mediamtx config to %s", args.out)
     return 0
 
 

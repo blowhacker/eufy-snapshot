@@ -45,5 +45,35 @@ services:
       - ./video:/app/video
       - yolo-run:/run/yolo
 
+  mediamtx-conf:
+    image: wanyard:latest
+    container_name: wanyard-mediamtx-conf
+    restart: "no"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+    command: ["-c", "/app/config.yaml", "gen-mediamtx", "--out", "/run/mediamtx/mediamtx.yml"]
+    environment:
+      - VIDEO_DIR=/app/video
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - mediamtx-conf:/run/mediamtx
+
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.3
+    container_name: wanyard-mediamtx
+    restart: unless-stopped
+    depends_on:
+      mediamtx-conf:
+        condition: service_completed_successfully
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+    command: ["/run/mediamtx/mediamtx.yml"]
+    volumes:
+      - mediamtx-conf:/run/mediamtx:ro
+
 volumes:
   yolo-run:
+  mediamtx-conf:
