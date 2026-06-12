@@ -411,6 +411,41 @@ class VideoSegmentDB:
                 (time.time() if scanned_at is None else float(scanned_at), segment_id),
             )
 
+    def open_live_segment(self, source_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM segments"
+                " WHERE source_id=? AND end_ts IS NULL"
+                " ORDER BY start_ts DESC LIMIT 1",
+                (source_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_live_detections(self, segment_id: int, source_id: str,
+                               detections: list[dict]) -> int:
+        if not detections:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO video_detections"
+                "(segment_id, source_id, abs_ts, has_human,"
+                " confidence, boxes_json, classes_json)"
+                " VALUES(?,?,?,?,?,?,?)",
+                [
+                    (
+                        segment_id,
+                        source_id,
+                        float(d["abs_ts"]),
+                        int(d["has_human"]),
+                        float(d["confidence"]),
+                        json.dumps(d["boxes"]) if d.get("boxes") else None,
+                        json.dumps(d["classes"]) if d.get("classes") else None,
+                    )
+                    for d in detections
+                ],
+            )
+        return len(detections)
+
     def replace_detections(self, segment_id: int, detections: list[dict]) -> None:
         """Store detections in world time. Each carries abs_ts; nothing else times them."""
         with self._connect() as conn:

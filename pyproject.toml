@@ -9,6 +9,7 @@ description = "RTSP/HLS camera capture with YOLO detection and a LAN web viewer.
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "av>=12",
     "starlette>=0.40",
     "hypercorn[asyncio]>=0.16",
     "uvloop>=0.19; sys_platform != 'win32'",

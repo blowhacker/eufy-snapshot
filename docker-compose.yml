@@ -19,7 +19,15 @@ services:
       - VIDEO_DIR=/app/video
       - YOLO_SOCKET=/run/yolo/yolo.sock
       - CLEANUP_DAYS=30
+      - WANYARD_LIVE_DETECTOR=1
+      - WANYARD_RELAY_HOST=mediamtx
+      - WANYARD_LIVE_FPS=2.0
+      - OMP_NUM_THREADS=2
       # - CLEANUP_MAX_GB=200  # uncomment to also cap by total size
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./models:/app/models

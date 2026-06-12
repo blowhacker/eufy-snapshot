@@ -743,6 +743,13 @@ def run(video_db_path: Path, video_dir: Path):
     )
     hls_tag_thread.start()
 
+    live_detector_thread = None
+    if os.environ.get("WANYARD_LIVE_DETECTOR", "") == "1":
+        from .live_detector import start_live_detector
+        live_detector_thread = start_live_detector(
+            model, video_db, stop_event, predict_lock
+        )
+
     cleanup_thread = threading.Thread(
         target=_cleanup_loop,
         args=(video_db, video_dir, stop_event),
@@ -752,6 +759,7 @@ def run(video_db_path: Path, video_dir: Path):
 
     srv = YoloSocketServer(SOCKET_PATH, model, video_db, video_dir, predict_lock)
     srv._backfill_thread = backfill_thread
+    srv._live_detector_thread = live_detector_thread
     srv.socket.settimeout(1.0)
     LOG.info("YOLO server listening on %s", SOCKET_PATH)
 
