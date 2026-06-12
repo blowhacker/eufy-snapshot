@@ -349,6 +349,23 @@ class _SourceWorker:
         )
         if covered:
             self.video_db.mark_scanned(int(closed["id"]))
+            try:
+                from .video import extract_events
+
+                dets = self.video_db.detections_for_segment(int(closed["id"]))
+                n_evt = extract_events(closed, dets, self.video_db)
+                LOG.info(
+                    "live detector %s extracted %d events for claimed segment_id=%s",
+                    self.source_id,
+                    n_evt,
+                    closed["id"],
+                )
+            except Exception:
+                LOG.exception(
+                    "live detector %s failed to derive events for claimed segment_id=%s",
+                    self.source_id,
+                    closed["id"],
+                )
             LOG.info(
                 "live detector %s claimed segment_id=%s media_epoch=%.3f "
                 "anchored_since=%.3f end_ts=%s",
