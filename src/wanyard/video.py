@@ -2271,6 +2271,8 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
             for idx, track in enumerate(tracks):
                 if idx in used:
                     continue
+                if off - float(track["last"]) > _EVENT_GAP_SECONDS:
+                    continue
                 if track["class"] != cls:
                     continue
                 if not _area_compatible(area, track["area"]):
