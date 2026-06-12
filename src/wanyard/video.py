@@ -382,6 +382,25 @@ class VideoSegmentDB:
                 (end_ts, duration, spritesheet, webvtt, segment_id),
             )
 
+    def correct_media_epoch_axis(self, segment_id: int, video_start_time: float) -> None:
+        """Shift media_epoch from first-video-frame time to container-time-zero.
+
+        The anchor's definition is "world time of media offset 0", but it is
+        observed from the first video frame (HLS PDT). The MP4's video stream
+        starts at container time `start_time` (> 0 when audio packets preroll
+        before the first keyframe), so the player's currentTime axis is shifted
+        by that amount — overlay boxes lead the subject by exactly start_time.
+        Called once at segment close with the probed start_time.
+        """
+        if not video_start_time or video_start_time <= 0:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE segments SET media_epoch = media_epoch - ?"
+                " WHERE id=? AND media_epoch IS NOT NULL",
+                (float(video_start_time), segment_id),
+            )
+
     def set_segment_media_start(self, segment_id: int, media_epoch: float) -> None:
         """Attach the world-time anchor for media offset 0 of one segment.
 
@@ -3270,7 +3289,37 @@ class VideoWorker:
         self._seg_id = None
         self._seg_start = 0.0
         if seg_id:
+            if seg_path:
+                start_time = _probe_video_start_time(seg_path)
+                if start_time is None:
+                    LOG.warning("media_epoch axis: start_time probe failed for %s"
+                                " — anchor keeps first-video-frame bias", seg_path)
+                else:
+                    self.db.correct_media_epoch_axis(seg_id, start_time)
             self.db.close_segment(seg_id, ts, None, None)
+
+
+def _probe_video_start_time(path: Path | str) -> float | None:
+    """Container start_time of the video stream (s), or None if unprobeable.
+
+    > 0 when audio packets preroll before the first video keyframe; the
+    player's currentTime axis includes that preroll.
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=start_time",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if out.returncode != 0:
+            return None
+        val = out.stdout.strip()
+        if not val or val == "N/A":
+            return None
+        return float(val)
+    except Exception:
+        return None
 
 
 def _write_webvtt(path: Path, sprite_name: str, w: int, h: int,
