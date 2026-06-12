@@ -30,10 +30,10 @@ import os
 import threading
 import time
 
-import av
-
 
 def consumer_loop(url, idx, duration, out_dir, stop_event):
+    import av
+
     path = os.path.join(out_dir, f"consumer_{idx}.csv")
     start = time.monotonic()
     frame_idx = 0
@@ -86,42 +86,76 @@ def load_csv(path):
     return rows
 
 
+def split_epochs(rows, back_tol=1.0, fwd_mult=5):
+    """Split a consumer log at RTP discontinuities (relay restart / camera
+    reboot / wrap). Small backward steps (< back_tol, e.g. reorder blips) do
+    NOT split — a real session break is hundreds of seconds."""
+    if len(rows) < 3:
+        return [rows]
+    diffs = [b[1] - a[1] for a, b in zip(rows, rows[1:])]
+    median = sorted(diffs)[len(diffs) // 2]
+    segs, start = [], 0
+    for i, d in enumerate(diffs):
+        if d < -back_tol or d > median * fwd_mult:
+            segs.append(rows[start : i + 1])
+            start = i + 1
+    segs.append(rows[start:])
+    return segs
+
+
 def cmd_analyze(args):
     files = sorted(f for f in os.listdir(args.out_dir) if f.startswith("consumer_") and f.endswith(".csv"))
     if not files:
         print("no consumer_*.csv found in", args.out_dir)
         return
     logs = {f: load_csv(os.path.join(args.out_dir, f)) for f in files}
+    epochs = {f: split_epochs(rows) for f, rows in logs.items()}
 
-    # 1. rtp_ts identity across consumers
+    # 1. rtp_ts identity across consumers, per epoch (identity only holds
+    # within an epoch: the pts base is session-relative, so consumers that
+    # reconnect at different instants get different bases)
     if len(logs) >= 2:
         names = list(logs)
-        ts_sets = [set(round(r[1], 3) for r in logs[n]) for n in names]
-        common = set.intersection(*ts_sets)
-        total = max(len(s) for s in ts_sets)
-        print(
-            f"[identity] common rtp_ts across {len(names)} consumers: "
-            f"{len(common)}/{total} ({100 * len(common) / total:.1f}%)"
-        )
+        n_epochs = min(len(epochs[n]) for n in names)
+        for k in range(n_epochs):
+            ts_sets = [set(round(r[1], 3) for r in epochs[n][k]) for n in names]
+            common = set.intersection(*ts_sets)
+            total = max(len(s) for s in ts_sets)
+            print(
+                f"[identity] epoch{k}: common rtp_ts across {len(names)} consumers: "
+                f"{len(common)}/{total} ({100 * len(common) / max(total, 1):.1f}%)"
+            )
 
-    # 2. frozen-delta stability per consumer
-    for name, rows in logs.items():
-        deltas = [wt - rtp for _, rtp, wt in rows]
-        min_d = min(deltas)
-        spread = max(deltas) - min_d
-        print(
-            f"[delta] {name}: n={len(rows)} min_delta={min_d:.4f}s "
-            f"spread(wobble)={spread * 1000:.2f}ms"
-        )
+    # 2. per-epoch delta stability: min-filtered anchor, residual wobble
+    # (one-sided late delivery), and camera-vs-host clock drift (ppm)
+    for name, segs in epochs.items():
+        for k, seg in enumerate(segs):
+            if len(seg) < 100:
+                continue
+            deltas = [wt - rtp for _, rtp, wt in seg]
+            t0 = seg[0][2]
+            xs = [wt - t0 for _, _, wt in seg]
+            n = len(seg)
+            xm, ym = sum(xs) / n, sum(deltas) / n
+            denom = sum((x - xm) ** 2 for x in xs)
+            slope = sum((x - xm) * (y - ym) for x, y in zip(xs, deltas)) / denom if denom else 0.0
+            startup = [d for x, d in zip(xs, deltas) if x <= 30]
+            frozen = min(startup)
+            resid = sorted((d - frozen) * 1000 for d in deltas)
+            print(
+                f"[delta] {name} epoch{k}: n={n} dur={xs[-1]:.0f}s "
+                f"drift={slope * 1e6:+.1f}ppm ({slope * 60_000:+.2f}ms/min) "
+                f"resid vs 30s-min anchor: p99={resid[int(n * 0.99)]:.1f}ms max={resid[-1]:.1f}ms"
+            )
 
-    # 3. PTS discontinuity
+    # 3. PTS discontinuity report
     for name, rows in logs.items():
         if len(rows) < 3:
             continue
         rtps = [r[1] for r in rows]
         diffs = [b - a for a, b in zip(rtps, rtps[1:])]
         median = sorted(diffs)[len(diffs) // 2]
-        jumps = [(i, d) for i, d in enumerate(diffs) if d <= 0 or d > median * 5]
+        jumps = [(i, round(d, 4)) for i, d in enumerate(diffs) if d <= 0 or d > median * 5]
         if jumps:
             print(f"[discontinuity] {name}: {len(jumps)} jump(s), e.g. {jumps[:3]} (median diff={median:.4f}s)")
         else:
