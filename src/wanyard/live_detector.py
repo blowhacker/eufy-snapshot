@@ -18,6 +18,7 @@ _QUEUE_LIMIT = 2000
 _DISC_BACKWARD_SECONDS = -1.0
 _DISC_FORWARD_SECONDS = 5.0
 _PATH_REFRESH_SECONDS = 60.0
+_MAX_LIVE_LAG_SECONDS = 2.0
 
 
 @dataclass
@@ -152,6 +153,7 @@ class _SourceWorker:
         self.pending: deque[_DetectionRow] = deque()
         self.open_segment_id: int | None = None
         self.next_infer_wall = 0.0
+        self.last_stale_log_wall = 0.0
         self.thread = threading.Thread(
             target=self.run,
             daemon=True,
@@ -229,6 +231,16 @@ class _SourceWorker:
 
     def _maybe_infer(self, frame, abs_ts: float, wall: float,
                      anchor: _TimeAnchor) -> None:
+        lag = wall - abs_ts
+        if lag > _MAX_LIVE_LAG_SECONDS:
+            if wall - self.last_stale_log_wall >= 30.0:
+                LOG.info(
+                    "live detector %s dropping stale decoded frames lag=%.3f",
+                    self.source_id,
+                    lag,
+                )
+                self.last_stale_log_wall = wall
+            return
         if wall < self.next_infer_wall:
             return
         self.next_infer_wall = wall + (1.0 / self.fps)
@@ -446,9 +458,19 @@ def _configure_torch_threads() -> None:
     try:
         import torch
         torch.set_num_threads(threads)
+        try:
+            torch.set_num_interop_threads(max(1, threads))
+        except RuntimeError as exc:
+            LOG.info("torch interop threads already set: %s", exc)
         LOG.info("live detector set torch threads=%d", threads)
     except Exception:
         LOG.exception("failed to set torch threads")
+    try:
+        import cv2
+        cv2.setNumThreads(0)
+        LOG.info("live detector disabled OpenCV internal threads")
+    except Exception:
+        LOG.exception("failed to configure OpenCV threads")
 
 
 def start_live_detector(model, video_db, stop_event: threading.Event,

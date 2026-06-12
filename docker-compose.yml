@@ -23,6 +23,9 @@ services:
       - WANYARD_RELAY_HOST=mediamtx
       - WANYARD_LIVE_FPS=2.0
       - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - OPENBLAS_NUM_THREADS=2
+      - NUMEXPR_NUM_THREADS=2
       # - CLEANUP_MAX_GB=200  # uncomment to also cap by total size
     ulimits:
       nofile:
