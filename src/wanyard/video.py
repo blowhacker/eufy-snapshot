@@ -1701,6 +1701,7 @@ class VideoSegmentDB:
             f"{epoch} IS NOT NULL",
             "((s.end_ts IS NULL AND s.start_ts>=?)"
             f" OR (s.end_ts IS NOT NULL AND {coverage_end}>=?"
+            " AND s.scanned_at IS NULL"
             " AND NOT EXISTS (SELECT 1 FROM video_events e WHERE e.segment_id=s.id)))"
         ], [open_cutoff, cutoff]
         if source_id and source_id != "all":
@@ -2248,6 +2249,7 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
     if media_start is None:
         return []
     tracks: list[dict] = []
+    active_indices: list[int] = []
 
     for det in detections:
         off = float(det.get("ts_offset", 0.0))
@@ -2261,6 +2263,10 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
             b for b in (det.get("boxes") or [])
             if isinstance(b, dict) and b.get("cls")
         ]
+        active_indices = [
+            idx for idx in active_indices
+            if off - float(tracks[idx]["last"]) <= _EVENT_GAP_SECONDS
+        ]
         used: set[int] = set()
         for box in sorted(boxes, key=lambda b: float(b.get("conf", 0.0)), reverse=True):
             cls = str(box.get("cls"))
@@ -2268,10 +2274,9 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
             area = _box_area(box)
             best_idx: int | None = None
             best_dist = _OBJECT_TRACK_CENTER_DISTANCE
-            for idx, track in enumerate(tracks):
+            for idx in active_indices:
+                track = tracks[idx]
                 if idx in used:
-                    continue
-                if off - float(track["last"]) > _EVENT_GAP_SECONDS:
                     continue
                 if track["class"] != cls:
                     continue
@@ -2296,7 +2301,9 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
                     "confidence": float(box.get("conf", 0.0)),
                     "box": dict(box),
                 })
-                used.add(len(tracks) - 1)
+                new_idx = len(tracks) - 1
+                active_indices.append(new_idx)
+                used.add(new_idx)
                 continue
 
             track = tracks[best_idx]
