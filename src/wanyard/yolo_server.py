@@ -705,6 +705,10 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def run(video_db_path: Path, video_dir: Path):
+    if os.environ.get("WANYARD_LIVE_DETECTOR", "") == "1":
+        from .live_detector import _configure_torch_threads
+        _configure_torch_threads()
+
     from ultralytics import YOLO
     from .video import VideoSegmentDB
 
