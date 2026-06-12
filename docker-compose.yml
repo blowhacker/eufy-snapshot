@@ -41,6 +41,7 @@ services:
     environment:
       - VIDEO_DIR=/app/video
       - YOLO_SOCKET=/run/yolo/yolo.sock
+      - WANYARD_RELAY_HOST=mediamtx
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

@@ -160,7 +160,7 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
     config_lines.append("paths:")
 
     for source in enabled_sources:
-        rtsp_url = resolve_rtsp_url(source)
+        rtsp_url = resolve_rtsp_url(source, direct=True)
         if rtsp_url is None:
             logging.warning("skipping source %s: resolve_rtsp_url returned None", source.id)
             continue
