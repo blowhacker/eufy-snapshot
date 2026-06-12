@@ -3223,6 +3223,9 @@ class VideoWorker:
 
         if not candidates:
             return
+        LOG.info("ANCHOR-PDT seg=%d src=%s n=%d min=%.3f max=%.3f",
+                 seg_id, self.source.id, len(candidates),
+                 min(candidates), max(candidates))
         try:
             self.db.set_segment_media_start(seg_id, min(candidates))
         except Exception:
@@ -3330,34 +3333,64 @@ class VideoWorker:
         self._seg_start = 0.0
         if seg_id:
             if seg_path:
-                start_time = _probe_video_start_time(seg_path)
-                if start_time is None:
+                times = _probe_container_times(seg_path)
+                if times is None:
                     LOG.warning("media_epoch axis: start_time probe failed for %s"
                                 " — anchor keeps first-video-frame bias", seg_path)
                 else:
-                    self.db.correct_media_epoch_axis(seg_id, start_time)
+                    self.db.correct_media_epoch_axis(seg_id, times["v_start"])
+                    try:
+                        seg = self.db.get_segment(seg_id) or {}
+                        epoch_post = seg.get("media_epoch")
+                        LOG.info(
+                            "ANCHOR-AUDIT seg=%d src=%s start_ts=%.3f"
+                            " epoch_pre=%s epoch_post=%s v_start=%.3f a_start=%s"
+                            " fmt_start=%s v_dur=%s wall_span=%.3f",
+                            seg_id, self.source.id, seg_start,
+                            f"{epoch_post + times['v_start']:.3f}" if epoch_post else "NULL",
+                            f"{epoch_post:.3f}" if epoch_post else "NULL",
+                            times["v_start"], times["a_start"],
+                            times["fmt_start"], times["v_dur"], ts - seg_start,
+                        )
+                    except Exception:
+                        LOG.exception("ANCHOR-AUDIT logging failed")
             self.db.close_segment(seg_id, ts, None, None)
 
 
-def _probe_video_start_time(path: Path | str) -> float | None:
-    """Container start_time of the video stream (s), or None if unprobeable.
+def _probe_container_times(path: Path | str) -> dict | None:
+    """Container timing facts: format/video/audio start_time + video duration.
 
-    > 0 when audio packets preroll before the first video keyframe; the
-    player's currentTime axis includes that preroll.
+    video start_time > 0 when audio packets preroll before the first keyframe;
+    the player's currentTime axis includes that preroll. Logged at segment
+    close (ANCHOR-AUDIT) to pin down which anchor input wobbles per session.
     """
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=start_time",
-             "-of", "default=nw=1:nk=1", str(path)],
+            ["ffprobe", "-v", "error",
+             "-show_entries", "stream=codec_type,start_time,duration",
+             "-show_entries", "format=start_time",
+             "-of", "json", str(path)],
             capture_output=True, text=True, timeout=15,
         )
         if out.returncode != 0:
             return None
-        val = out.stdout.strip()
-        if not val or val == "N/A":
-            return None
-        return float(val)
+        data = json.loads(out.stdout)
+
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        res = {"fmt_start": _f(data.get("format", {}).get("start_time")),
+               "v_start": None, "a_start": None, "v_dur": None}
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "video" and res["v_start"] is None:
+                res["v_start"] = _f(s.get("start_time"))
+                res["v_dur"] = _f(s.get("duration"))
+            elif s.get("codec_type") == "audio" and res["a_start"] is None:
+                res["a_start"] = _f(s.get("start_time"))
+        return res if res["v_start"] is not None else None
     except Exception:
         return None
 
