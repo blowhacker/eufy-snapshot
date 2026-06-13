@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from fractions import Fraction
 from pathlib import Path
 from unittest import mock
 
@@ -19,8 +20,16 @@ from wanyard.video import VideoSegmentDB, _decode_first_frame_marker
 
 
 class _FakeFrame:
-    def __init__(self, frame_bgr: np.ndarray) -> None:
+    def __init__(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        pts: int | None = None,
+        time_base: Fraction | None = None,
+    ) -> None:
         self.frame_bgr = frame_bgr
+        self.pts = pts
+        self.time_base = time_base
 
     def to_ndarray(self, *, format: str):
         if format != "bgr24":
@@ -29,19 +38,27 @@ class _FakeFrame:
 
 
 class _FakePacket:
-    def __init__(self, frames: list[_FakeFrame]) -> None:
-        self._frames = frames
+    def __init__(self, frames: list[np.ndarray] | list[_FakeFrame]) -> None:
+        self._frames = [
+            frame if isinstance(frame, _FakeFrame) else _FakeFrame(frame)
+            for frame in frames
+        ]
 
     def decode(self):
         return list(self._frames)
 
 
 class _FakeContainer:
-    def __init__(self, frames: list[np.ndarray], *, has_video: bool = True) -> None:
+    def __init__(
+        self,
+        frames: list[np.ndarray] | list[_FakeFrame],
+        *,
+        has_video: bool = True,
+    ) -> None:
         self.streams = []
         if has_video:
             self.streams.append(types.SimpleNamespace(type="video"))
-        self._packets = [_FakePacket([_FakeFrame(frame) for frame in frames])]
+        self._packets = [_FakePacket(frames)]
         self.closed = False
 
     def demux(self, _stream):
@@ -87,6 +104,26 @@ class VideoBitcAnchorTests(unittest.TestCase):
             decoded = _decode_first_frame_marker("audio-only.mp4")
 
         self.assertIsNone(decoded)
+        self.assertTrue(container.closed)
+
+    def test_decode_first_frame_marker_uses_early_neighbor_when_frame0_unreadable(self) -> None:
+        unix_seconds = 1_781_600_010.12
+        blank = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
+        marked = blank.copy()
+        bitc.render(marked, bitc.encode_value(unix_seconds + 2.0))
+        frames = [
+            _FakeFrame(blank, pts=100, time_base=Fraction(1, 1000)),
+            _FakeFrame(blank, pts=1100, time_base=Fraction(1, 1000)),
+            _FakeFrame(marked, pts=2100, time_base=Fraction(1, 1000)),
+        ]
+        container = _FakeContainer(frames)
+
+        fake_av = types.SimpleNamespace(open=lambda _path: container)
+        with mock.patch.dict(sys.modules, {"av": fake_av}):
+            decoded = _decode_first_frame_marker("segment.mp4")
+
+        self.assertIsNotNone(decoded)
+        self.assertEqual(round(decoded * 100), bitc.encode_value(unix_seconds))
         self.assertTrue(container.closed)
 
     def test_segment_media_start_is_exact_assignment(self) -> None:

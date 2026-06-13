@@ -46,6 +46,8 @@ _NOTIFICATION_CONFIRMATION_STRATEGY = "yolo1280-crop640-960-v1"
 _NOTIFICATION_CONFIRMATION_RETRY_SECONDS = 30.0
 _NOTIFICATION_CONFIRMATION_TIMEOUT_SECONDS = 8.0
 _PROVISIONAL_TRACKLET_CACHE_TTL_SECONDS = 3.0
+_BITC_ANCHOR_SCAN_SECONDS = 5.0
+_BITC_ANCHOR_SCAN_FRAMES = 150
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS segments (
@@ -3206,7 +3208,7 @@ class VideoWorker:
 
 
 def _decode_first_frame_marker(path: Path | str) -> float | None:
-    """Decode the BITC marker from the first video frame in a media file."""
+    """Decode or estimate the first-frame BITC marker for a media file."""
     try:
         import av
 
@@ -3215,16 +3217,44 @@ def _decode_first_frame_marker(path: Path | str) -> float | None:
             video_stream = next((s for s in container.streams if s.type == "video"), None)
             if video_stream is None:
                 return None
+            first_pts: float | None = None
+            scanned = 0
             for packet in container.demux(video_stream):
                 for frame in packet.decode():
+                    frame_pts = _frame_pts_seconds(frame)
+                    if first_pts is None and frame_pts is not None:
+                        first_pts = frame_pts
                     frame_bgr = frame.to_ndarray(format="bgr24")
                     marker_ts, crc_ok = bitc.decode(frame_bgr)
-                    return marker_ts if crc_ok and marker_ts is not None else None
+                    if crc_ok and marker_ts is not None:
+                        if first_pts is not None and frame_pts is not None:
+                            return marker_ts - (frame_pts - first_pts)
+                        return marker_ts
+                    scanned += 1
+                    if scanned >= _BITC_ANCHOR_SCAN_FRAMES:
+                        return None
+                    if (
+                        first_pts is not None
+                        and frame_pts is not None
+                        and frame_pts - first_pts >= _BITC_ANCHOR_SCAN_SECONDS
+                    ):
+                        return None
             return None
         finally:
             container.close()
     except Exception:
         LOG.debug("failed to decode first-frame BITC marker from %s", path, exc_info=True)
+        return None
+
+
+def _frame_pts_seconds(frame) -> float | None:
+    pts = getattr(frame, "pts", None)
+    time_base = getattr(frame, "time_base", None)
+    if pts is None or time_base is None:
+        return None
+    try:
+        return float(pts * time_base)
+    except (TypeError, ValueError):
         return None
 
 
