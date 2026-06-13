@@ -159,7 +159,7 @@ class _SourceWorker:
         # anchoring (see video.py _align_media_epoch). Ring of two files.
         video_dir = Path(os.environ.get("VIDEO_DIR", "video"))
         self._ft_path = video_dir / "live" / source_id / "frametimes.jsonl"
-        self._ft_buf: list[float] = []
+        self._ft_buf: list[tuple[float, float]] = []
         self.thread = threading.Thread(
             target=self.run,
             daemon=True,
@@ -229,30 +229,32 @@ class _SourceWorker:
                     abs_ts = anchor.observe(rtp, wall)
                     if abs_ts is None:
                         continue
-                    self._dump_frame_time(abs_ts)
+                    self._dump_frame_time(abs_ts, wall)
                     self._maybe_infer(frame, abs_ts, wall, anchor)
             if not self.stopped():
                 raise EOFError("rtsp stream ended")
         finally:
             container.close()
 
-    def _dump_frame_time(self, abs_ts: float) -> None:
-        """Append honest frame world-times to the shared ring file.
+    def _dump_frame_time(self, abs_ts: float, wall: float) -> None:
+        """Append per-frame (honest world time, arrival wall) to the ring file.
 
-        The recorder aligns its MP4 pts sequence against these at segment
-        close to derive media_epoch from the detector clock instead of the
-        recorder's own (wobbly) wallclock/AAC-pts witnesses. Open/append/close
-        per flush — no held fds (gotcha #7 discipline).
+        The recorder aligns its MP4 pts sequence against the WALL column at
+        segment close — relay delivery jitter is common-mode across consumers
+        (B0 re-measured: cross-consumer per-frame delay diff p99 = 0.2 ms), so
+        the jitter pattern pairs frames unambiguously even on perfect-CFR
+        cameras. media_epoch then comes from the ABS column (detector clock).
+        Open/append/close per flush — no held fds (gotcha #7 discipline).
         """
-        self._ft_buf.append(abs_ts)
+        self._ft_buf.append((abs_ts, wall))
         if len(self._ft_buf) < 100:
             return
         buf, self._ft_buf = self._ft_buf, []
         try:
             self._ft_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self._ft_path, "a", encoding="utf-8") as f:
-                f.write("".join(f"{t:.6f}\n" for t in buf))
-            if self._ft_path.stat().st_size > 3_000_000:   # ~2h per generation
+                f.write("".join(f"{a:.6f} {w:.6f}\n" for a, w in buf))
+            if self._ft_path.stat().st_size > 6_000_000:   # ~2h per generation
                 os.replace(self._ft_path, self._ft_path.with_suffix(".jsonl.1"))
         except OSError:
             LOG.exception("live detector %s frametimes dump failed", self.source_id)

@@ -3406,90 +3406,98 @@ def _probe_video_pts(path: Path | str) -> list[float] | None:
         return None
 
 
-def _load_frame_times(live_dir: Path, lo: float, hi: float) -> list[float]:
-    """Detector-published honest frame world-times within [lo, hi]."""
-    times: list[float] = []
+def _load_frame_times(live_dir: Path, lo: float, hi: float) -> list[tuple[float, float]]:
+    """Detector-published (abs world time, arrival wall) pairs within [lo, hi]."""
+    times: list[tuple[float, float]] = []
     for name in ("frametimes.jsonl.1", "frametimes.jsonl"):
         p = live_dir / name
         try:
             with open(p, encoding="utf-8") as f:
                 for line in f:
+                    parts = line.split()
+                    if len(parts) != 2:
+                        continue
                     try:
-                        t = float(line)
+                        a, w = float(parts[0]), float(parts[1])
                     except ValueError:
                         continue
-                    if lo <= t <= hi:
-                        times.append(t)
+                    if lo <= w <= hi:
+                        times.append((a, w))
         except OSError:
             continue
-    times.sort()
+    times.sort(key=lambda t: t[1])
     return times
 
 
-def _align_media_epoch(pts: list[float], det: list[float],
+def _align_media_epoch(pts: list[float], det: list[tuple[float, float]],
                        seg_start: float) -> dict | None:
-    """Anchor media_epoch from the detector clock by sequence alignment.
+    """Anchor media_epoch from the detector clock by jitter-pattern pairing.
 
-    The MP4's video pts and the detector's frame world-times tick with the
-    same camera pacing (identical relay frames). Find the offset E that maps
-    pts onto detector times: coarse grid for the best match count, then the
-    median matched residual as the refined epoch. Per-frame arrival jitter is
-    one-sided and dies in the median; no recorder clock is involved.
+    The MP4's video pts are wallclock arrival times (recorder axis); the
+    detector logs (abs world time, arrival wall) for the same relay frames.
+    Relay delivery jitter is common-mode across consumers (measured:
+    cross-consumer per-frame delay diff p99 = 0.2 ms, jitter sd ~85 ms), so
+    matching the jitter pattern pairs frames unambiguously even on a
+    perfect-CFR camera. The pairing is scored on the WALL column; the epoch
+    is the median of (abs − pts) over paired frames — mapping the player's
+    container axis directly onto detection world time, no recorder clock in
+    the chain.
 
-    Returns {epoch, matched, n_pts, spread_ms} or None if the alignment is
-    not trustworthy (detector down / too few matches).
+    Returns {epoch, matched, n_pts, spread_ms} or None when untrustworthy
+    (detector down, poor overlap, ambiguous pairing).
     """
     if len(pts) < 600 or len(det) < 600:
         return None
 
-    def symbols(seq: list[float]) -> list[int]:
-        # VFR gap pattern: Short (~50 ms) vs Long (~100 ms) inter-frame gaps.
-        return [1 if b - a > 0.075 else 0 for a, b in zip(seq, seq[1:])]
-
-    # Longest contiguous detector run (no reconnect gap) overlapping the file.
-    runs: list[list[float]] = [[det[0]]]
+    # Longest contiguous detector run (no reconnect/re-anchor gap).
+    runs: list[list[tuple[float, float]]] = [[det[0]]]
     for a, b in zip(det, det[1:]):
-        if b - a > 1.5:
+        if b[1] - a[1] > 1.5:
             runs.append([])
         runs[-1].append(b)
     run = max(runs, key=len)
     if len(run) < 600:
         return None
 
-    s_pts = symbols(pts)
-    s_det = symbols(run)
-    # The detector file is loaded with ~10 s slack either side of the segment;
-    # the run's first ~200 frames may predate the file. Start the probe past
-    # that slack so every probe symbol has a counterpart in the file.
+    # Skip the loader's ~10 s slack: probe frames must exist in the file.
     j0 = min(300, max(0, len(run) - 600))
-    probe = s_det[j0:j0 + 2000]
-    probe_len = len(probe)
-    if probe_len < 400:
-        return None
-    # A near-CFR stream has no discriminating pattern — any offset would
-    # "align". Require real symbol diversity before trusting a match.
-    long_frac = sum(probe) / probe_len
-    if not 0.05 <= long_frac <= 0.95:
-        return None
-    # Index prior from the time prior (epoch ≈ seg_start ± a few s).
-    avg_gap = (pts[-1] - pts[0]) / max(1, len(pts) - 1)
-    k0 = int((run[j0] - seg_start - pts[0]) / avg_gap)
-    window = 400   # frames ≈ ±20 s; generous vs the ±3 s real uncertainty
-    best_k, best_score = None, -1
-    for k in range(max(0, k0 - window), min(len(s_pts) - probe_len, k0 + window) + 1):
-        score = sum(1 for x, y in zip(s_pts[k:k + probe_len], probe) if x == y)
-        if score > best_score:
-            best_score, best_k = score, k
-    if best_k is None or best_score < probe_len * 0.62:
+    probe = run[j0:j0 + 2000]
+    if len(probe) < 400:
         return None
 
-    # Paired differences over the full overlap; median kills per-frame jitter.
-    diffs = sorted(d - p for p, d in zip(pts[best_k:], run[j0:]))
+    avg_gap = (pts[-1] - pts[0]) / max(1, len(pts) - 1)
+    k0 = int((probe[0][1] - seg_start - pts[0]) / avg_gap)
+    window = 400   # frames; generous vs the real ± few s prior uncertainty
+
+    def pair_score(k: int) -> tuple[int, float]:
+        # Try pairing probe[j] <-> pts[k+j]; under the right k the wall
+        # residuals are constant to ~ms (common-mode jitter), under a wrong
+        # k they wobble by the jitter sd. Score = frames within 10 ms of the
+        # median residual.
+        n = min(len(probe), len(pts) - k)
+        if n < 400:
+            return 0, 0.0
+        res = sorted(probe[j][1] - pts[k + j] for j in range(n))
+        med = res[len(res) // 2]
+        good = sum(1 for r in res if abs(r - med) <= 0.010)
+        return good, med
+
+    best_k, best_good = None, 0
+    for k in range(max(0, k0 - window), min(len(pts) - 400, k0 + window) + 1):
+        good, _ = pair_score(k)
+        if good > best_good:
+            best_good, best_k = good, k
+    if best_k is None or best_good < min(len(probe), len(pts) - best_k) * 0.7:
+        return None
+
+    # Epoch from the honest abs column over the full aligned overlap.
+    n = min(len(run) - j0, len(pts) - best_k)
+    diffs = sorted(run[j0 + j][0] - pts[best_k + j] for j in range(n))
     epoch = diffs[len(diffs) // 2]
     spread = (diffs[int(len(diffs) * 0.9)] - diffs[int(len(diffs) * 0.1)]) * 1000.0
     if spread > 250.0 or abs(epoch - seg_start) > 8.0:
         return None
-    return {"epoch": epoch, "matched": len(diffs),
+    return {"epoch": epoch, "matched": n,
             "n_pts": len(pts), "spread_ms": spread}
 
 
