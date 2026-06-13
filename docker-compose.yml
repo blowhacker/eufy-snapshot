@@ -88,6 +88,26 @@ services:
     volumes:
       - mediamtx-conf:/run/mediamtx:ro
 
+  stamper:
+    build: .
+    image: wanyard:latest
+    container_name: wanyard-stamper
+    restart: unless-stopped
+    depends_on:
+      mediamtx-conf:
+        condition: service_completed_successfully
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+    command: ["-c", "/app/config.yaml", "stamp"]
+    environment:
+      - VIDEO_DIR=/app/video
+      - WANYARD_RELAY_HOST=mediamtx
+      - WANYARD_STAMP_CRF=18
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+
 volumes:
   yolo-run:
   mediamtx-conf:

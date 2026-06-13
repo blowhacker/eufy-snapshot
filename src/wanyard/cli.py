@@ -30,6 +30,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_derive_episodes(args)
     if args.command == "gen-mediamtx":
         return cmd_gen_mediamtx(args, config)
+    if args.command == "stamp":
+        from . import stamper
+        return stamper.run()
     parser.print_help()
     return 2
 
@@ -59,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen_mediamtx = sub.add_parser("gen-mediamtx", help="generate mediamtx config from configured sources")
     gen_mediamtx.add_argument("--out", default="/run/mediamtx/mediamtx.yml",
                                help="output path for mediamtx config (default: /run/mediamtx/mediamtx.yml)")
+    sub.add_parser("stamp", help="BITC stamper: burn world-time into frames, republish <src>-stamped")
     return parser
 
 
@@ -168,6 +172,9 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
         config_lines.append(f"    source: {rtsp_url}")
         config_lines.append("    sourceProtocol: tcp")
         config_lines.append("    sourceOnDemand: yes")
+        # BITC stamper republishes the marked stream here (no source = accepts
+        # a publisher). Consumers read <id>-stamped post-cutover.
+        config_lines.append(f"  {source.id}-stamped: {{}}")
 
     config_text = "\n".join(config_lines) + "\n"
 
