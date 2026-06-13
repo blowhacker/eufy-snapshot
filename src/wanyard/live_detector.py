@@ -5,22 +5,19 @@ from dataclasses import dataclass
 import json
 import logging
 import os
-from pathlib import Path
 import threading
 import time
 import urllib.request
 
+from . import bitc
+
 LOG = logging.getLogger(__name__)
 
-_ANCHORING_SECONDS = 10.0
-_ROLLING_SECONDS = 90.0
-_SLEW_SECONDS_PER_SECOND = 0.002
 _QUEUE_LIMIT = 2000
-_DISC_BACKWARD_SECONDS = -1.0
-_DISC_FORWARD_SECONDS = 5.0
 _PATH_REFRESH_SECONDS = 60.0
 _MAX_LIVE_LAG_SECONDS = 1.0
 _STAMPED_SUFFIX = "-stamped"
+_MARKER_FAIL_LOG_SECONDS = 30.0
 
 
 @dataclass
@@ -31,112 +28,6 @@ class _DetectionRow:
     boxes: list[dict]
     classes: list[str]
     segment_id: int | None = None
-
-
-class _TimeAnchor:
-    def __init__(self, source_id: str) -> None:
-        self.source_id = source_id
-        self.state = "ANCHORING"
-        self.anchor_start_wall: float | None = None
-        self.anchor_samples: list[tuple[float, float]] = []
-        self.rolling: deque[tuple[float, float]] = deque()
-        self.delta_active: float | None = None
-        self.last_wall: float | None = None
-        self.last_rtp: float | None = None
-        self.anchored_since: float | None = None
-        self.last_slew_log_wall = 0.0
-        LOG.info("live detector %s ANCHORING reason=initial", self.source_id)
-
-    @property
-    def active(self) -> bool:
-        return self.state == "ACTIVE" and self.delta_active is not None
-
-    def _reset(self, reason: str, pts_jump: float | None = None) -> None:
-        LOG.info(
-            "live detector %s ANCHORING reason=%s pts_jump=%s",
-            self.source_id,
-            reason,
-            f"{pts_jump:.3f}" if pts_jump is not None else "n/a",
-        )
-        self.state = "ANCHORING"
-        self.anchor_start_wall = None
-        self.anchor_samples = []
-        self.rolling.clear()
-        self.delta_active = None
-        self.last_wall = None
-        self.anchored_since = None
-
-    def observe(self, rtp: float, wall: float) -> float | None:
-        if self.last_rtp is not None:
-            pts_jump = rtp - self.last_rtp
-            if pts_jump < _DISC_BACKWARD_SECONDS or pts_jump > _DISC_FORWARD_SECONDS:
-                self.last_rtp = rtp
-                self._reset("pts_discontinuity", pts_jump)
-                return self._observe_anchoring(rtp, wall)
-            if pts_jump < 0:
-                LOG.info(
-                    "live detector %s skip small pts reorder pts_jump=%.3f",
-                    self.source_id,
-                    pts_jump,
-                )
-                self.last_rtp = rtp
-                return None
-        self.last_rtp = rtp
-
-        if self.state == "ANCHORING":
-            return self._observe_anchoring(rtp, wall)
-        return self._observe_active(rtp, wall)
-
-    def _observe_anchoring(self, rtp: float, wall: float) -> float | None:
-        if self.anchor_start_wall is None:
-            self.anchor_start_wall = wall
-        delta = wall - rtp
-        self.anchor_samples.append((wall, delta))
-        if wall - self.anchor_start_wall < _ANCHORING_SECONDS:
-            return None
-
-        window_min = min(d for _, d in self.anchor_samples)
-        self.delta_active = window_min
-        self.rolling = deque(self.anchor_samples)
-        self.last_wall = wall
-        self.anchored_since = wall
-        self.state = "ACTIVE"
-        LOG.info(
-            "live detector %s ACTIVE delta=%.6f window_min=%.6f samples=%d",
-            self.source_id,
-            self.delta_active,
-            window_min,
-            len(self.anchor_samples),
-        )
-        return None
-
-    def _observe_active(self, rtp: float, wall: float) -> float | None:
-        if self.delta_active is None:
-            return None
-        delta_sample = wall - rtp
-        self.rolling.append((wall, delta_sample))
-        cutoff = wall - _ROLLING_SECONDS
-        while self.rolling and self.rolling[0][0] < cutoff:
-            self.rolling.popleft()
-
-        window_min = min(d for _, d in self.rolling)
-        elapsed = max(0.0, wall - (self.last_wall or wall))
-        max_slew = _SLEW_SECONDS_PER_SECOND * elapsed
-        requested = window_min - self.delta_active
-        slew = max(-max_slew, min(max_slew, requested))
-        self.delta_active += slew
-        self.last_wall = wall
-
-        if abs(slew) > 0 and wall - self.last_slew_log_wall >= 30.0:
-            LOG.info(
-                "live detector %s slew delta=%.6f window_min=%.6f slew=%.6f",
-                self.source_id,
-                self.delta_active,
-                window_min,
-                slew,
-            )
-            self.last_slew_log_wall = wall
-        return rtp + self.delta_active
 
 
 class _SourceWorker:
@@ -157,11 +48,8 @@ class _SourceWorker:
         self.open_segment_id: int | None = None
         self.next_infer_wall = 0.0
         self.last_stale_log_wall = 0.0
-        # Honest per-frame world times, shared with the recorder for segment
-        # anchoring (see video.py _align_media_epoch). Ring of two files.
-        video_dir = Path(os.environ.get("VIDEO_DIR", "video"))
-        self._ft_path = video_dir / "live" / source_id / "frametimes.jsonl"
-        self._ft_buf: list[tuple[float, float]] = []
+        self.last_marker_fail_log_wall = 0.0
+        self.marker_active_since: float | None = None
         self.thread = threading.Thread(
             target=self.run,
             daemon=True,
@@ -180,9 +68,9 @@ class _SourceWorker:
     def run(self) -> None:
         backoff = 1.0
         while not self.stopped():
-            anchor = _TimeAnchor(self.source_id)
             try:
-                self._stream(anchor)
+                self.marker_active_since = None
+                self._stream()
                 backoff = 1.0
             except Exception as exc:
                 LOG.warning(
@@ -200,7 +88,7 @@ class _SourceWorker:
         while not self.stopped() and time.time() < deadline:
             time.sleep(min(0.25, deadline - time.time()))
 
-    def _stream(self, anchor: _TimeAnchor) -> None:
+    def _stream(self) -> None:
         import av
 
         url = f"rtsp://{self.relay_host}:8554/{self.relay_path}"
@@ -225,14 +113,11 @@ class _SourceWorker:
                 self.source_id,
                 stream.time_base,
             )
-            # Reader/worker split: this thread only demuxes, timestamps,
-            # decodes and parks the freshest frame — it must NEVER block on
-            # inference, or packets queue in the socket and the recorded
-            # arrival walls become a burst pattern of the drain instead of
-            # delivery (which breaks the recorder's jitter-pattern anchor
-            # alignment AND batches stale frames into YOLO).
+            # Reader/worker split: this thread only demuxes, decodes and parks
+            # the freshest frame. BITC decode and YOLO stay in the worker so
+            # frames that miss the FPS gate avoid a native-frame ndarray copy.
             latest_lock = threading.Lock()
-            latest: list = [None]   # [(frame, abs_ts, wall)] slot
+            latest: list = [None]   # [(frame, wall)] slot
             reader_alive = threading.Event()
             reader_alive.set()
 
@@ -243,9 +128,9 @@ class _SourceWorker:
                     if item is None:
                         time.sleep(0.02)
                         continue
-                    frame, f_abs, f_wall = item
+                    frame, f_wall = item
                     try:
-                        self._maybe_infer(frame, f_abs, f_wall, anchor)
+                        self._maybe_infer(frame, f_wall)
                     except Exception:
                         LOG.exception("live detector %s inference error",
                                       self.source_id)
@@ -258,17 +143,10 @@ class _SourceWorker:
                 for packet in container.demux(stream):
                     if self.stopped():
                         break
-                    if packet.pts is None:
-                        continue
-                    wall = time.time()
-                    rtp = float(packet.pts * stream.time_base)
                     for frame in packet.decode():
-                        abs_ts = anchor.observe(rtp, wall)
-                        if abs_ts is None:
-                            continue
-                        self._dump_frame_time(abs_ts, wall)
+                        wall = time.time()
                         with latest_lock:
-                            latest[0] = (frame, abs_ts, wall)
+                            latest[0] = (frame, wall)
                 if not self.stopped():
                     raise EOFError("rtsp stream ended")
             finally:
@@ -277,31 +155,27 @@ class _SourceWorker:
         finally:
             container.close()
 
-    def _dump_frame_time(self, abs_ts: float, wall: float) -> None:
-        """Append per-frame (honest world time, arrival wall) to the ring file.
-
-        The recorder aligns its MP4 pts sequence against the WALL column at
-        segment close — relay delivery jitter is common-mode across consumers
-        (B0 re-measured: cross-consumer per-frame delay diff p99 = 0.2 ms), so
-        the jitter pattern pairs frames unambiguously even on perfect-CFR
-        cameras. media_epoch then comes from the ABS column (detector clock).
-        Open/append/close per flush — no held fds (gotcha #7 discipline).
-        """
-        self._ft_buf.append((abs_ts, wall))
-        if len(self._ft_buf) < 100:
+    def _maybe_infer(self, frame, wall: float) -> None:
+        if wall < self.next_infer_wall:
             return
-        buf, self._ft_buf = self._ft_buf, []
-        try:
-            self._ft_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._ft_path, "a", encoding="utf-8") as f:
-                f.write("".join(f"{a:.6f} {w:.6f}\n" for a, w in buf))
-            if self._ft_path.stat().st_size > 6_000_000:   # ~2h per generation
-                os.replace(self._ft_path, self._ft_path.with_suffix(".jsonl.1"))
-        except OSError:
-            LOG.exception("live detector %s frametimes dump failed", self.source_id)
+        self.next_infer_wall = wall + (1.0 / self.fps)
 
-    def _maybe_infer(self, frame, abs_ts: float, wall: float,
-                     anchor: _TimeAnchor) -> None:
+        from .video import _CCTV_CLASS_IDS, _CONF_THRESHOLD, _parse_results
+
+        frame_bgr = frame.to_ndarray(format="bgr24")
+        abs_ts, crc_ok = bitc.decode(frame_bgr)
+        if not crc_ok or abs_ts is None:
+            if wall - self.last_marker_fail_log_wall >= _MARKER_FAIL_LOG_SECONDS:
+                LOG.info("live detector %s skip frame unreadable BITC marker",
+                         self.source_id)
+                self.last_marker_fail_log_wall = wall
+            return
+
+        if self.marker_active_since is None:
+            self.marker_active_since = abs_ts
+            LOG.info("live detector %s MARKER_ACTIVE marker_since=%.3f",
+                     self.source_id, abs_ts)
+
         lag = wall - abs_ts
         if lag > _MAX_LIVE_LAG_SECONDS:
             if wall - self.last_stale_log_wall >= 30.0:
@@ -312,13 +186,8 @@ class _SourceWorker:
                 )
                 self.last_stale_log_wall = wall
             return
-        if wall < self.next_infer_wall:
-            return
-        self.next_infer_wall = wall + (1.0 / self.fps)
 
-        from .video import _CCTV_CLASS_IDS, _CONF_THRESHOLD, _parse_results
-
-        frame_bgr = frame.to_ndarray(format="bgr24")
+        bitc.mask(frame_bgr)
         with self.predict_lock:
             results = self.model.predict(
                 frame_bgr,
@@ -331,12 +200,11 @@ class _SourceWorker:
         classes = list({b["cls"] for b in boxes}) if boxes else []
         self._store_or_queue(
             _DetectionRow(abs_ts, has_human, confidence, boxes, classes),
-            anchor,
         )
 
-    def _store_or_queue(self, row: _DetectionRow, anchor: _TimeAnchor) -> None:
+    def _store_or_queue(self, row: _DetectionRow) -> None:
         segment = self.video_db.open_live_segment(self.source_id)
-        self._handle_rotation(segment, anchor)
+        self._handle_rotation(segment)
         if not segment or segment.get("media_epoch") is None:
             row.segment_id = int(segment["id"]) if segment else None
             self._queue(row)
@@ -394,7 +262,7 @@ class _SourceWorker:
                 dropped,
             )
 
-    def _handle_rotation(self, segment: dict | None, anchor: _TimeAnchor) -> None:
+    def _handle_rotation(self, segment: dict | None) -> None:
         new_id = int(segment["id"]) if segment else None
         if self.open_segment_id is None:
             self.open_segment_id = new_id
@@ -409,14 +277,13 @@ class _SourceWorker:
             return
 
         media_epoch = closed.get("media_epoch")
-        anchored_since = anchor.anchored_since
+        marker_since = self.marker_active_since
         covered = (
             self.claim
-            and anchor.active
             and media_epoch is not None
             and closed.get("end_ts") is not None
-            and anchored_since is not None
-            and anchored_since <= float(media_epoch)
+            and marker_since is not None
+            and marker_since <= float(media_epoch)
         )
         if covered:
             self.video_db.mark_scanned(int(closed["id"]))
@@ -439,22 +306,22 @@ class _SourceWorker:
                 )
             LOG.info(
                 "live detector %s claimed segment_id=%s media_epoch=%.3f "
-                "anchored_since=%.3f end_ts=%s",
+                "marker_since=%.3f end_ts=%s",
                 self.source_id,
                 closed["id"],
                 float(media_epoch),
-                anchored_since,
+                marker_since,
                 closed.get("end_ts"),
             )
         else:
             LOG.info(
-                "live detector %s left segment_id=%s unclaimed active=%s "
-                "media_epoch=%s anchored_since=%s",
+                "live detector %s left segment_id=%s unclaimed marker_active=%s "
+                "media_epoch=%s marker_since=%s",
                 self.source_id,
                 closed["id"],
-                anchor.active,
+                marker_since is not None,
                 media_epoch,
-                anchored_since,
+                marker_since,
             )
 
 
