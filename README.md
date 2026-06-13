@@ -2,7 +2,8 @@
 
 Website: https://wanyard.com
 
-RTSP/HLS camera capture with YOLO object detection and a LAN web viewer.
+RTSP camera capture with BITC-stamped video, YOLO object detection, live HLS,
+and a LAN web viewer.
 
 ## Quick start
 
@@ -23,24 +24,28 @@ docker compose up --build -d
 
 ## What it does
 
-- Records RTSP camera streams as continuous MP4 segments
-- Serves live HLS streams for browser playback
-- Runs YOLO inference (real-time on HLS segments, backfill on MP4) with per-class thumbnail crops
+- Burns BITC Unix time into each frame before recording and detection
+- Records stamped camera streams as continuous MP4 segments
+- Serves rolling live HLS streams for browser playback
+- Runs live YOLO detection plus MP4 backfill, with detections keyed by BITC time
 - Web UI: live view, timeline filmstrip, event feed with class filtering, clip export
 - Auto-cleanup of old footage by age or disk usage
 
 ## Architecture
 
-Two containers via `docker-compose.yml`:
+Main services in `docker-compose.yml`:
 
-- **wanyard** — web server + RTSP recording
-- **wanyard-yolo** — YOLO inference, backfill loop, HLS real-time tagging
+- **app** (`wanyard`) — web server, APIs, recording, HLS/MP4 serving
+- **mediamtx** — RTSP relay
+- **stamper** — burns BITC into frames and republishes stamped streams
+- **yolo** (`wanyard-yolo`) — live detector, thumbnail crops, MP4 backfill
 
 ## Commands
 
 ```bash
-wanyard serve        # web server + RTSP recording
-wanyard yolo-serve   # YOLO inference + backfill (separate process/container)
+wanyard serve        # web server, APIs, recording
+wanyard stamp        # BITC stamper
+wanyard yolo-serve   # YOLO live detection + MP4 backfill
 ```
 
 ## Web UI
