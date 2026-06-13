@@ -3148,7 +3148,12 @@ class VideoWorker:
         try:
             self._proc = subprocess.Popen(
                 [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
-                 "-use_wallclock_as_timestamps", "1",
+                 # Preserve the stamper's rtp-based pts as the MP4/HLS container
+                 # timeline. -use_wallclock_as_timestamps would overwrite it with
+                 # bursty recorder arrival time, compressing the early frames so
+                 # the player's currentTime no longer maps to the burned marker
+                 # (the box-lead bug). The stamper already supplies clean
+                 # monotonic pts that track the markers.
                  "-rtsp_transport", self.source.rtsp_transport,
                  "-i", url,
                  # Archive: MP4 with faststart
