@@ -15,7 +15,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from wanyard import bitc
+from wanyard import bitc, media_time
 from wanyard.video import (
     VideoSegmentDB,
     _BITC_ZERO_FIRST_FRAME,
@@ -206,6 +206,98 @@ class VideoBitcAnchorTests(unittest.TestCase):
         self.assertIsNotNone(decoded)
         self.assertEqual(round(decoded * 100), bitc.encode_value(unix_seconds))
         self.assertTrue(container.closed)
+
+    def test_live_hls_window_uses_decoded_bitc_not_pdt(self) -> None:
+        marker_ts = 1_781_700_010.12
+        blank = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
+        marked = blank.copy()
+        bitc.render(marked, bitc.encode_value(marker_ts))
+        container = _FakeContainer([
+            _FakeFrame(blank, pts=100, time_base=Fraction(1, 1000)),
+            _FakeFrame(marked, pts=600, time_base=Fraction(1, 1000)),
+        ])
+        opened: list[str] = []
+
+        def fake_open(path: str):
+            opened.append(Path(path).name)
+            return container
+
+        with tempfile.TemporaryDirectory(prefix="wanyard-live-window-") as tmp:
+            live_dir = Path(tmp) / "live" / "front"
+            live_dir.mkdir(parents=True)
+            (live_dir / "seg_a.ts").write_bytes(b"a")
+            (live_dir / "seg_b.ts").write_bytes(b"b")
+            (live_dir / "live.m3u8").write_text(
+                "#EXTM3U\n"
+                "#EXT-X-TARGETDURATION:4\n"
+                "#EXT-X-PROGRAM-DATE-TIME:2020-01-01T00:00:00Z\n"
+                "#EXTINF:4.0,\n"
+                "seg_a.ts\n"
+                "#EXT-X-PROGRAM-DATE-TIME:2020-01-01T00:00:04Z\n"
+                "#EXTINF:4.0,\n"
+                "seg_b.ts\n",
+                encoding="utf-8",
+            )
+
+            fake_av = types.SimpleNamespace(open=fake_open)
+            with mock.patch.dict(sys.modules, {"av": fake_av}):
+                window = media_time.live_window(Path(tmp), "front")
+
+        assert window is not None
+        self.assertEqual(opened, ["seg_b.ts"])
+        self.assertAlmostEqual(window["segments"][1]["start_ts"], marker_ts - 0.5, places=2)
+        self.assertAlmostEqual(window["start_ts"], marker_ts - 4.5, places=2)
+        self.assertGreater(abs(window["start_ts"] - 1_577_836_800.0), 1_000_000.0)
+        self.assertTrue(container.closed)
+
+    def test_hls_frame_read_matches_nearest_decoded_bitc(self) -> None:
+        target = 1_781_700_100.0
+        early = np.full((64, bitc.WIDTH + 16, 3), 50, dtype=np.uint8)
+        close = np.full((64, bitc.WIDTH + 16, 3), 150, dtype=np.uint8)
+        late = np.full((64, bitc.WIDTH + 16, 3), 250, dtype=np.uint8)
+        bitc.render(early, bitc.encode_value(target - 0.4))
+        bitc.render(close, bitc.encode_value(target + 0.03))
+        bitc.render(late, bitc.encode_value(target + 1.0))
+        capture = _FakeCapture([early, close, late], [0.0, 0.1, 0.2], 10.0)
+        fake_cv2 = types.SimpleNamespace(VideoCapture=lambda _path: capture)
+
+        with mock.patch.dict(sys.modules, {"cv2": fake_cv2}):
+            frame = media_time._decode_ts_frame_at_bitc(
+                Path("seg.ts"), target, max_drift=0.2)
+
+        self.assertIsNotNone(frame)
+        self.assertEqual(int(frame[0, 0, 0]), 150)
+        self.assertTrue(capture.released)
+
+    def test_live_status_returns_requested_detection_window(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wanyard-live-status-") as tmp:
+            db = VideoSegmentDB(Path(tmp) / "video.sqlite")
+            base = 1_781_700_000.0
+            segment_id = db.open_segment("front", "front/live.mp4", base)
+            db.set_segment_media_start(segment_id, base)
+            db.insert_live_detections(segment_id, "front", [
+                {
+                    "abs_ts": base + 10.0,
+                    "has_human": True,
+                    "confidence": 0.8,
+                    "boxes": [{"cls": "person", "x1": 0.1, "y1": 0.1, "x2": 0.2, "y2": 0.2}],
+                    "classes": ["person"],
+                },
+                {
+                    "abs_ts": base + 20.0,
+                    "has_human": True,
+                    "confidence": 0.9,
+                    "boxes": [{"cls": "person", "x1": 0.3, "y1": 0.3, "x2": 0.4, "y2": 0.4}],
+                    "classes": ["person"],
+                },
+            ])
+
+            status = db.live_status("front", det_since=base + 19.0, det_until=base + 21.0)
+
+        self.assertEqual(
+            [d["abs_ts"] for d in status["recent_detections"]],
+            [base + 20.0],
+        )
 
     def test_segment_media_start_is_exact_assignment(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wanyard-video-db-") as tmp:

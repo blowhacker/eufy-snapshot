@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -11,7 +12,6 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -47,78 +47,24 @@ class _PathAwareGZipMiddleware:
         await self.gzip_app(scope, receive, send)
 
 
-def _parse_hls_program_date_time(raw: str) -> float | None:
-    value = raw.strip()
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    if len(value) >= 5 and value[-5] in "+-" and value[-3] != ":":
-        value = value[:-2] + ":" + value[-2:]
-    try:
-        return datetime.fromisoformat(value).timestamp()
-    except ValueError:
-        return None
-
-
 def _read_live_hls_window(video_dir: Path | None, source_id: str | None) -> dict | None:
     if not video_dir or not source_id or ".." in source_id:
         return None
-    playlist = video_dir / "live" / source_id / "live.m3u8"
+    from wanyard import media_time
+    return media_time.live_window(video_dir, source_id)
+
+
+def _optional_float_query(request: Request, name: str) -> float | None:
+    raw = request.query_params.get(name)
+    if raw in (None, ""):
+        return None
     try:
-        stat = playlist.stat()
-        lines = playlist.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return None
-
-    target_duration = 0.0
-    next_start: float | None = None
-    next_duration: float | None = None
-    inferred_start: float | None = None
-    segments: list[dict] = []
-
-    for raw in lines:
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("#EXT-X-TARGETDURATION:"):
-            try:
-                target_duration = float(line.split(":", 1)[1])
-            except (IndexError, ValueError):
-                target_duration = 0.0
-        elif line.startswith("#EXTINF:"):
-            try:
-                next_duration = float(line.split(":", 1)[1].split(",", 1)[0])
-            except (IndexError, ValueError):
-                next_duration = None
-        elif line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
-            next_start = _parse_hls_program_date_time(line.split(":", 1)[1])
-        elif not line.startswith("#"):
-            duration = next_duration if next_duration is not None else target_duration
-            start = next_start if next_start is not None else inferred_start
-            if start is not None and duration > 0:
-                end = start + duration
-                segments.append({
-                    "uri": Path(line.split("?", 1)[0]).name,
-                    "start_ts": start,
-                    "end_ts": end,
-                    "duration": duration,
-                })
-                inferred_start = end
-            next_start = None
-            next_duration = None
-
-    if not segments:
-        return None
-    start_ts = segments[0]["start_ts"]
-    end_ts = max(s["end_ts"] for s in segments)
-    return {
-        "source_id": source_id,
-        "start_ts": start_ts,
-        "end_ts": end_ts,
-        "duration": max(0.0, end_ts - start_ts),
-        "segment_count": len(segments),
-        "playlist_age_seconds": max(0.0, time.time() - stat.st_mtime),
-        "segments": segments,
-    }
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return value
 
 
 # Overlay association — kept in lockstep with the browser overlay
@@ -353,7 +299,7 @@ def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
     frame is found."""
     import cv2
 
-    from . import bitc
+    from . import bitc, media_time
     from .yolo_server import _crop_thumb
 
     live_dir = (video_dir / "live" / source_id).resolve()
@@ -364,17 +310,21 @@ def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
     if not live_dir.is_dir():
         return None
 
-    # Fragment filenames (seg_<n>.ts) are NOT reliable wall-clock timestamps —
-    # the BITC marker inside each ~2-3s fragment is the source of truth, and
-    # a fragment's mtime (written when the fragment closes) is roughly its
-    # *end* time. So pick fragments whose mtime is within a window around
-    # `ts` (the event could be anywhere in the fragment, up to ~3s before
-    # the mtime), newest first.
-    all_frags = sorted(live_dir.glob("seg_*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
-    candidates = [
-        p for p in all_frags
-        if ts - 1.0 <= p.stat().st_mtime <= ts + 8.0
-    ]
+    window = media_time.live_window(video_dir, source_id)
+    candidates: list[Path] = []
+    if window:
+        for segment in window.get("segments", []):
+            if segment["start_ts"] - 0.5 <= ts <= segment["end_ts"] + 0.5:
+                candidates.append(live_dir / segment["uri"])
+    if not candidates:
+        # Fallback for pre-BITC or temporarily undecodable playlists. Fragment
+        # mtimes are only an operational hint; every returned frame is still
+        # verified against the burned marker below.
+        all_frags = sorted(live_dir.glob("seg_*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
+        candidates = [
+            p for p in all_frags
+            if ts - 1.0 <= p.stat().st_mtime <= ts + 8.0
+        ]
     if not candidates:
         return None
 
@@ -1122,7 +1072,18 @@ def make_app(
             return JSONResponse({"segments": [], "events": [], "detections": []})
         source_id = request.query_params.get("source") or None
         zone_id = request.query_params.get("zone") or None
-        status = await asyncio.to_thread(video_db.live_status, source_id, zone_id)
+        try:
+            det_since = _optional_float_query(request, "det_since")
+            det_until = _optional_float_query(request, "det_until")
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if det_since is not None and det_until is not None:
+            if det_until < det_since:
+                det_since, det_until = det_until, det_since
+            if det_until - det_since > 120:
+                return JSONResponse({"error": "detection window too large"}, status_code=400)
+        status = await asyncio.to_thread(
+            video_db.live_status, source_id, zone_id, det_since, det_until)
         return JSONResponse(status)
 
     async def api_video_live_window(request: Request) -> JSONResponse:

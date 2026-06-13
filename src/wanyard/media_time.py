@@ -15,15 +15,16 @@ this resolver/player boundary.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 EPS = 0.05  # round-trip identity tolerance, seconds
 
-# Live HLS PDT can lead/lag BITC slightly at chunk edges.
+# Live HLS fragment boundaries can land slightly away from decoded BITC frames.
 _LIVE_EDGE_SLOP_SECONDS = 2.0
+_LIVE_PROBE_CACHE_MAX = 128
 
 # Mirrors VideoWorker._MAX_SEGMENT_SECONDS — used only to estimate when an open
 # segment will close (i.e. when its authoritative MP4 frame becomes readable).
@@ -36,6 +37,16 @@ _CLOSE_READY_GRACE_SECONDS = 20.0
 # grace so a detection on that last fragment still resolves to its own file
 # rather than a gap. Far below real reconnect gaps.
 _COVERAGE_TAIL_GRACE_SECONDS = 0.5
+
+
+@dataclass(frozen=True)
+class _LiveBitcProbe:
+    bitc_ts: float
+    media_offset: float
+
+
+_LIVE_PROBE_CACHE: dict[tuple[str, int, int], _LiveBitcProbe | None] = {}
+_LIVE_PROBE_LOCK = threading.Lock()
 
 
 def _recorded_media_epoch(row: sqlite3.Row) -> float | None:
@@ -162,31 +173,34 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
 
 # ── live HLS ────────────────────────────────────────────────────────────────
 
-def _parse_pdt(raw: str) -> float | None:
-    value = raw.strip()
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    if len(value) >= 5 and value[-5] in "+-" and value[-3] != ":":
-        value = value[:-2] + ":" + value[-2:]
-    try:
-        return datetime.fromisoformat(value).timestamp()
-    except ValueError:
-        return None
+def _safe_live_source_id(source_id: str | None) -> bool:
+    return bool(
+        source_id
+        and ".." not in source_id
+        and "/" not in source_id
+        and "\\" not in source_id
+    )
 
 
-def _live_chunks(video_dir: Path, source_id: str) -> list[dict]:
-    """[{uri, start_ts(PDT), end_ts, duration}] for the live playlist, or []."""
+def _live_playlist_entries(video_dir: Path, source_id: str) -> tuple[object | None, list[dict]]:
+    """Return playlist stat and media-offset entries.
+
+    EXT-X-PROGRAM-DATE-TIME is intentionally ignored. It is a transport hint,
+    not scene time. The only absolute anchor comes from decoded BITC markers.
+    """
+    if not _safe_live_source_id(source_id):
+        return None, []
     playlist = video_dir / "live" / source_id / "live.m3u8"
     try:
+        stat = playlist.stat()
         lines = playlist.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return []
+        return None, []
 
     target = 0.0
-    next_start: float | None = None
     next_dur: float | None = None
-    inferred: float | None = None
-    chunks: list[dict] = []
+    offset = 0.0
+    entries: list[dict] = []
     for raw in lines:
         line = raw.strip()
         if not line:
@@ -201,22 +215,167 @@ def _live_chunks(video_dir: Path, source_id: str) -> list[dict]:
                 next_dur = float(line.split(":", 1)[1].split(",", 1)[0])
             except (IndexError, ValueError):
                 next_dur = None
-        elif line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
-            next_start = _parse_pdt(line.split(":", 1)[1])
         elif not line.startswith("#"):
             dur = next_dur if next_dur is not None else target
-            start = next_start if next_start is not None else inferred
-            if start is not None and dur > 0:
-                chunks.append({
+            if dur > 0:
+                entries.append({
                     "uri": Path(line.split("?", 1)[0]).name,
-                    "start_ts": start,
-                    "end_ts": start + dur,
+                    "offset": offset,
                     "duration": dur,
                 })
-                inferred = start + dur
-            next_start = None
+                offset += dur
             next_dur = None
+    return stat, entries
+
+
+def _frame_media_seconds(frame) -> float | None:
+    frame_time = getattr(frame, "time", None)
+    if frame_time is not None:
+        try:
+            return float(frame_time)
+        except (TypeError, ValueError):
+            pass
+    pts = getattr(frame, "pts", None)
+    time_base = getattr(frame, "time_base", None)
+    if pts is None or time_base is None:
+        return None
+    try:
+        return float(pts * time_base)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stream_rate(stream) -> float | None:
+    for attr in ("average_rate", "base_rate", "guessed_rate"):
+        rate = getattr(stream, attr, None)
+        if not rate:
+            continue
+        try:
+            value = float(rate)
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _decode_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
+    """Decode one BITC marker and its media offset within an HLS fragment."""
+    from . import bitc
+    import av
+
+    container = None
+    try:
+        container = av.open(str(path))
+        video_stream = next((s for s in container.streams if s.type == "video"), None)
+        if video_stream is None:
+            return None
+        rate = _stream_rate(video_stream)
+        first_media_ts: float | None = None
+        frame_index = 0
+        for packet in container.demux(video_stream):
+            for frame in packet.decode():
+                frame_ts = _frame_media_seconds(frame)
+                if first_media_ts is None and frame_ts is not None:
+                    first_media_ts = frame_ts
+                if frame_ts is not None and first_media_ts is not None:
+                    rel = max(0.0, frame_ts - first_media_ts)
+                elif rate is not None:
+                    rel = frame_index / rate
+                else:
+                    rel = 0.0
+                frame_index += 1
+
+                frame_bgr = frame.to_ndarray(format="bgr24")
+                marker, crc_ok = bitc.decode(frame_bgr)
+                if crc_ok and marker is not None:
+                    return _LiveBitcProbe(float(marker), float(rel))
+    except Exception:
+        return None
+    finally:
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
+    return None
+
+
+def _cached_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    with _LIVE_PROBE_LOCK:
+        if key in _LIVE_PROBE_CACHE:
+            return _LIVE_PROBE_CACHE[key]
+
+    probe = _decode_live_bitc_probe(path)
+    with _LIVE_PROBE_LOCK:
+        if len(_LIVE_PROBE_CACHE) >= _LIVE_PROBE_CACHE_MAX:
+            _LIVE_PROBE_CACHE.clear()
+        _LIVE_PROBE_CACHE[key] = probe
+    return probe
+
+
+def _live_window_epoch(video_dir: Path, source_id: str, entries: list[dict]) -> float | None:
+    live_dir = video_dir / "live" / source_id
+    for entry in reversed(entries):
+        probe = _cached_live_bitc_probe(live_dir / entry["uri"])
+        if probe is not None:
+            return probe.bitc_ts - (float(entry["offset"]) + probe.media_offset)
+    return None
+
+
+def _live_chunks_and_stat(video_dir: Path, source_id: str) -> tuple[list[dict], object | None]:
+    stat, entries = _live_playlist_entries(video_dir, source_id)
+    if not entries:
+        return [], stat
+    media_epoch = _live_window_epoch(video_dir, source_id, entries)
+    if media_epoch is None:
+        return [], stat
+
+    chunks: list[dict] = []
+    for entry in entries:
+        start = media_epoch + float(entry["offset"])
+        duration = float(entry["duration"])
+        chunks.append({
+            "uri": entry["uri"],
+            "start_ts": start,
+            "end_ts": start + duration,
+            "duration": duration,
+            "media_offset": float(entry["offset"]),
+        })
+    return chunks, stat
+
+
+def _live_chunks(video_dir: Path, source_id: str) -> list[dict]:
+    """[{uri, start_ts(BITC), end_ts, duration}] for the live playlist."""
+    chunks, _stat = _live_chunks_and_stat(video_dir, source_id)
     return chunks
+
+
+def live_window(video_dir: Path, source_id: str | None) -> dict | None:
+    """Public live HLS DVR window, anchored on decoded BITC time."""
+    if not source_id:
+        return None
+    chunks, stat = _live_chunks_and_stat(video_dir, source_id)
+    if not chunks:
+        return None
+    start_ts = chunks[0]["start_ts"]
+    end_ts = max(c["end_ts"] for c in chunks)
+    return {
+        "source_id": source_id,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "duration": max(0.0, end_ts - start_ts),
+        "segment_count": len(chunks),
+        "playlist_age_seconds": (
+            max(0.0, time.time() - stat.st_mtime) if stat is not None else None
+        ),
+        "segments": chunks,
+    }
 
 
 def _resolve_live(video_dir: Path, source_id: str,
@@ -229,7 +388,6 @@ def _resolve_live(video_dir: Path, source_id: str,
     for c in chunks:
         if (t >= c["start_ts"] - _LIVE_EDGE_SLOP_SECONDS
                 and t <= c["end_ts"] + _LIVE_EDGE_SLOP_SECONDS):
-            # PDT IS the media_epoch — HLS carries the honest anchor natively.
             anchor = Anchor("hls", c["uri"], c["start_ts"], c["duration"])
             return MediaLocation(
                 provider="hls",
@@ -330,24 +488,32 @@ def _decode_mp4_frame(path: Path, offset: float):
         cap.release()
 
 
-def _decode_ts_frame(path: Path, offset: float):
-    """Indexless MPEG-TS fragment → decode from the lead keyframe and step to
-    the target frame. Frame-accurate; never a POS_MSEC guess. ndarray or None.
-    """
+def _decode_ts_frame_at_bitc(path: Path, t: float, max_drift: float = 0.5):
+    """Return the HLS frame whose decoded BITC marker is nearest ``t``."""
     import cv2
+
+    from . import bitc
+
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         return None
     try:
-        fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
-        target = max(0, int(round(max(0.0, offset) * fps)))
-        frame = None
-        for _ in range(target + 1):
-            ok, f = cap.read()
-            if not ok or f is None:
+        best_frame = None
+        best_diff = max_drift
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
                 break
-            frame = f
-        return frame
+            marker, crc_ok = bitc.decode(frame)
+            if not crc_ok or marker is None:
+                continue
+            diff = abs(float(marker) - t)
+            if diff < best_diff:
+                best_diff = diff
+                best_frame = frame
+                if diff < 0.02:
+                    break
+        return best_frame
     finally:
         cap.release()
 
@@ -388,7 +554,7 @@ def read_frame(conn: sqlite3.Connection, video_dir: Path,
 
     if loc.provider == "hls":
         path = video_dir / "live" / source_id / loc.anchor.asset_ref
-        frame = _decode_ts_frame(path, loc.media_offset)
+        frame = _decode_ts_frame_at_bitc(path, t)
         if frame is not None:
             return FrameResult(frame, "ok", "hls", None)
         # Live chunk not fetchable; authoritative MP4 exists after segment close.

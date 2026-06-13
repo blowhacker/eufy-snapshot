@@ -1799,7 +1799,9 @@ class VideoSegmentDB:
         with self._connect() as conn:
             conn.execute("DELETE FROM hls_events WHERE abs_ts<?", (cutoff,))
 
-    def live_status(self, source_id: str | None = None, zone_id=None) -> dict:
+    def live_status(self, source_id: str | None = None, zone_id=None,
+                    det_since: float | None = None,
+                    det_until: float | None = None) -> dict:
         with self._connect() as conn:
             where, params = [
                 "s.end_ts IS NULL",
@@ -1850,10 +1852,19 @@ class VideoSegmentDB:
         # no per-class merge is needed. Return ALL recent frames so the client
         # can pick the detection matching the displayed video time (the HLS
         # video player still buffers several seconds behind the live edge).
-        det_cutoff = time.time() - 30  # last 30s counts as "live"
+        if det_since is None:
+            if det_until is None:
+                det_since = time.time() - 30  # last 30s counts as "live"
+            else:
+                det_since = float(det_until) - 30.0
+        if det_until is None and det_since is not None:
+            det_until = float(det_since) + 30.0
         with self._connect() as conn:
             rec_where = ["d.abs_ts >= ?"]
-            rec_params: list = [det_cutoff]
+            rec_params: list = [float(det_since)]
+            if det_until is not None:
+                rec_where.append("d.abs_ts <= ?")
+                rec_params.append(float(det_until))
             if source_id and source_id != "all":
                 rec_where.append("d.source_id=?"); rec_params.append(source_id)
             rec_rows = conn.execute(

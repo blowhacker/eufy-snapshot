@@ -14,12 +14,11 @@ event grid lands exact. The BITC↔media conversion is done ad hoc in ~6 places
 with inconsistent bases. That is the leak.
 
 Root cause: cameras give no usable wall clock (RTP is a relative 90kHz media
-clock; RTCP is unreliable on cheap cams), so we restamp with host wall clock
-(`-use_wallclock_as_timestamps 1`). The MP4 muxer then normalizes first PTS to
-~0, losing the absolute mapping inside the file. HLS keeps it via
-`EXT-X-PROGRAM-DATE-TIME` (PDT). So the only honest stored fact is
-`(asset, offset)`; every wall-clock value is a *derived projection* needing a
-base — and we picked the base inconsistently.
+clock; RTCP is unreliable on cheap cams), so host/container clocks used to leak
+in as stand-ins. MP4 muxing normalizes first PTS to ~0, and HLS
+`EXT-X-PROGRAM-DATE-TIME` (PDT) can lead/lag the burned-in frame time. The only
+honest absolute fact is the BITC value decoded from the frame itself; media
+offsets are private projections derived from that marker.
 
 ## Decision
 
@@ -32,7 +31,8 @@ There are two coordinate spaces. Exactly one component crosses between them.
    or stream. Exists only inside the resolver and the player/decoder.
 
 `start_ts`, `actual_start_ts`, `ts_offset`, PDT are **not timestamps**. They are
-storage facts used to build the mapping. Only the resolver reads them.
+storage or transport facts. The resolver maps absolute time from decoded BITC,
+never from PDT.
 
 ## Vocabulary
 
@@ -128,13 +128,13 @@ Rules that make the "confirmation can't get a good frame" bug class impossible:
 3. **Rename/alias columns** with compatibility views/helpers so existing callers
    keep working until moved (`actual_start_ts`→`media_epoch`,
    `ts_offset`→`media_offset`, `start_ts`→`nominal_open_ts`).
-4. **Authoritative `media_epoch`**: writer ties it to its own ffmpeg's first
-   `.ts` PDT by segment id. Unknown → NULL, surfaced as `no_anchor`. Backfill.
+4. **Authoritative `media_epoch`**: writer ties it to decoded BITC from the
+   media itself. Unknown → NULL, surfaced as `no_anchor`. Backfill.
 5. **Backend callers → resolver** (yolo frame read, notification candidates;
    already on the correct base — log round-trip ε to confirm zero regression).
 6. **Frontend seek → resolver**: UI calls `/api/video/resolve?source=&ts=`;
    `V2Player.seek(source_id, t)` only. No `start_ts` in JS. Live (`hls`) seek via
-   hls.js fragment `.programDateTime`, killing the `wallClockOffset` fudge.
+   the server's BITC-anchored live window, not hls.js `.programDateTime`.
 7. **Frame access → resolver** (`read_frame`): collapse `_read_mp4_frame` /
    `_read_live_hls_frame` into the resolver with frame-accurate seek and the
    `pending(retry_after)` availability policy. Move notification confirmation,
@@ -160,7 +160,8 @@ Rules that make the "confirmation can't get a good frame" bug class impossible:
   `t` and the event-grid target for the same detection resolve to the *same*
   `media_offset`.
 - **HLS sliding window**: seek into a DVR window after chunks roll off still maps
-  `t`→correct frame via PDT, not via `seekable.start(0)` arithmetic.
+  `t`→correct frame via a decoded BITC fragment anchor, not via PDT or
+  `seekable.start(0)` arithmetic.
 - **Frame accuracy** (makes the confirmation bug class impossible): for a known
   detection, `read_frame(source_id, t)` returns a frame whose decoded content
   time is within one frame interval of `t`, for BOTH providers — never a

@@ -75,33 +75,6 @@ class YoloSocketServer(socketserver.ThreadingUnixStreamServer):
         return {"status": "error", "error": f"unknown type: {t}"}
 
 
-# ── M3U8 parser ────────────────────────────────────────────────────────────────
-
-def _parse_hls_segments(m3u8_path: Path) -> list[tuple[str, float]]:
-    """Return [(filename, abs_ts_unix)] from a live m3u8 with EXT-X-PROGRAM-DATE-TIME."""
-    from datetime import datetime, timezone
-    results = []
-    pending_dt: float | None = None
-    try:
-        lines = m3u8_path.read_text().splitlines()
-    except OSError:
-        return results
-    for line in lines:
-        line = line.strip()
-        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
-            dt_str = line[len("#EXT-X-PROGRAM-DATE-TIME:"):]
-            try:
-                pending_dt = datetime.fromisoformat(
-                    dt_str.replace("+0000", "+00:00")
-                ).timestamp()
-            except ValueError:
-                pending_dt = None
-        elif not line.startswith("#") and line.endswith(".ts") and pending_dt is not None:
-            results.append((line, pending_dt))
-            pending_dt = None
-    return results
-
-
 # ── Per-class thumb crop (matches MP4 _select_event_box + _crop_from_box) ─────
 
 def _crop_thumb(frame, cls_boxes: list, cls: str,

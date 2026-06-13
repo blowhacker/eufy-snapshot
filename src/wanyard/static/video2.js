@@ -1039,6 +1039,7 @@ const LIVE_DVR_TOLERANCE_SECONDS = 1.5;
 const LIVE_DVR_EDGE_PAD_SECONDS = 0.25;
 const LIVE_TIMELINE_FUTURE_PAD_SECONDS = 600;
 const LIVE_EDGE_RATE_RESET_SECONDS = 4;
+const LIVE_DET_WINDOW_SECONDS = 6;
 const ABSOLUTE_SEEK_RETRIES = 6;
 const ABSOLUTE_SEEK_RETRY_MS = 750;
 const ZONE_ALL = "all";
@@ -1229,7 +1230,7 @@ const liveTail = {
   latestDet: null,
   recentDets: [],   // recent detections buffer (sorted by abs_ts asc)
   window: null,
-  wallClockOffset: null,
+  bitcTimeOffset: null,
   targetTs: null,
 };
 
@@ -1563,13 +1564,15 @@ function seekLiveVideoToTs(ts, win) {
   }
   liveTail.window = win;
   liveTail.targetTs = ts;
-  liveTail.wallClockOffset = ts - target;
+  liveTail.bitcTimeOffset = ts - target;
   return true;
 }
 
 function liveTailCurrentTs() {
-  if (liveTail.wallClockOffset != null) {
-    return liveTail.wallClockOffset + (el.liveVideo.currentTime || 0);
+  const markerTs = decodeLiveMarker(el.liveVideo);
+  if (markerTs != null) return markerTs;
+  if (liveTail.bitcTimeOffset != null) {
+    return liveTail.bitcTimeOffset + (el.liveVideo.currentTime || 0);
   }
   return liveTail.latestDet?.abs_ts ?? Date.now() / 1000;
 }
@@ -1591,7 +1594,7 @@ function updateLivePlaybackRate(ts = liveTailCurrentTs()) {
   let rate = selected;
   if (selected > 1) {
     const lag = Date.now() / 1000 - ts;
-    const isDvrCatchup = liveTail.wallClockOffset != null && lag > LIVE_EDGE_RATE_RESET_SECONDS;
+    const isDvrCatchup = liveTail.bitcTimeOffset != null && lag > LIVE_EDGE_RATE_RESET_SECONDS;
     rate = isDvrCatchup ? selected : 1;
   }
   setLivePlaybackRate(rate);
@@ -3249,7 +3252,7 @@ async function startLiveTail(srcId = null, options = {}) {
   liveTail.latestDet = null;
   liveTail.recentDets = [];
   liveTail.window = liveWindow;
-  liveTail.wallClockOffset = null;
+  liveTail.bitcTimeOffset = null;
   liveTail.targetTs = seekTs;
   mode.enterLive();
   player.pause();
@@ -3359,7 +3362,7 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   liveTail.latestDet = null;
   liveTail.recentDets = [];
   liveTail.window = null;
-  liveTail.wallClockOffset = null;
+  liveTail.bitcTimeOffset = null;
   liveTail.targetTs = null;
   // Restore URL: remove live=1 and ts params
   const _p = new URLSearchParams(location.search);
@@ -3377,6 +3380,11 @@ function stopLiveTail(updateMode = true, invalidate = true) {
 async function pollLiveTail() {
   if (!liveTail.active || !liveTail.srcId) return;
   const p = new URLSearchParams({ source: liveTail.srcId });
+  const focusTs = liveTailCurrentTs();
+  if (Number.isFinite(focusTs)) {
+    p.set("det_since", (focusTs - LIVE_DET_WINDOW_SECONDS).toFixed(3));
+    p.set("det_until", (focusTs + LIVE_DET_WINDOW_SECONDS).toFixed(3));
+  }
   appendZoneParam(p);
   const r = await fetch(`/api/video/live?${p}`, { cache:"no-store" }).catch(() => null);
   if (!r?.ok) return;
@@ -3979,9 +3987,8 @@ function drawBoxes(ts) {
 function drawLiveBoxes() {
   // The displayed frame carries its exact BITC time in the burned marker —
   // read it and match the nearest detection on the SAME (detector) clock. This
-  // replaces matching against HLS playingDate (PDT), which is a different clock
-  // and made the live boxes lead the subject.
-  let det = liveTail.latestDet;
+  // replaces matching against transport/player clocks, which can lead the subject.
+  let det = null;
   const markerTs = decodeLiveMarker(el.liveVideo);
   if (markerTs != null && liveTail.recentDets.length) {
     let best = null, bestDist = Infinity;
@@ -3990,20 +3997,6 @@ function drawLiveBoxes() {
       if (dist < bestDist) { best = d; bestDist = dist; }
     }
     det = (best && bestDist < 1.0) ? best : null;
-  } else {
-    // Fallback only when the marker is unreadable (e.g. a pre-stamper stream):
-    // the old playingDate match.
-    const displayDate = liveTail.hls?.playingDate;
-    if (displayDate && liveTail.recentDets.length) {
-      const target = displayDate.getTime() / 1000;
-      let best = null, bestDist = Infinity;
-      for (const d of liveTail.recentDets) {
-        const dist = Math.abs(d.abs_ts - target);
-        if (dist < bestDist) { best = d; bestDist = dist; }
-      }
-      if (best && bestDist < 1.5) det = best;
-      else if (bestDist >= 1.5) det = null;
-    }
   }
   drawBoxList(el.liveVideo, _filterBoxes(det?.boxes));
 }
