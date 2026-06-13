@@ -20,6 +20,7 @@ _DISC_BACKWARD_SECONDS = -1.0
 _DISC_FORWARD_SECONDS = 5.0
 _PATH_REFRESH_SECONDS = 60.0
 _MAX_LIVE_LAG_SECONDS = 1.0
+_STAMPED_SUFFIX = "-stamped"
 
 
 @dataclass
@@ -139,11 +140,12 @@ class _TimeAnchor:
 
 
 class _SourceWorker:
-    def __init__(self, relay_host: str, source_id: str, model, video_db,
+    def __init__(self, relay_host: str, source_id: str, relay_path: str, model, video_db,
                  stop_event: threading.Event, predict_lock: threading.Lock,
                  fps: float, claim: bool) -> None:
         self.relay_host = relay_host
         self.source_id = source_id
+        self.relay_path = relay_path
         self.model = model
         self.video_db = video_db
         self.stop_event = stop_event
@@ -201,8 +203,13 @@ class _SourceWorker:
     def _stream(self, anchor: _TimeAnchor) -> None:
         import av
 
-        url = f"rtsp://{self.relay_host}:8554/{self.source_id}"
-        LOG.info("live detector %s connecting %s", self.source_id, url)
+        url = f"rtsp://{self.relay_host}:8554/{self.relay_path}"
+        LOG.info(
+            "live detector %s connecting path=%s url=%s",
+            self.source_id,
+            self.relay_path,
+            url,
+        )
         container = av.open(
             url,
             options={"rtsp_transport": "tcp"},
@@ -459,6 +466,7 @@ class _LiveDetectorSupervisor:
         self.stop_event = stop_event
         self.predict_lock = predict_lock
         self.relay_host = os.environ.get("WANYARD_RELAY_HOST", "mediamtx").strip() or "mediamtx"
+        self.path_suffix = os.environ.get("WANYARD_RELAY_PATH_SUFFIX", "").strip()
         self.fps = float(os.environ.get("WANYARD_LIVE_FPS", "2.0") or "2.0")
         self.claim = os.environ.get("WANYARD_SHADOW_CLAIM", "1") == "1"
         self.workers: dict[str, _SourceWorker] = {}
@@ -471,8 +479,9 @@ class _LiveDetectorSupervisor:
     def start(self) -> threading.Thread:
         _configure_torch_threads()
         LOG.info(
-            "live detector supervisor starting relay=%s fps=%.2f claim=%s",
+            "live detector supervisor starting relay=%s path_suffix=%r fps=%.2f claim=%s",
             self.relay_host,
+            self.path_suffix,
             self.fps,
             self.claim,
         )
@@ -491,11 +500,12 @@ class _LiveDetectorSupervisor:
         LOG.info("live detector supervisor stopped")
 
     def _sync_paths(self) -> None:
-        paths = set(_list_relay_paths(self.relay_host))
-        for source_id in sorted(paths - set(self.workers)):
+        targets = _target_relay_paths(_list_relay_paths(self.relay_host), self.path_suffix)
+        for source_id in sorted(set(targets) - set(self.workers)):
             worker = _SourceWorker(
                 self.relay_host,
                 source_id,
+                targets[source_id],
                 self.model,
                 self.video_db,
                 self.stop_event,
@@ -505,9 +515,13 @@ class _LiveDetectorSupervisor:
             )
             self.workers[source_id] = worker
             worker.start()
-            LOG.info("live detector started path=%s", source_id)
+            LOG.info(
+                "live detector started source=%s path=%s",
+                source_id,
+                targets[source_id],
+            )
 
-        for source_id in sorted(set(self.workers) - paths):
+        for source_id in sorted(set(self.workers) - set(targets)):
             self.workers[source_id].stop()
             del self.workers[source_id]
             LOG.info("live detector stopped removed path=%s", source_id)
@@ -523,6 +537,28 @@ def _list_relay_paths(relay_host: str) -> list[str]:
         if name:
             paths.append(str(name))
     return paths
+
+
+def _target_relay_paths(paths: list[str], suffix: str) -> dict[str, str]:
+    """Map DB source IDs to mediamtx paths the detector should consume.
+
+    With M2 cutover enabled, ``suffix`` is ``-stamped``: the detector reads
+    ``<source>-stamped`` but still stores rows under ``<source>``. Without an
+    explicit suffix, ignore stamper shadow outputs so the detector does not
+    accidentally double-consume M1 paths.
+    """
+    suffix = suffix.strip()
+    targets: dict[str, str] = {}
+    for path in sorted({p for p in paths if p}):
+        if suffix:
+            if not path.endswith(suffix):
+                continue
+            source_id = path[: -len(suffix)]
+            if source_id:
+                targets[source_id] = path
+        elif not path.endswith(_STAMPED_SUFFIX):
+            targets[path] = path
+    return targets
 
 
 def _configure_torch_threads() -> None:

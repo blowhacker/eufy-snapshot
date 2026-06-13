@@ -21,6 +21,7 @@ services:
       - CLEANUP_DAYS=30
       - WANYARD_LIVE_DETECTOR=1
       - WANYARD_RELAY_HOST=mediamtx
+      - WANYARD_RELAY_PATH_SUFFIX=-stamped
       - WANYARD_LIVE_FPS=2.0
       - OMP_NUM_THREADS=2
       - MKL_NUM_THREADS=2
@@ -53,6 +54,7 @@ services:
       - VIDEO_DIR=/app/video
       - YOLO_SOCKET=/run/yolo/yolo.sock
       - WANYARD_RELAY_HOST=mediamtx
+      - WANYARD_RELAY_PATH_SUFFIX=-stamped
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
