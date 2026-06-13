@@ -10,7 +10,7 @@ subtracts `start_ts`; YOLO frame reads and notification candidates subtract
 `actual_start_ts`; thumbnail nav deliberately re-adds `start_ts` so the offset
 math cancels. These bases disagree by *drift* (median ~0.64s on prod, 13% >1s,
 max 4.1s), so a notification click lands ~0.6s off the frame it shows while the
-event grid lands exact. The world↔media conversion is done ad hoc in ~6 places
+event grid lands exact. The BITC↔media conversion is done ad hoc in ~6 places
 with inconsistent bases. That is the leak.
 
 Root cause: cameras give no usable wall clock (RTP is a relative 90kHz media
@@ -25,8 +25,9 @@ base — and we picked the base inconsistently.
 
 There are two coordinate spaces. Exactly one component crosses between them.
 
-1. **World time** — `(source_id, t)`, `t` = unix UTC seconds. The only
-   coordinate that crosses module boundaries. User-facing.
+1. **BITC time** — `(source_id, t)`, `t` = unix UTC seconds decoded from the
+   burned-in BITC marker. The only point-in-time coordinate that crosses module
+   boundaries. User-facing.
 2. **Media time** — `(asset, offset)`, `offset` = seconds into a specific file
    or stream. Exists only inside the resolver and the player/decoder.
 
@@ -37,9 +38,9 @@ storage facts used to build the mapping. Only the resolver reads them.
 
 | Term | Meaning | Replaces |
 |------|---------|----------|
-| `t` (world ts) | unix UTC seconds; best-known wall instant of a frame | the overloaded "abs_ts"/"ts" |
+| `t` (BITC ts) | unix UTC seconds decoded from the frame's BITC marker | the overloaded "abs_ts"/"ts" |
 | `media_offset` | seconds into an asset | `ts_offset` |
-| `media_epoch` | world time of `media_offset == 0` for an asset | `actual_start_ts` |
+| `media_epoch` | BITC/Unix time of `media_offset == 0` for an asset | `actual_start_ts` |
 | `nominal_open_ts` | recorder's pre-launch clock; filename/ordering key, **not** a coordinate | `start_ts` (as a time) |
 | anchor | `{provider, asset_ref, media_epoch, duration}` | scattered offset math |
 | provider | `mp4` (recorded) \| `hls` (live) \| `none` (gap) | `h:`/`d:`/`o:` leak |
@@ -47,12 +48,12 @@ storage facts used to build the mapping. Only the resolver reads them.
 ## Invariant (the property that proves the abstraction holds)
 
 ```
-world→media(t)  = t - media_epoch        # clamp [0, duration]
-media→world(o)  = media_epoch + o
+BITC→media(t)   = t - media_epoch        # clamp [0, duration]
+media→BITC(o)   = media_epoch + o
 
 For every stored detection d:
   loc = resolve(d.source_id, d.t)
-  assert |loc.anchor.media_to_world(loc.media_offset) - d.t| < EPS
+  assert |loc.anchor.media_to_bitc(loc.media_offset) - d.t| < EPS
 ```
 
 If `start_ts` (now `nominal_open_ts`) ever creeps back in as a public
@@ -68,7 +69,7 @@ MediaLocation {
     url:          str | None       # what the player/decoder opens
     media_offset: float | None     # = t - anchor.media_epoch, computed ONCE
     coverage:     {start: float, end: float} | None  # world-span covered
-    anchor:       Anchor | None     # for media→world on the way back
+    anchor:       Anchor | None     # for media→BITC on the way back
     reason:       str               # "recorded" | "live" | "gap" | "no_anchor"
 }
 ```

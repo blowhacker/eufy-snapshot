@@ -673,8 +673,8 @@ def make_app(
         media_epoch = loc.anchor.media_epoch if loc.anchor else None
 
         # Recorded media plays the MP4 file directly: currentTime = t - media_epoch.
-        # media_epoch is the one anchor shared with detections, so overlay boxes
-        # enclose the on-screen frame by construction. No rewrap, no second clock.
+        # Both t and media_epoch are decoded BITC/Unix time; currentTime is only
+        # the private player coordinate needed to show that BITC frame.
         return JSONResponse({
             "provider": loc.provider,
             "storage_provider": loc.provider,

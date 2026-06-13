@@ -1,12 +1,13 @@
-"""Media-time resolver — the single boundary between world time and media time.
+"""Media-time resolver — the single boundary between BITC time and media time.
 
 See docs/media-time-architecture.md.
 
-World time = (source_id, t), t = unix UTC seconds. The only coordinate that
-crosses module boundaries. Media time = (asset, offset), exists only inside this
-module and the player/decoder.
+BITC time = (source_id, t), t = the decoded BITC/Unix seconds burned into the
+frame. This is the only point-in-time coordinate that crosses module
+boundaries. Media time = (asset, offset), exists only inside this module and
+the player/decoder.
 
-Hard rule: world time is the only public point-in-time coordinate. Recorded
+Hard rule: BITC time is the only public point-in-time coordinate. Recorded
 media is anchored by segments.media_epoch, and media offsets stay private to
 this resolver/player boundary.
 """
@@ -21,7 +22,7 @@ from pathlib import Path
 
 EPS = 0.05  # round-trip identity tolerance, seconds
 
-# Live HLS clock can lead/lag the wall clock slightly at chunk edges.
+# Live HLS PDT can lead/lag BITC slightly at chunk edges.
 _LIVE_EDGE_SLOP_SECONDS = 2.0
 
 # Mirrors VideoWorker._MAX_SEGMENT_SECONDS — used only to estimate when an open
@@ -60,16 +61,16 @@ def _recorded_media_epoch_sql(alias: str | None = None) -> str:
 
 @dataclass(frozen=True)
 class Anchor:
-    """world<->media conversion for one playable asset.
+    """BITC<->media conversion for one playable asset.
 
-    media_epoch is the world time (unix UTC) of media_offset == 0.
+    media_epoch is the BITC/Unix time of media_offset == 0.
     """
     provider: str            # "mp4" | "hls"
     asset_ref: str           # mp4 rel path, or live .ts filename
     media_epoch: float
     duration: float | None   # seconds; None if open/unknown
 
-    def world_to_media(self, t: float) -> float:
+    def bitc_to_media(self, t: float) -> float:
         o = t - self.media_epoch
         if o < 0:
             return 0.0
@@ -77,7 +78,7 @@ class Anchor:
             return self.duration
         return o
 
-    def media_to_world(self, o: float) -> float:
+    def media_to_bitc(self, o: float) -> float:
         return self.media_epoch + o
 
 
@@ -133,13 +134,13 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
         if media_epoch is None:
             return _none("no_anchor")
         # Include the final-GOP flush tail so a detection on the last fragment
-        # both selects (above) and clamps (world_to_media) to its own file.
+        # both selects (above) and clamps (bitc_to_media) to its own file.
         media_duration = (_recorded_duration(row) or 0.0) + _COVERAGE_TAIL_GRACE_SECONDS
         anchor = Anchor("mp4", row["path"], media_epoch, media_duration)
         return MediaLocation(
             provider="mp4",
             url=f"/video/files/{row['path']}",
-            media_offset=anchor.world_to_media(t),
+            media_offset=anchor.bitc_to_media(t),
             coverage=Coverage(media_epoch, media_epoch + media_duration),
             anchor=anchor,
             reason="recorded",
@@ -233,7 +234,7 @@ def _resolve_live(video_dir: Path, source_id: str,
             return MediaLocation(
                 provider="hls",
                 url=f"/video/live/{source_id}/{c['uri']}",
-                media_offset=anchor.world_to_media(t),
+                media_offset=anchor.bitc_to_media(t),
                 coverage=window,
                 anchor=anchor,
                 reason="live",
@@ -284,7 +285,7 @@ def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
 
 def resolve(conn: sqlite3.Connection, video_dir: Path,
             source_id: str, t: float) -> MediaLocation:
-    """The only place world time is converted to media time.
+    """The only place BITC time is converted to media time.
 
     Closed recorded MP4 wins for the past; live HLS for the recent edge
     (including the currently-open, not-yet-finalized segment); otherwise a gap.
@@ -404,7 +405,7 @@ class RoundTrip:
     ok: bool
     detection_id: int
     status: str               # ok | sentinel | no_anchor | gap | world_mismatch | no_detection
-    world_delta: float | None  # |resolved world - detection world|, the real invariant
+    world_delta: float | None  # |resolved BITC - detection BITC|, the real invariant
     expected_offset: float
     resolved_offset: float | None
     provider: str
@@ -413,11 +414,11 @@ class RoundTrip:
 
 def check_detection_round_trip(conn: sqlite3.Connection, video_dir: Path,
                                detection_id: int) -> RoundTrip:
-    """Invariant: resolve(media->world(detection)) lands on a usable asset whose
-    world time equals the detection's world time, within EPS.
+    """Invariant: resolve(media->BITC(detection)) lands on a usable asset whose
+    BITC time equals the detection's BITC time, within EPS.
 
-    The invariant is on WORLD time, not offset equality: at contiguous segment
-    boundaries the same wall instant exists in two files, so resolving to the
+    The invariant is on BITC time, not offset equality: at contiguous segment
+    boundaries the same BITC instant exists in two files, so resolving to the
     adjacent segment (different offset) is correct. The expected media offset is
     derived (abs_ts - media_epoch), never stored. No side effects.
     """
@@ -433,14 +434,14 @@ def check_detection_round_trip(conn: sqlite3.Connection, video_dir: Path,
                          0.0, None, "none", False)
 
     expected = float(row["media_offset"])
-    world_t = float(row["abs_ts"])
-    loc = resolve(conn, video_dir, row["source_id"], world_t)
+    bitc_t = float(row["abs_ts"])
+    loc = resolve(conn, video_dir, row["source_id"], bitc_t)
     if loc.provider != "mp4" or loc.anchor is None or loc.media_offset is None:
         return RoundTrip(False, detection_id, loc.reason, None,
                          expected, loc.media_offset, loc.provider, False)
-    resolved_world = loc.anchor.media_to_world(loc.media_offset)
-    world_delta = abs(resolved_world - world_t)
-    ok = world_delta < EPS
+    resolved_bitc = loc.anchor.media_to_bitc(loc.media_offset)
+    bitc_delta = abs(resolved_bitc - bitc_t)
+    ok = bitc_delta < EPS
     alternate = abs(loc.media_offset - expected) > EPS
     return RoundTrip(ok, detection_id, "ok" if ok else "world_mismatch",
-                     world_delta, expected, loc.media_offset, loc.provider, alternate)
+                     bitc_delta, expected, loc.media_offset, loc.provider, alternate)

@@ -1,6 +1,6 @@
 """BITC stamper.
 
-Reads a relay path, computes the honest world time per frame (the ONE clock —
+Reads a relay path, computes the BITC/Unix time per frame (the ONE clock —
 rolling-min of wall-minus-rtp), burns the BITC marker into every video frame,
 re-encodes, and republishes to ``<src>-stamped``. Audio is remuxed (copied)
 through. Downstream consumers (recorder, detector) read the time from the

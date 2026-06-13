@@ -19,12 +19,12 @@ refs to current code), then isolates exactly where the overlay time-anchor gap
                     │ RECORDER (ffmpeg)     │      │ DETECTOR (PyAV, yolo)  │
                     │ video.py CaptureWorker│      │ live_detector.py        │
                     │  → MP4 archive         │      │  → video_detections     │
-                    │  → HLS live (.ts+PDT)  │      │  (abs_ts world time)    │
+                    │  → HLS live (.ts+PDT)  │      │  (abs_ts BITC time)     │
                     └───────────┬───────────┘      └──────────┬─────────────┘
                                 │                             │
                                 ▼                             ▼
                          segments table              video_detections table
-                         (media_epoch = THE anchor)  (abs_ts = world time)
+                         (media_epoch = THE anchor)  (abs_ts = BITC time)
                                 │                             │
                                 └──────────────┬──────────────┘
                                                ▼
@@ -107,7 +107,7 @@ ffmpeg -use_wallclock_as_timestamps 1 -rtsp_transport tcp -i <relay url>
 ## 5. Tagging storage & backfill
 
 - `video_detections` = the single detection store (live detector authoritative
-  after B4). `abs_ts` is world time; box coords normalized 0–1.
+  after B4). `abs_ts` is BITC time; box coords normalized 0–1.
 - `backfill_loop` (`yolo_server.py`) YOLO-tags only **unclaimed** closed segments
   (`scanned_at IS NULL AND media_epoch IS NOT NULL`) at 1fps — gap-filler only.
   Undecodable MP4s now get `mark_scanned` (no tight-spin). Then `extract_events`.

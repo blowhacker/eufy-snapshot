@@ -1236,7 +1236,7 @@ const liveTail = {
 function urlTimestamp(ts) {
   const n = Number(ts);
   // Reject null/undefined (Number(null)===0) and any non-positive value: a URL ts
-  // is an absolute world time, never 0. Prevents ?ts=0 from a live click.
+  // is an absolute BITC/Unix time, never 0. Prevents ?ts=0 from a live click.
   if (ts == null || !Number.isFinite(n) || n <= 0) return null;
   return n.toFixed(3).replace(/\.?0+$/, "");
 }
@@ -1615,9 +1615,9 @@ function replaceProvisionalEvents(events, srcId = null) {
   mergeEvents(events);
 }
 
-// The server sends each segment's honest recorder-open start_ts plus the world
-// anchor media_epoch. The timeline and player index everything by world time, so
-// here we set start_ts/end_ts to the segment's world coverage
+// The server sends each segment's honest recorder-open start_ts plus the BITC
+// anchor media_epoch. The timeline and player index everything by BITC time, so
+// here we set start_ts/end_ts to the segment's BITC coverage
 // [media_epoch, media_epoch + duration]. One value (media_epoch) places the file
 // in the universe; offsets into it are derived, never stored.
 function worldizeSeg(s) {
@@ -3977,7 +3977,7 @@ function drawBoxes(ts) {
 }
 
 function drawLiveBoxes() {
-  // The displayed frame carries its exact world time in the burned BITC marker —
+  // The displayed frame carries its exact BITC time in the burned marker —
   // read it and match the nearest detection on the SAME (detector) clock. This
   // replaces matching against HLS playingDate (PDT), which is a different clock
   // and made the live boxes lead the subject.
