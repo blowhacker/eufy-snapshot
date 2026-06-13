@@ -3863,6 +3863,66 @@ function boxesAtOverlayTime(ts) {
   return _filterBoxes(out);                     // class/zone filter applied at draw
 }
 
+// ── BITC marker: read the world-time burned into the displayed frame ──────────
+// JS port of wanyard.bitc.decode. The marker is a bottom-flush, bottom-left strip
+// of 46 8px black/white cells: 38 payload bits (unix centiseconds, LSB first) +
+// 8 CRC bits. Read at NATIVE resolution so the fixed-pixel strip is exact.
+const _BITC_CELL = 8, _BITC_NCELLS = 46, _BITC_NPAY = 38, _BITC_W = _BITC_CELL * _BITC_NCELLS;
+let _bitcCrcTable = null, _bitcCanvas = null;
+function _bitcCrc32(bytes) {
+  if (!_bitcCrcTable) {
+    _bitcCrcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      _bitcCrcTable[n] = c >>> 0;
+    }
+  }
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) crc = (_bitcCrcTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8)) >>> 0;
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+function decodeLiveMarker(v) {
+  const iw = v.videoWidth, ih = v.videoHeight;
+  if (!iw || !ih || ih < _BITC_CELL || iw < _BITC_W) return null;
+  if (!_bitcCanvas) { _bitcCanvas = document.createElement("canvas"); _bitcCanvas.width = _BITC_W; _bitcCanvas.height = _BITC_CELL; }
+  const ctx = _bitcCanvas.getContext("2d", { willReadFrequently: true });
+  let data;
+  try {
+    ctx.drawImage(v, 0, ih - _BITC_CELL, _BITC_W, _BITC_CELL, 0, 0, _BITC_W, _BITC_CELL);
+    data = ctx.getImageData(0, 0, _BITC_W, _BITC_CELL).data;
+  } catch (e) { return null; }                 // not yet decoded / tainted
+  const pad = (_BITC_CELL / 4) | 0;            // inner-50% sampling
+  const bits = new Array(_BITC_NCELLS);
+  for (let i = 0; i < _BITC_NCELLS; i++) {
+    let sum = 0, cnt = 0;
+    for (let y = pad; y < _BITC_CELL - pad; y++)
+      for (let x = i * _BITC_CELL + pad; x < i * _BITC_CELL + _BITC_CELL - pad; x++) {
+        const idx = (y * _BITC_W + x) * 4;
+        sum += data[idx] + data[idx + 1] + data[idx + 2]; cnt += 3;
+      }
+    bits[i] = (sum / cnt) > 128 ? 1 : 0;
+  }
+  let value = 0;                                // 38 bits: arithmetic (>32-bit)
+  for (let i = 0; i < _BITC_NPAY; i++) if (bits[i]) value += Math.pow(2, i);
+  let crc = 0;
+  for (let i = 0; i < 8; i++) if (bits[_BITC_NPAY + i]) crc += (1 << i);
+  const vb = new Array(8); let vv = value;
+  for (let j = 0; j < 8; j++) { vb[j] = vv % 256; vv = Math.floor(vv / 256); }
+  if ((_bitcCrc32(vb) & 0xFF) !== crc) return null;
+  return value / 100;                          // unix seconds
+}
+function _maskBitcStrip(ctx, c, v) {
+  const iw = v.videoWidth, ih = v.videoHeight;
+  if (!iw || !ih) return;
+  const scale = Math.min(c.width / iw, c.height / ih);
+  const rw = iw * scale, rh = ih * scale, ox = (c.width - rw) / 2, oy = (c.height - rh) / 2;
+  const sx = ox, sy = oy + (1 - _BITC_CELL / ih) * rh;
+  const sw = (_BITC_W / iw) * rw, sh = (_BITC_CELL / ih) * rh;
+  ctx.fillStyle = "#0b0e12";
+  ctx.fillRect(sx, sy - 1, sw + 1, sh + 2);    // small pad to fully cover
+}
+
 function drawBoxes(ts) {
   if (liveTail.active) return;
   const v = el.video;
@@ -3882,21 +3942,33 @@ function drawBoxes(ts) {
 }
 
 function drawLiveBoxes() {
-  // Pick the detection matching the displayed video frame's wall-clock time.
-  // HLS.js's playingDate gives the camera-time of the currently displayed
-  // frame. Detection arrives at the server ~2-3s before the video player
-  // shows that camera frame (due to HLS player buffering).
-  const displayDate = liveTail.hls?.playingDate;
+  // The displayed frame carries its exact world time in the burned BITC marker —
+  // read it and match the nearest detection on the SAME (detector) clock. This
+  // replaces matching against HLS playingDate (PDT), which is a different clock
+  // and made the live boxes lead the subject.
   let det = liveTail.latestDet;
-  if (displayDate && liveTail.recentDets.length) {
-    const target = displayDate.getTime() / 1000;
+  const markerTs = decodeLiveMarker(el.liveVideo);
+  if (markerTs != null && liveTail.recentDets.length) {
     let best = null, bestDist = Infinity;
     for (const d of liveTail.recentDets) {
-      const dist = Math.abs(d.abs_ts - target);
+      const dist = Math.abs(d.abs_ts - markerTs);
       if (dist < bestDist) { best = d; bestDist = dist; }
     }
-    if (best && bestDist < 1.5) det = best;
-    else if (bestDist >= 1.5) det = null;
+    det = (best && bestDist < 1.0) ? best : null;
+  } else {
+    // Fallback only when the marker is unreadable (e.g. a pre-stamper stream):
+    // the old playingDate match.
+    const displayDate = liveTail.hls?.playingDate;
+    if (displayDate && liveTail.recentDets.length) {
+      const target = displayDate.getTime() / 1000;
+      let best = null, bestDist = Infinity;
+      for (const d of liveTail.recentDets) {
+        const dist = Math.abs(d.abs_ts - target);
+        if (dist < bestDist) { best = d; bestDist = dist; }
+      }
+      if (best && bestDist < 1.5) det = best;
+      else if (bestDist >= 1.5) det = null;
+    }
   }
   drawBoxList(el.liveVideo, _filterBoxes(det?.boxes));
 }
@@ -3934,7 +4006,9 @@ function drawBoxList(v, boxes) {
   c.width = c.clientWidth; c.height = c.clientHeight;
   const ctx = c.getContext("2d");
   ctx.clearRect(0, 0, c.width, c.height);
-  if (!st.showBoxes || !v.videoWidth) return;
+  if (!v.videoWidth) return;
+  _maskBitcStrip(ctx, c, v);              // hide the burned timecode strip (always)
+  if (!st.showBoxes) return;
   if (!boxes.length) return;
   const cw = c.width, ch = c.height;
   const iw = v.videoWidth, ih = v.videoHeight;
