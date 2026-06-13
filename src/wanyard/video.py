@@ -3248,9 +3248,18 @@ class VideoWorker:
 
 
 def _decode_first_frame_marker(path: Path | str) -> float | None:
-    """Decode or estimate the first-frame BITC marker for a media file."""
+    """Estimate media_epoch (world time of container offset 0) from the early
+    frames' burned markers.
+
+    For each readable early frame, ``marker - container_offset`` estimates
+    media_epoch. We take the MEDIAN over the first few seconds rather than
+    trusting frame 0 alone: frame 0 can be a re-delivered keyframe or carry a
+    per-frame stamper-delta spike, which would offset every overlay box by a
+    constant lead. The median sits on the trend line of the bulk of frames.
+    """
     try:
         import av
+        import statistics
 
         container = av.open(str(path))
         try:
@@ -3258,28 +3267,28 @@ def _decode_first_frame_marker(path: Path | str) -> float | None:
             if video_stream is None:
                 return None
             first_pts: float | None = None
+            samples: list[float] = []
             scanned = 0
+            done = False
             for packet in container.demux(video_stream):
+                if done:
+                    break
                 for frame in packet.decode():
                     frame_pts = _frame_pts_seconds(frame)
                     if first_pts is None and frame_pts is not None:
                         first_pts = frame_pts
-                    frame_bgr = frame.to_ndarray(format="bgr24")
-                    marker_ts, crc_ok = bitc.decode(frame_bgr)
-                    if crc_ok and marker_ts is not None:
-                        if first_pts is not None and frame_pts is not None:
-                            return marker_ts - (frame_pts - first_pts)
-                        return marker_ts
+                    marker_ts, crc_ok = bitc.decode(frame.to_ndarray(format="bgr24"))
+                    if (crc_ok and marker_ts is not None
+                            and frame_pts is not None and first_pts is not None):
+                        samples.append(marker_ts - (frame_pts - first_pts))
                     scanned += 1
-                    if scanned >= _BITC_ANCHOR_SCAN_FRAMES:
-                        return None
-                    if (
-                        first_pts is not None
-                        and frame_pts is not None
+                    if scanned >= _BITC_ANCHOR_SCAN_FRAMES or (
+                        first_pts is not None and frame_pts is not None
                         and frame_pts - first_pts >= _BITC_ANCHOR_SCAN_SECONDS
                     ):
-                        return None
-            return None
+                        done = True
+                        break
+            return statistics.median(samples) if samples else None
         finally:
             container.close()
     except Exception:
