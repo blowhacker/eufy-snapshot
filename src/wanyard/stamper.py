@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+from fractions import Fraction
 
 import numpy as np
 
@@ -117,8 +118,19 @@ class _StamperWorker:
             vout.width = vin.codec_context.width
             vout.height = vin.codec_context.height
             vout.pix_fmt = "yuv420p"
+            # Fixed 90kHz output timebase; assign pts from the input's RTP
+            # (session-relative, monotonic, real-rate) so playback timing mirrors
+            # the camera exactly and the RTSP muxer always gets clean monotonic
+            # pts (carrying input frame.pts through a mismatched encoder rate
+            # EINVALs for VFR streams, e.g. avg 15 != base 20).
+            out_tb = Fraction(1, 90000)
+            vout.codec_context.time_base = out_tb
+            # ~2s keyframe interval so the downstream HLS (hls_time 2) and short
+            # records are seekable; we control GOP now that we re-encode.
+            gop = max(1, int(round(2 * float(vin.average_rate or 15))))
             vout.options = {"preset": self.preset, "tune": "zerolatency",
-                            "crf": self.crf}
+                            "crf": self.crf, "g": str(gop),
+                            "keyint_min": str(gop)}
             aout = None
             if ain is not None:
                 try:
@@ -129,6 +141,8 @@ class _StamperWorker:
                     aout = None
 
             anchor = _StampAnchor(self.source_id)
+            rtp0: float | None = None
+            last_pts = -1
             for packet in inp.demux():
                 if self.stopped():
                     break
@@ -140,6 +154,8 @@ class _StamperWorker:
                     for frame in packet.decode():
                         wall = time.time()
                         abs_ts = anchor.observe(rtp, wall)
+                        if rtp0 is None:
+                            rtp0 = rtp
                         img = frame.to_ndarray(format="bgr24")
                         try:
                             bitc.render(img, bitc.encode_value(abs_ts))
@@ -147,8 +163,10 @@ class _StamperWorker:
                             LOG.warning("stamper %s abs_ts %.3f out of range",
                                         self.source_id, abs_ts)
                         of = av.VideoFrame.from_ndarray(img, format="bgr24")
-                        of.pts = frame.pts
-                        of.time_base = frame.time_base or vin.time_base
+                        pts = int(round((rtp - rtp0) * 90000))
+                        of.pts = pts if pts > last_pts else last_pts + 1
+                        last_pts = of.pts
+                        of.time_base = out_tb
                         for op in vout.encode(of):
                             out.mux(op)
                 elif aout is not None and packet.stream is ain:
