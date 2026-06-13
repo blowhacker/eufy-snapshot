@@ -133,12 +133,25 @@ class _StamperWorker:
                             "keyint_min": str(gop)}
             aout = None
             if ain is not None:
-                try:
-                    aout = out.add_stream(template=ain)
-                except Exception:
-                    LOG.warning("stamper %s audio copy unsupported — video only",
+                rate = getattr(ain.codec_context, "sample_rate", None) or 8000
+                for attempt in ("explicit", "template"):
+                    try:
+                        if attempt == "explicit":
+                            aout = out.add_stream(ain.codec_context.name, rate=rate)
+                            try:
+                                aout.layout = ain.layout
+                            except Exception:
+                                pass
+                        else:
+                            aout = out.add_stream(template=ain)
+                        break
+                    except Exception as exc:
+                        LOG.info("stamper %s audio add_stream(%s) failed: %s",
+                                 self.source_id, attempt, exc)
+                        aout = None
+                if aout is None:
+                    LOG.warning("stamper %s audio unsupported — video only",
                                 self.source_id)
-                    aout = None
 
             anchor = _StampAnchor(self.source_id)
             rtp0: float | None = None
@@ -171,7 +184,11 @@ class _StamperWorker:
                             out.mux(op)
                 elif aout is not None and packet.stream is ain:
                     packet.stream = aout
-                    out.mux(packet)
+                    try:
+                        out.mux(packet)
+                    except Exception as exc:
+                        LOG.info("stamper %s audio mux dropped: %s",
+                                 self.source_id, exc)
             if not self.stopped():
                 for op in vout.encode():
                     out.mux(op)
