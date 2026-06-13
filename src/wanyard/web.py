@@ -323,6 +323,97 @@ def _extract_video_thumb(seg_path: Path, cache_file: Path, t: float,
     return False
 
 
+# ── Live-thumb (provisional/open-segment event) cache ─────────────────────
+_LIVE_THUMB_CACHE: dict[tuple, tuple[float, bytes | None]] = {}
+_LIVE_THUMB_CACHE_TTL = 30.0
+_LIVE_THUMB_CACHE_MAX = 256
+
+
+def _live_thumb_cache_get(key: tuple) -> bytes | None | object:
+    entry = _LIVE_THUMB_CACHE.get(key)
+    if not entry:
+        return None
+    ts, data = entry
+    if time.time() - ts > _LIVE_THUMB_CACHE_TTL:
+        _LIVE_THUMB_CACHE.pop(key, None)
+        return None
+    return data if data else b""  # b"" is a cached "not found"
+
+
+def _live_thumb_cache_put(key: tuple, data: bytes | None) -> None:
+    if len(_LIVE_THUMB_CACHE) > _LIVE_THUMB_CACHE_MAX:
+        _LIVE_THUMB_CACHE.clear()
+    _LIVE_THUMB_CACHE[key] = (time.time(), data)
+
+
+def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
+                        box: dict, max_drift: float = 0.5) -> bytes | None:
+    """Find the live HLS .ts fragment frame whose BITC marker is closest to
+    ``ts`` and crop ``box`` from it. Returns JPEG bytes or None if no suitable
+    frame is found."""
+    import cv2
+
+    from . import bitc
+    from .yolo_server import _crop_thumb
+
+    live_dir = (video_dir / "live" / source_id).resolve()
+    try:
+        live_dir.relative_to(video_dir.resolve())
+    except ValueError:
+        return None
+    if not live_dir.is_dir():
+        return None
+
+    # Fragments are named seg_<unix_ts>.ts (start time of the fragment).
+    # The live segmenter cuts ~2s fragments, so a fragment whose start time
+    # is within a couple seconds of `ts` is the only plausible candidate.
+    candidates: list[Path] = []
+    for p in live_dir.glob("seg_*.ts"):
+        try:
+            seg_start = int(p.stem.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if seg_start - 1 <= ts <= seg_start + 4:
+            candidates.append(p)
+    if not candidates:
+        return None
+
+    # Newest few first, in case of duplicates/overlap.
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    best_frame = None
+    best_diff = max_drift
+    for p in candidates[:4]:
+        cap = cv2.VideoCapture(str(p))
+        if not cap.isOpened():
+            cap.release()
+            continue
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                marker, crc_ok = bitc.decode(frame)
+                if not crc_ok or marker is None:
+                    continue
+                diff = abs(marker - ts)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_frame = frame
+                    if diff < 0.02:
+                        break
+        finally:
+            cap.release()
+        if best_frame is not None and best_diff < 0.02:
+            break
+
+    if best_frame is None:
+        return None
+
+    bitc.mask(best_frame)
+    cls = str(box.get("cls") or "")
+    return _crop_thumb(best_frame, [box], cls)
+
 
 def make_app(
     config: AppConfig,
@@ -509,6 +600,40 @@ def make_app(
             return Response(status_code=404)
         return Response(content=data, media_type="image/jpeg",
                         headers={"Cache-Control": _IMG_CACHE})
+
+    async def api_video_live_thumb(request: Request) -> Response:
+        """Crop a thumbnail for a provisional (open-segment) event from the
+        live HLS .ts fragments, using the burned-in BITC timecode to find the
+        frame closest to the event's time."""
+        if not video_dir:
+            return Response(status_code=404)
+        source_id = request.query_params.get("source") or ""
+        if not source_id or ".." in source_id or "/" in source_id:
+            return Response(status_code=400)
+        try:
+            ts = float(request.query_params["ts"])
+            x1 = float(request.query_params["x1"])
+            y1 = float(request.query_params["y1"])
+            x2 = float(request.query_params["x2"])
+            y2 = float(request.query_params["y2"])
+        except (KeyError, ValueError):
+            return Response(status_code=400)
+
+        cache_key = (source_id, round(ts, 2), round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4))
+        cached = _live_thumb_cache_get(cache_key)
+        if cached is not None:
+            if not cached:
+                return Response(status_code=404)
+            return Response(content=cached, media_type="image/jpeg",
+                            headers={"Cache-Control": "no-store"})
+
+        box = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": 1.0}
+        data = await asyncio.to_thread(_extract_live_thumb, video_dir, source_id, ts, box)
+        _live_thumb_cache_put(cache_key, data)
+        if not data:
+            return Response(status_code=404)
+        return Response(content=data, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
 
     async def api_video_segment_at(request: Request) -> JSONResponse:
         """Fast single-segment lookup by timestamp — for instant URL-based seek."""
@@ -1480,6 +1605,7 @@ def make_app(
         Route("/api/thumb",                 api_thumb),
         Route("/api/video/event-thumb/{event_id}", api_video_event_thumb),
         Route("/api/video/hls-thumb/{hls_id}", api_video_hls_thumb),
+        Route("/api/video/live-thumb",      api_video_live_thumb),
         Route("/api/video/segment-at",      api_video_segment_at),
         Route("/api/video/resolve",         api_video_resolve),
         Route("/api/video2/timeline",       api_video2_timeline),

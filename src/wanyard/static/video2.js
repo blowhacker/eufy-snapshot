@@ -2141,6 +2141,26 @@ function bucketLabel(start) {
   return `${eventLocalTime(start).slice(0, 5)} - ${eventLocalTime(end).slice(0, 5)}`;
 }
 
+function _liveThumbSrc(evt) {
+  let boxes;
+  try {
+    boxes = JSON.parse(evt.boxes_json || "[]");
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(boxes) || !boxes.length) return null;
+  const box = boxes.find(b => b && b.cls === evt.class) || boxes[0];
+  if (!box) return null;
+  const { x1, y1, x2, y2 } = box;
+  if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
+  const params = new URLSearchParams({
+    source: evt.source_id,
+    ts: String(evt.abs_ts),
+    x1: String(x1), y1: String(y1), x2: String(x2), y2: String(y2),
+  });
+  return `/api/video/live-thumb?${params.toString()}`;
+}
+
 function _makeThumbNode(evt, baseTs) {
   const btn = document.createElement("button");
   btn.type = "button";
@@ -2158,9 +2178,24 @@ function _makeThumbNode(evt, baseTs) {
   thumb.className = "ev-thumb";
   let media;
   if (evt.provisional && !evt.hls_id) {
-    media = document.createElement("div");
-    media.className = "ev-thumb-live";
-    media.textContent = "LIVE";
+    const liveSrc = _liveThumbSrc(evt);
+    if (liveSrc) {
+      media = document.createElement("img");
+      media.loading = "lazy";
+      media.alt = "";
+      media.src = liveSrc;
+      media.onerror = () => {
+        const fallback = document.createElement("div");
+        fallback.className = "ev-thumb-live";
+        fallback.textContent = "LIVE";
+        media.replaceWith(fallback);
+        media = fallback;
+      };
+    } else {
+      media = document.createElement("div");
+      media.className = "ev-thumb-live";
+      media.textContent = "LIVE";
+    }
   } else {
     media = document.createElement("img");
     media.loading = "lazy";
