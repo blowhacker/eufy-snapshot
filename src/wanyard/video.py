@@ -1980,6 +1980,11 @@ def _yolo_tag_video(
 
     cap = cv2.VideoCapture(str(seg_path))
     if not cap.isOpened():
+        # Sealed MP4 that won't decode (corrupt/zero-frame) won't improve on
+        # retry — mark it scanned so backfill doesn't re-pick it every loop
+        # forever (it kept scanned_at NULL → tight spin). media_epoch-None
+        # bails above stay unmarked: those may anchor later.
+        db.mark_scanned(seg_id)
         return 0
 
     fps        = cap.get(cv2.CAP_PROP_FPS) or 25.0
