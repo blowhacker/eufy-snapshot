@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import json
 import tempfile
 import types
 import unittest
@@ -298,6 +299,50 @@ class VideoBitcAnchorTests(unittest.TestCase):
             [d["abs_ts"] for d in status["recent_detections"]],
             [base + 20.0],
         )
+
+    def test_provisional_event_id_resolves_for_thumbnail_crop(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wanyard-provisional-event-") as tmp:
+            db = VideoSegmentDB(Path(tmp) / "video.sqlite")
+            base = 1_781_700_000.0
+            segment_id = db.open_segment("front", "front/live.mp4", base)
+            db.set_segment_media_start(segment_id, base)
+            box = {
+                "cls": "person",
+                "conf": 0.8,
+                "x1": 0.1,
+                "y1": 0.2,
+                "x2": 0.3,
+                "y2": 0.5,
+            }
+            db.insert_live_detections(segment_id, "front", [
+                {
+                    "abs_ts": base + 2.0,
+                    "has_human": True,
+                    "confidence": 0.8,
+                    "boxes": [box],
+                    "classes": ["person"],
+                },
+                {
+                    "abs_ts": base + 2.5,
+                    "has_human": True,
+                    "confidence": 0.82,
+                    "boxes": [{**box, "conf": 0.82}],
+                    "classes": ["person"],
+                },
+            ])
+
+            events = db.provisional_events("front")
+            event = next(e for e in events if e["class"] == "person")
+            resolved = db.get_event_with_segment(event["id"])
+
+        assert resolved is not None
+        self.assertEqual(resolved["id"], event["id"])
+        self.assertEqual(resolved["seg_path"], "front/live.mp4")
+        self.assertEqual(resolved["seg_media_epoch"], base)
+        self.assertEqual(resolved["seg_end_ts"], None)
+        self.assertEqual(round(resolved["abs_ts"], 1), base + 2.0)
+        boxes = json.loads(resolved["boxes_json"])
+        self.assertEqual(boxes[0]["cls"], "person")
 
     def test_segment_media_start_is_exact_assignment(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wanyard-video-db-") as tmp:

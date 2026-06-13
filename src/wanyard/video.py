@@ -1414,6 +1414,36 @@ class VideoSegmentDB:
                 ).fetchone()
             return _worldize_event_row(dict(row)) if row else None
 
+        if raw_id.startswith("p:"):
+            try:
+                _prefix, segment_id_raw, cls, start_off_raw = raw_id.split(":", 3)
+                segment_id = int(segment_id_raw)
+                start_off = float(start_off_raw)
+            except ValueError:
+                return None
+            with self._connect() as conn:
+                seg_row = conn.execute(
+                    "SELECT * FROM segments WHERE id=?",
+                    (segment_id,),
+                ).fetchone()
+            if not seg_row:
+                return None
+            seg = dict(seg_row)
+            now = time.time()
+            for row in self._provisional_tracklets_for_segment(seg, now):
+                if row.get("class") != cls:
+                    continue
+                if round(float(row.get("start_off", -1.0)), 1) != round(start_off, 1):
+                    continue
+                row["id"] = raw_id
+                row["provisional"] = True
+                row["seg_path"] = seg["path"]
+                row["spritesheet"] = seg.get("spritesheet")
+                row["seg_media_epoch"] = seg.get("media_epoch")
+                row["seg_end_ts"] = seg.get("end_ts")
+                return _worldize_event_row(row)
+            return None
+
         try:
             legacy_event_id = int(raw_id)
         except (TypeError, ValueError):

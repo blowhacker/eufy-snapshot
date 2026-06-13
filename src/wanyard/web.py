@@ -507,8 +507,6 @@ def make_app(
             seg_path.relative_to(video_dir.resolve())
         except ValueError:
             return Response(status_code=403)
-        if not seg_path.is_file():
-            return Response(status_code=404)
 
         t = max(0.0, float(evt["abs_ts"]) - float(evt["seg_media_epoch"]))
         try:
@@ -516,6 +514,30 @@ def make_app(
         except (TypeError, json.JSONDecodeError):
             boxes = []
         box = _select_event_box(boxes, evt.get("class", ""))
+
+        async def _try_live_thumb() -> Response | None:
+            if not evt.get("provisional") or not box:
+                return None
+            data = await asyncio.to_thread(
+                _extract_live_thumb, video_dir, evt["source_id"], float(evt["abs_ts"]), box)
+            if not data:
+                return None
+            return Response(content=data, media_type="image/jpeg",
+                            headers={"Cache-Control": "no-store"})
+
+        # Open MP4s are not finalized/readable yet, so use the live HLS fragment
+        # while it is still in the DVR window. Closed provisional segments should
+        # use their recorded MP4; their HLS fragments may already have rolled off.
+        if evt.get("provisional") and evt.get("seg_end_ts") is None:
+            live_response = await _try_live_thumb()
+            if live_response is not None:
+                return live_response
+
+        if not seg_path.is_file():
+            live_response = await _try_live_thumb()
+            if live_response is not None:
+                return live_response
+            return Response(status_code=404)
 
         cache_dir = seg_path.parent / ".thumbcache"
         safe_event_id = "".join(
@@ -526,6 +548,9 @@ def make_app(
         if not cache_file.exists():
             ok = await asyncio.to_thread(_extract_video_thumb, seg_path, cache_file, t, box)
             if not ok:
+                live_response = await _try_live_thumb()
+                if live_response is not None:
+                    return live_response
                 return Response(status_code=404)
 
         return FileResponse(cache_file, media_type="image/jpeg",
