@@ -3107,6 +3107,8 @@ class VideoWorker:
                         if self._proc.poll() is not None:
                             LOG.warning("ffmpeg exited early for %s", self.source.id)
                             break
+                        if self._seg_id and not getattr(self, "_anchor_set", False):
+                            self._observe_marker_anchor()
                         self._stop.wait(5)
                     elapsed = time.time() - ts
                     self._stop_segment(time.time())
@@ -3175,7 +3177,40 @@ class VideoWorker:
             self._seg_id = self.db.open_segment(self.source.id, rel_path, ts)
         except Exception:
             self._seg_id = None
+        self._anchor_set = False
         LOG.info("segment started: %s", rel_path)
+
+    def _observe_marker_anchor(self) -> None:
+        """Early open-segment anchor: decode the marker from the first live HLS
+        fragment and set media_epoch provisionally, so the detector stops
+        queueing rows for the whole open segment (the close-time decode from the
+        sealed MP4 later overwrites this with the exact frame-0 value).
+        """
+        seg_id = self._seg_id
+        seg_start = self._seg_start
+        if not seg_id or not seg_start:
+            return
+        try:
+            fragments = sorted(
+                (p for p in self._live_dir.glob("seg_*.ts")
+                 if p.stat().st_mtime >= seg_start - 1.0),
+                key=lambda p: p.stat().st_mtime,
+            )
+        except OSError:
+            return
+        if not fragments:
+            return
+        marker_ts = _decode_first_frame_marker(fragments[0])
+        if marker_ts is None:
+            return
+        try:
+            self.db.set_segment_media_start(seg_id, marker_ts)
+        except Exception:
+            LOG.exception("early anchor set failed for %s", self.source.id)
+            return
+        self._anchor_set = True
+        LOG.info("BITC-ANCHOR-EARLY seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
+                 seg_id, self.source.id, marker_ts, marker_ts - seg_start)
 
     def _stop_segment(self, ts: float) -> None:
         proc      = self._proc;     self._proc     = None
