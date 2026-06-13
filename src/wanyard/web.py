@@ -364,22 +364,19 @@ def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
     if not live_dir.is_dir():
         return None
 
-    # Fragments are named seg_<unix_ts>.ts (start time of the fragment).
-    # The live segmenter cuts ~2s fragments, so a fragment whose start time
-    # is within a couple seconds of `ts` is the only plausible candidate.
-    candidates: list[Path] = []
-    for p in live_dir.glob("seg_*.ts"):
-        try:
-            seg_start = int(p.stem.split("_", 1)[1])
-        except (IndexError, ValueError):
-            continue
-        if seg_start - 1 <= ts <= seg_start + 4:
-            candidates.append(p)
+    # Fragment filenames (seg_<n>.ts) are NOT reliable wall-clock timestamps —
+    # the BITC marker inside each ~2-3s fragment is the source of truth, and
+    # a fragment's mtime (written when the fragment closes) is roughly its
+    # *end* time. So pick fragments whose mtime is within a window around
+    # `ts` (the event could be anywhere in the fragment, up to ~3s before
+    # the mtime), newest first.
+    all_frags = sorted(live_dir.glob("seg_*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
+    candidates = [
+        p for p in all_frags
+        if ts - 1.0 <= p.stat().st_mtime <= ts + 8.0
+    ]
     if not candidates:
         return None
-
-    # Newest few first, in case of duplicates/overlap.
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     best_frame = None
     best_diff = max_drift
