@@ -218,21 +218,55 @@ class _SourceWorker:
                 self.source_id,
                 stream.time_base,
             )
-            for packet in container.demux(stream):
-                if self.stopped():
-                    break
-                if packet.pts is None:
-                    continue
-                rtp = float(packet.pts * stream.time_base)
-                for frame in packet.decode():
-                    wall = time.time()
-                    abs_ts = anchor.observe(rtp, wall)
-                    if abs_ts is None:
+            # Reader/worker split: this thread only demuxes, timestamps,
+            # decodes and parks the freshest frame — it must NEVER block on
+            # inference, or packets queue in the socket and the recorded
+            # arrival walls become a burst pattern of the drain instead of
+            # delivery (which breaks the recorder's jitter-pattern anchor
+            # alignment AND batches stale frames into YOLO).
+            latest_lock = threading.Lock()
+            latest: list = [None]   # [(frame, abs_ts, wall)] slot
+            reader_alive = threading.Event()
+            reader_alive.set()
+
+            def _infer_worker() -> None:
+                while reader_alive.is_set() and not self.stopped():
+                    with latest_lock:
+                        item, latest[0] = latest[0], None
+                    if item is None:
+                        time.sleep(0.02)
                         continue
-                    self._dump_frame_time(abs_ts, wall)
-                    self._maybe_infer(frame, abs_ts, wall, anchor)
-            if not self.stopped():
-                raise EOFError("rtsp stream ended")
+                    frame, f_abs, f_wall = item
+                    try:
+                        self._maybe_infer(frame, f_abs, f_wall, anchor)
+                    except Exception:
+                        LOG.exception("live detector %s inference error",
+                                      self.source_id)
+
+            worker = threading.Thread(
+                target=_infer_worker, daemon=True,
+                name=f"live-infer-{self.source_id}")
+            worker.start()
+            try:
+                for packet in container.demux(stream):
+                    if self.stopped():
+                        break
+                    if packet.pts is None:
+                        continue
+                    wall = time.time()
+                    rtp = float(packet.pts * stream.time_base)
+                    for frame in packet.decode():
+                        abs_ts = anchor.observe(rtp, wall)
+                        if abs_ts is None:
+                            continue
+                        self._dump_frame_time(abs_ts, wall)
+                        with latest_lock:
+                            latest[0] = (frame, abs_ts, wall)
+                if not self.stopped():
+                    raise EOFError("rtsp stream ended")
+            finally:
+                reader_alive.clear()
+                worker.join(timeout=5.0)
         finally:
             container.close()
 
