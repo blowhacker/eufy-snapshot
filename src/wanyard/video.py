@@ -3347,7 +3347,10 @@ class VideoWorker:
                 if pts:
                     det = _load_frame_times(
                         self._live_dir, seg_start - 10.0, ts + 10.0)
-                    aligned = _align_media_epoch(pts, det, seg_start)
+                    seg_row = self.db.get_segment(seg_id) or {}
+                    aligned = _align_media_epoch(
+                        pts, det, seg_start,
+                        arrival_prior=seg_row.get("media_epoch"))
                 if aligned:
                     self.db.set_media_epoch_absolute(seg_id, aligned["epoch"])
                     LOG.info(
@@ -3430,7 +3433,8 @@ def _load_frame_times(live_dir: Path, lo: float, hi: float) -> list[tuple[float,
 
 
 def _align_media_epoch(pts: list[float], det: list[tuple[float, float]],
-                       seg_start: float) -> dict | None:
+                       seg_start: float,
+                       arrival_prior: float | None = None) -> dict | None:
     """Anchor media_epoch from the detector clock by jitter-pattern pairing.
 
     The MP4's video pts are wallclock arrival times (recorder axis); the
@@ -3482,9 +3486,20 @@ def _align_media_epoch(pts: list[float], det: list[tuple[float, float]],
         good = sum(1 for r in res if abs(r - med) <= 0.010)
         return good, med
 
+    # On a low-jitter CFR stream every lattice shift k gives equally tight
+    # residuals — tightness alone cannot pick k. Disambiguate with the
+    # arrival prior: PDT(f0) is the recorder's arrival claim for pts[0], and
+    # arrivals are common-mode across consumers to ~0.2 ms, so the true k's
+    # wall-vs-pts base must sit within half a frame interval of
+    # (PDT(f0) − pts[0]). PDT steadiness (±30 ms measured) picks the integer
+    # slot; the detector clock then supplies the fine epoch.
+    avg = avg_gap
+    base_prior = (arrival_prior - pts[0]) if arrival_prior is not None else None
     best_k, best_good = None, 0
     for k in range(max(0, k0 - window), min(len(pts) - 400, k0 + window) + 1):
-        good, _ = pair_score(k)
+        good, med = pair_score(k)
+        if base_prior is not None and abs(med - base_prior) > avg * 0.5:
+            continue
         if good > best_good:
             best_good, best_k = good, k
     if best_k is None or best_good < min(len(probe), len(pts) - best_k) * 0.7:
