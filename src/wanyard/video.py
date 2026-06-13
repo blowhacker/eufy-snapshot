@@ -385,6 +385,14 @@ class VideoSegmentDB:
                 (end_ts, duration, spritesheet, webvtt, segment_id),
             )
 
+    def set_media_epoch_absolute(self, segment_id: int, epoch: float) -> None:
+        """Overwrite media_epoch with a detector-aligned absolute value."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE segments SET media_epoch=? WHERE id=?",
+                (float(epoch), segment_id),
+            )
+
     def correct_media_epoch_axis(self, segment_id: int, video_start_time: float) -> None:
         """Shift media_epoch from first-video-frame time to container-time-zero.
 
@@ -3223,9 +3231,10 @@ class VideoWorker:
 
         if not candidates:
             return
-        LOG.info("ANCHOR-PDT seg=%d src=%s n=%d min=%.3f max=%.3f",
-                 seg_id, self.source.id, len(candidates),
-                 min(candidates), max(candidates))
+        if segment_id is not None:   # close-time call only; run-loop polls stay quiet
+            LOG.info("ANCHOR-PDT seg=%d src=%s n=%d min=%.3f max=%.3f",
+                     seg_id, self.source.id, len(candidates),
+                     min(candidates), max(candidates))
         try:
             self.db.set_segment_media_start(seg_id, min(candidates))
         except Exception:
@@ -3333,12 +3342,35 @@ class VideoWorker:
         self._seg_start = 0.0
         if seg_id:
             if seg_path:
+                aligned = None
+                pts = _probe_video_pts(seg_path)
+                if pts:
+                    det = _load_frame_times(
+                        self._live_dir, seg_start - 10.0, ts + 10.0)
+                    aligned = _align_media_epoch(pts, det, seg_start)
+                if aligned:
+                    self.db.set_media_epoch_absolute(seg_id, aligned["epoch"])
+                    LOG.info(
+                        "ANCHOR-ALIGN seg=%d src=%s epoch=%.3f (start_ts%+.3f)"
+                        " matched=%d/%d spread_ms=%.0f",
+                        seg_id, self.source.id, aligned["epoch"],
+                        aligned["epoch"] - seg_start,
+                        aligned["matched"], aligned["n_pts"],
+                        aligned["spread_ms"],
+                    )
+                else:
+                    LOG.warning(
+                        "ANCHOR-ALIGN seg=%d src=%s FALLBACK (detector frame"
+                        " times unusable) — using PDT - v_start formula",
+                        seg_id, self.source.id,
+                    )
                 times = _probe_container_times(seg_path)
                 if times is None:
                     LOG.warning("media_epoch axis: start_time probe failed for %s"
                                 " — anchor keeps first-video-frame bias", seg_path)
                 else:
-                    self.db.correct_media_epoch_axis(seg_id, times["v_start"])
+                    if not aligned:
+                        self.db.correct_media_epoch_axis(seg_id, times["v_start"])
                     try:
                         seg = self.db.get_segment(seg_id) or {}
                         epoch_post = seg.get("media_epoch")
@@ -3355,6 +3387,110 @@ class VideoWorker:
                     except Exception:
                         LOG.exception("ANCHOR-AUDIT logging failed")
             self.db.close_segment(seg_id, ts, None, None)
+
+
+def _probe_video_pts(path: Path | str) -> list[float] | None:
+    """All video packet pts (container seconds, ascending) of an MP4."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_packets", "-show_entries", "packet=pts_time",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if out.returncode != 0:
+            return None
+        pts = sorted(float(v) for v in out.stdout.split() if v and v != "N/A")
+        return pts or None
+    except Exception:
+        return None
+
+
+def _load_frame_times(live_dir: Path, lo: float, hi: float) -> list[float]:
+    """Detector-published honest frame world-times within [lo, hi]."""
+    times: list[float] = []
+    for name in ("frametimes.jsonl.1", "frametimes.jsonl"):
+        p = live_dir / name
+        try:
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        t = float(line)
+                    except ValueError:
+                        continue
+                    if lo <= t <= hi:
+                        times.append(t)
+        except OSError:
+            continue
+    times.sort()
+    return times
+
+
+def _align_media_epoch(pts: list[float], det: list[float],
+                       seg_start: float) -> dict | None:
+    """Anchor media_epoch from the detector clock by sequence alignment.
+
+    The MP4's video pts and the detector's frame world-times tick with the
+    same camera pacing (identical relay frames). Find the offset E that maps
+    pts onto detector times: coarse grid for the best match count, then the
+    median matched residual as the refined epoch. Per-frame arrival jitter is
+    one-sided and dies in the median; no recorder clock is involved.
+
+    Returns {epoch, matched, n_pts, spread_ms} or None if the alignment is
+    not trustworthy (detector down / too few matches).
+    """
+    if len(pts) < 600 or len(det) < 600:
+        return None
+
+    def symbols(seq: list[float]) -> list[int]:
+        # VFR gap pattern: Short (~50 ms) vs Long (~100 ms) inter-frame gaps.
+        return [1 if b - a > 0.075 else 0 for a, b in zip(seq, seq[1:])]
+
+    # Longest contiguous detector run (no reconnect gap) overlapping the file.
+    runs: list[list[float]] = [[det[0]]]
+    for a, b in zip(det, det[1:]):
+        if b - a > 1.5:
+            runs.append([])
+        runs[-1].append(b)
+    run = max(runs, key=len)
+    if len(run) < 600:
+        return None
+
+    s_pts = symbols(pts)
+    s_det = symbols(run)
+    # The detector file is loaded with ~10 s slack either side of the segment;
+    # the run's first ~200 frames may predate the file. Start the probe past
+    # that slack so every probe symbol has a counterpart in the file.
+    j0 = min(300, max(0, len(run) - 600))
+    probe = s_det[j0:j0 + 2000]
+    probe_len = len(probe)
+    if probe_len < 400:
+        return None
+    # A near-CFR stream has no discriminating pattern — any offset would
+    # "align". Require real symbol diversity before trusting a match.
+    long_frac = sum(probe) / probe_len
+    if not 0.05 <= long_frac <= 0.95:
+        return None
+    # Index prior from the time prior (epoch ≈ seg_start ± a few s).
+    avg_gap = (pts[-1] - pts[0]) / max(1, len(pts) - 1)
+    k0 = int((run[j0] - seg_start - pts[0]) / avg_gap)
+    window = 400   # frames ≈ ±20 s; generous vs the ±3 s real uncertainty
+    best_k, best_score = None, -1
+    for k in range(max(0, k0 - window), min(len(s_pts) - probe_len, k0 + window) + 1):
+        score = sum(1 for x, y in zip(s_pts[k:k + probe_len], probe) if x == y)
+        if score > best_score:
+            best_score, best_k = score, k
+    if best_k is None or best_score < probe_len * 0.62:
+        return None
+
+    # Paired differences over the full overlap; median kills per-frame jitter.
+    diffs = sorted(d - p for p, d in zip(pts[best_k:], run[j0:]))
+    epoch = diffs[len(diffs) // 2]
+    spread = (diffs[int(len(diffs) * 0.9)] - diffs[int(len(diffs) * 0.1)]) * 1000.0
+    if spread > 250.0 or abs(epoch - seg_start) > 8.0:
+        return None
+    return {"epoch": epoch, "matched": len(diffs),
+            "n_pts": len(pts), "spread_ms": spread}
 
 
 def _probe_container_times(path: Path | str) -> dict | None:

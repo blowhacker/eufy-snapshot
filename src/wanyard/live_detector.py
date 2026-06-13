@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+from pathlib import Path
 import threading
 import time
 import urllib.request
@@ -154,6 +155,11 @@ class _SourceWorker:
         self.open_segment_id: int | None = None
         self.next_infer_wall = 0.0
         self.last_stale_log_wall = 0.0
+        # Honest per-frame world times, shared with the recorder for segment
+        # anchoring (see video.py _align_media_epoch). Ring of two files.
+        video_dir = Path(os.environ.get("VIDEO_DIR", "video"))
+        self._ft_path = video_dir / "live" / source_id / "frametimes.jsonl"
+        self._ft_buf: list[float] = []
         self.thread = threading.Thread(
             target=self.run,
             daemon=True,
@@ -223,11 +229,33 @@ class _SourceWorker:
                     abs_ts = anchor.observe(rtp, wall)
                     if abs_ts is None:
                         continue
+                    self._dump_frame_time(abs_ts)
                     self._maybe_infer(frame, abs_ts, wall, anchor)
             if not self.stopped():
                 raise EOFError("rtsp stream ended")
         finally:
             container.close()
+
+    def _dump_frame_time(self, abs_ts: float) -> None:
+        """Append honest frame world-times to the shared ring file.
+
+        The recorder aligns its MP4 pts sequence against these at segment
+        close to derive media_epoch from the detector clock instead of the
+        recorder's own (wobbly) wallclock/AAC-pts witnesses. Open/append/close
+        per flush — no held fds (gotcha #7 discipline).
+        """
+        self._ft_buf.append(abs_ts)
+        if len(self._ft_buf) < 100:
+            return
+        buf, self._ft_buf = self._ft_buf, []
+        try:
+            self._ft_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._ft_path, "a", encoding="utf-8") as f:
+                f.write("".join(f"{t:.6f}\n" for t in buf))
+            if self._ft_path.stat().st_size > 3_000_000:   # ~2h per generation
+                os.replace(self._ft_path, self._ft_path.with_suffix(".jsonl.1"))
+        except OSError:
+            LOG.exception("live detector %s frametimes dump failed", self.source_id)
 
     def _maybe_infer(self, frame, abs_ts: float, wall: float,
                      anchor: _TimeAnchor) -> None:
