@@ -3486,24 +3486,34 @@ def _align_media_epoch(pts: list[float], det: list[tuple[float, float]],
         good = sum(1 for r in res if abs(r - med) <= 0.010)
         return good, med
 
-    # On a low-jitter CFR stream every lattice shift k gives equally tight
-    # residuals — tightness alone cannot pick k. Disambiguate with the
-    # arrival prior: PDT(f0) is the recorder's arrival claim for pts[0], and
-    # arrivals are common-mode across consumers to ~0.2 ms, so the true k's
-    # wall-vs-pts base must sit within half a frame interval of
-    # (PDT(f0) − pts[0]). PDT steadiness (±30 ms measured) picks the integer
-    # slot; the detector clock then supplies the fine epoch.
-    avg = avg_gap
-    base_prior = (arrival_prior - pts[0]) if arrival_prior is not None else None
-    best_k, best_good = None, 0
+    # Score every slot on the jitter/drop pattern first. Real streams carry
+    # enough natural irregularity that the true slot scores ~100% with clear
+    # margin (measured: 1998/2000 vs 1906 runner-up). The PDT arrival prior
+    # is only a TIE-BREAKER for genuinely ambiguous (pure-CFR) cases — it can
+    # be ~0.5 s late, so it must never veto a decisive pattern match.
+    cands: list[tuple[int, int, float]] = []
     for k in range(max(0, k0 - window), min(len(pts) - 400, k0 + window) + 1):
         good, med = pair_score(k)
-        if base_prior is not None and abs(med - base_prior) > avg * 0.5:
-            continue
-        if good > best_good:
-            best_good, best_k = good, k
-    if best_k is None or best_good < min(len(probe), len(pts) - best_k) * 0.7:
+        cands.append((good, k, med))
+    if not cands:
         return None
+    cands.sort(reverse=True)
+    best_good = cands[0][0]
+    if best_good < min(len(probe), len(pts) - cands[0][1]) * 0.7:
+        return None
+    margin = max(10, int(len(probe) * 0.02))
+    tied = [c for c in cands if c[0] >= best_good - margin]
+    if len(tied) == 1:
+        best_k = tied[0][1]
+    else:
+        # Pattern ambiguous: let the prior pick among the tied slots only.
+        if arrival_prior is None:
+            return None
+        base_prior = arrival_prior - pts[0]
+        near = [c for c in tied if abs(c[2] - base_prior) <= avg_gap * 0.5]
+        if not near:
+            return None
+        best_k = max(near)[1]
 
     # Epoch from the honest abs column over the full aligned overlap.
     n = min(len(run) - j0, len(pts) - best_k)
