@@ -607,11 +607,9 @@ def run(video_db_path: Path, video_dir: Path):
     backfill_thread.start()
 
     # B4: the live detector (relay, subsecond) is now the authoritative live
-    # pass. The old HLS-tag loop (YOLO on .ts fragments) is gone — it was the
-    # second of the double-YOLO. Backfill stays gap-filler-only (scanned_at
-    # IS NULL); the recorder still sets open-segment media_epoch via its own
-    # 5s _observe_live_anchor poll (the tag loop's observe_frame_time was
-    # redundant).
+    # pass. The old HLS-tag loop (YOLO on .ts fragments) is gone; backfill stays
+    # gap-filler-only (scanned_at IS NULL). The recorder anchors closed archive
+    # segments from their burned-in frame-0 marker.
 
     live_detector_thread = None
     if os.environ.get("WANYARD_LIVE_DETECTOR", "") == "1":

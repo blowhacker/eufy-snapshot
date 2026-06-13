@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
+from . import bitc
+
 LOG = logging.getLogger(__name__)
 
 _MAX_SEGMENT_SECONDS = 600
@@ -385,48 +387,12 @@ class VideoSegmentDB:
                 (end_ts, duration, spritesheet, webvtt, segment_id),
             )
 
-    def set_media_epoch_absolute(self, segment_id: int, epoch: float) -> None:
-        """Overwrite media_epoch with a detector-aligned absolute value."""
+    def set_segment_media_start(self, segment_id: int, media_epoch: float) -> None:
+        """Attach the marker-derived world-time anchor for one segment."""
         with self._connect() as conn:
             conn.execute(
                 "UPDATE segments SET media_epoch=? WHERE id=?",
-                (float(epoch), segment_id),
-            )
-
-    def correct_media_epoch_axis(self, segment_id: int, video_start_time: float) -> None:
-        """Shift media_epoch from first-video-frame time to container-time-zero.
-
-        The anchor's definition is "world time of media offset 0", but it is
-        observed from the first video frame (HLS PDT). The MP4's video stream
-        starts at container time `start_time` (> 0 when audio packets preroll
-        before the first keyframe), so the player's currentTime axis is shifted
-        by that amount — overlay boxes lead the subject by exactly start_time.
-        Called once at segment close with the probed start_time.
-        """
-        if not video_start_time or video_start_time <= 0:
-            return
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE segments SET media_epoch = media_epoch - ?"
-                " WHERE id=? AND media_epoch IS NOT NULL",
-                (float(video_start_time), segment_id),
-            )
-
-    def set_segment_media_start(self, segment_id: int, media_epoch: float) -> None:
-        """Attach the world-time anchor for media offset 0 of one segment.
-
-        Keeps the earliest observed frame time: the anchor is frame 0, and later
-        observations can only confirm or push it earlier, never later.
-        """
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE segments"
-                " SET media_epoch = CASE"
-                "   WHEN media_epoch IS NULL THEN ?"
-                "   ELSE MIN(media_epoch, ?)"
-                " END"
-                " WHERE id=?",
-                (media_epoch, media_epoch, segment_id),
+                (float(media_epoch), segment_id),
             )
 
     def mark_scanned(self, segment_id: int, scanned_at: float | None = None) -> None:
@@ -1829,27 +1795,6 @@ class VideoSegmentDB:
         with self._connect() as conn:
             conn.execute("DELETE FROM hls_events WHERE abs_ts<?", (cutoff,))
 
-    def observe_frame_time(self, source_id: str, abs_ts: float) -> None:
-        """Fallback anchor capture from live HLS PDT for the current open segment."""
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT id FROM segments"
-                " WHERE source_id=? AND end_ts IS NULL AND start_ts<=?"
-                " ORDER BY start_ts DESC LIMIT 1",
-                (source_id, abs_ts),
-            ).fetchone()
-            if not row:
-                return
-            conn.execute(
-                "UPDATE segments"
-                " SET media_epoch = CASE"
-                "   WHEN media_epoch IS NULL THEN ?"
-                "   ELSE MIN(media_epoch, ?)"
-                " END"
-                " WHERE id=?",
-                (abs_ts, abs_ts, row["id"]),
-            )
-
     def live_status(self, source_id: str | None = None, zone_id=None) -> dict:
         with self._connect() as conn:
             where, params = [
@@ -3145,68 +3090,6 @@ class VideoWorker:
                 except OSError:
                     pass
 
-    def _parse_live_pdt(self, raw: str) -> float | None:
-        value = raw.strip()
-        if value.endswith("Z"):
-            value = value[:-1] + "+00:00"
-        if len(value) >= 5 and value[-5] in "+-" and value[-3] != ":":
-            value = value[:-2] + ":" + value[-2:]
-        try:
-            return datetime.fromisoformat(value).timestamp()
-        except ValueError:
-            return None
-
-    def _observe_live_anchor(
-        self,
-        segment_id: int | None = None,
-        segment_start: float | None = None,
-    ) -> None:
-        """Bind one MP4 segment to the first HLS PDT from this ffmpeg run."""
-        seg_id = self._seg_id if segment_id is None else segment_id
-        seg_start = self._seg_start if segment_start is None else segment_start
-        if not seg_id or not seg_start:
-            return
-        playlist = self._live_dir / "live.m3u8"
-        try:
-            if playlist.stat().st_mtime < seg_start:
-                return
-            lines = playlist.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return
-
-        pending_start: float | None = None
-        candidates: list[float] = []
-        for raw in lines:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
-                pending_start = self._parse_live_pdt(line.split(":", 1)[1])
-                continue
-            if line.startswith("#") or pending_start is None:
-                continue
-            media_file = self._live_dir / Path(line.split("?", 1)[0]).name
-            try:
-                if media_file.stat().st_mtime < seg_start:
-                    pending_start = None
-                    continue
-            except OSError:
-                pending_start = None
-                continue
-            candidates.append(pending_start)
-            pending_start = None
-
-        if not candidates:
-            return
-        if segment_id is not None:   # close-time call only; run-loop polls stay quiet
-            LOG.info("ANCHOR-PDT seg=%d src=%s n=%d min=%.3f max=%.3f",
-                     seg_id, self.source.id, len(candidates),
-                     min(candidates), max(candidates))
-        try:
-            self.db.set_segment_media_start(seg_id, min(candidates))
-        except Exception:
-            LOG.exception("failed to set media_epoch for segment %s", seg_id)
-
     def run(self) -> None:
         """Continuous recording loop — call from a daemon thread."""
         LOG.info("continuous recording started: %s", self.source.id)
@@ -3222,7 +3105,6 @@ class VideoWorker:
                         if self._proc.poll() is not None:
                             LOG.warning("ffmpeg exited early for %s", self.source.id)
                             break
-                        self._observe_live_anchor()
                         self._stop.wait(5)
                     elapsed = time.time() - ts
                     self._stop_segment(time.time())
@@ -3303,231 +3185,46 @@ class VideoWorker:
                 proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
             except Exception:
                 proc.kill()
-        if seg_id:
-            self._observe_live_anchor(seg_id, seg_start)
         self._seg_id = None
         self._seg_start = 0.0
         if seg_id:
             if seg_path:
-                aligned = None
-                pts = _probe_video_pts(seg_path)
-                if pts:
-                    det = _load_frame_times(
-                        self._live_dir, seg_start - 10.0, ts + 10.0)
-                    seg_row = self.db.get_segment(seg_id) or {}
-                    aligned = _align_media_epoch(
-                        pts, det, seg_start,
-                        arrival_prior=seg_row.get("media_epoch"))
-                if aligned:
-                    self.db.set_media_epoch_absolute(seg_id, aligned["epoch"])
+                marker_ts = _decode_first_frame_marker(seg_path)
+                if marker_ts is not None:
+                    self.db.set_segment_media_start(seg_id, marker_ts)
                     LOG.info(
-                        "ANCHOR-ALIGN seg=%d src=%s epoch=%.3f (start_ts%+.3f)"
-                        " matched=%d/%d spread_ms=%.0f",
-                        seg_id, self.source.id, aligned["epoch"],
-                        aligned["epoch"] - seg_start,
-                        aligned["matched"], aligned["n_pts"],
-                        aligned["spread_ms"],
+                        "BITC-ANCHOR seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
+                        seg_id, self.source.id, marker_ts, marker_ts - seg_start,
                     )
                 else:
                     LOG.warning(
-                        "ANCHOR-ALIGN seg=%d src=%s FALLBACK (detector frame"
-                        " times unusable) — using PDT - v_start formula",
+                        "BITC-ANCHOR seg=%d src=%s no readable frame-0 marker; "
+                        "leaving media_epoch NULL",
                         seg_id, self.source.id,
                     )
-                times = _probe_container_times(seg_path)
-                if times is None:
-                    LOG.warning("media_epoch axis: start_time probe failed for %s"
-                                " — anchor keeps first-video-frame bias", seg_path)
-                else:
-                    if not aligned:
-                        self.db.correct_media_epoch_axis(seg_id, times["v_start"])
-                    try:
-                        seg = self.db.get_segment(seg_id) or {}
-                        epoch_post = seg.get("media_epoch")
-                        LOG.info(
-                            "ANCHOR-AUDIT seg=%d src=%s start_ts=%.3f"
-                            " epoch_pre=%s epoch_post=%s v_start=%.3f a_start=%s"
-                            " fmt_start=%s v_dur=%s wall_span=%.3f",
-                            seg_id, self.source.id, seg_start,
-                            f"{epoch_post + times['v_start']:.3f}" if epoch_post else "NULL",
-                            f"{epoch_post:.3f}" if epoch_post else "NULL",
-                            times["v_start"], times["a_start"],
-                            times["fmt_start"], times["v_dur"], ts - seg_start,
-                        )
-                    except Exception:
-                        LOG.exception("ANCHOR-AUDIT logging failed")
             self.db.close_segment(seg_id, ts, None, None)
 
 
-def _probe_video_pts(path: Path | str) -> list[float] | None:
-    """All video packet pts (container seconds, ascending) of an MP4."""
+def _decode_first_frame_marker(path: Path | str) -> float | None:
+    """Decode the BITC marker from the first video frame in a media file."""
     try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_packets", "-show_entries", "packet=pts_time",
-             "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=60,
-        )
-        if out.returncode != 0:
-            return None
-        pts = sorted(float(v) for v in out.stdout.split() if v and v != "N/A")
-        return pts or None
-    except Exception:
-        return None
+        import av
 
-
-def _load_frame_times(live_dir: Path, lo: float, hi: float) -> list[tuple[float, float]]:
-    """Detector-published (abs world time, arrival wall) pairs within [lo, hi]."""
-    times: list[tuple[float, float]] = []
-    for name in ("frametimes.jsonl.1", "frametimes.jsonl"):
-        p = live_dir / name
+        container = av.open(str(path))
         try:
-            with open(p, encoding="utf-8") as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) != 2:
-                        continue
-                    try:
-                        a, w = float(parts[0]), float(parts[1])
-                    except ValueError:
-                        continue
-                    if lo <= w <= hi:
-                        times.append((a, w))
-        except OSError:
-            continue
-    times.sort(key=lambda t: t[1])
-    return times
-
-
-def _align_media_epoch(pts: list[float], det: list[tuple[float, float]],
-                       seg_start: float,
-                       arrival_prior: float | None = None) -> dict | None:
-    """Anchor media_epoch from the detector clock by jitter-pattern pairing.
-
-    The MP4's video pts are wallclock arrival times (recorder axis); the
-    detector logs (abs world time, arrival wall) for the same relay frames.
-    Relay delivery jitter is common-mode across consumers (measured:
-    cross-consumer per-frame delay diff p99 = 0.2 ms, jitter sd ~85 ms), so
-    matching the jitter pattern pairs frames unambiguously even on a
-    perfect-CFR camera. The pairing is scored on the WALL column; the epoch
-    is the median of (abs − pts) over paired frames — mapping the player's
-    container axis directly onto detection world time, no recorder clock in
-    the chain.
-
-    Returns {epoch, matched, n_pts, spread_ms} or None when untrustworthy
-    (detector down, poor overlap, ambiguous pairing).
-    """
-    if len(pts) < 600 or len(det) < 600:
-        return None
-
-    # Longest contiguous detector run (no reconnect/re-anchor gap).
-    runs: list[list[tuple[float, float]]] = [[det[0]]]
-    for a, b in zip(det, det[1:]):
-        if b[1] - a[1] > 1.5:
-            runs.append([])
-        runs[-1].append(b)
-    run = max(runs, key=len)
-    if len(run) < 600:
-        return None
-
-    # Skip the loader's ~10 s slack: probe frames must exist in the file.
-    j0 = min(300, max(0, len(run) - 600))
-    probe = run[j0:j0 + 2000]
-    if len(probe) < 400:
-        return None
-
-    avg_gap = (pts[-1] - pts[0]) / max(1, len(pts) - 1)
-    k0 = int((probe[0][1] - seg_start - pts[0]) / avg_gap)
-    window = 400   # frames; generous vs the real ± few s prior uncertainty
-
-    def pair_score(k: int) -> tuple[int, float]:
-        # Try pairing probe[j] <-> pts[k+j]; under the right k the wall
-        # residuals are constant to ~ms (common-mode jitter), under a wrong
-        # k they wobble by the jitter sd. Score = frames within 10 ms of the
-        # median residual.
-        n = min(len(probe), len(pts) - k)
-        if n < 400:
-            return 0, 0.0
-        res = sorted(probe[j][1] - pts[k + j] for j in range(n))
-        med = res[len(res) // 2]
-        good = sum(1 for r in res if abs(r - med) <= 0.010)
-        return good, med
-
-    # Score every slot on the jitter/drop pattern first. Real streams carry
-    # enough natural irregularity that the true slot scores ~100% with clear
-    # margin (measured: 1998/2000 vs 1906 runner-up). The PDT arrival prior
-    # is only a TIE-BREAKER for genuinely ambiguous (pure-CFR) cases — it can
-    # be ~0.5 s late, so it must never veto a decisive pattern match.
-    cands: list[tuple[int, int, float]] = []
-    for k in range(max(0, k0 - window), min(len(pts) - 400, k0 + window) + 1):
-        good, med = pair_score(k)
-        cands.append((good, k, med))
-    if not cands:
-        return None
-    cands.sort(reverse=True)
-    best_good = cands[0][0]
-    if best_good < min(len(probe), len(pts) - cands[0][1]) * 0.7:
-        return None
-    margin = max(10, int(len(probe) * 0.02))
-    tied = [c for c in cands if c[0] >= best_good - margin]
-    if len(tied) == 1:
-        best_k = tied[0][1]
-    else:
-        # Pattern ambiguous: let the prior pick among the tied slots only.
-        if arrival_prior is None:
-            return None
-        base_prior = arrival_prior - pts[0]
-        near = [c for c in tied if abs(c[2] - base_prior) <= avg_gap * 0.5]
-        if not near:
-            return None
-        best_k = max(near)[1]
-
-    # Epoch from the honest abs column over the full aligned overlap.
-    n = min(len(run) - j0, len(pts) - best_k)
-    diffs = sorted(run[j0 + j][0] - pts[best_k + j] for j in range(n))
-    epoch = diffs[len(diffs) // 2]
-    spread = (diffs[int(len(diffs) * 0.9)] - diffs[int(len(diffs) * 0.1)]) * 1000.0
-    if spread > 250.0 or abs(epoch - seg_start) > 8.0:
-        return None
-    return {"epoch": epoch, "matched": n,
-            "n_pts": len(pts), "spread_ms": spread}
-
-
-def _probe_container_times(path: Path | str) -> dict | None:
-    """Container timing facts: format/video/audio start_time + video duration.
-
-    video start_time > 0 when audio packets preroll before the first keyframe;
-    the player's currentTime axis includes that preroll. Logged at segment
-    close (ANCHOR-AUDIT) to pin down which anchor input wobbles per session.
-    """
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error",
-             "-show_entries", "stream=codec_type,start_time,duration",
-             "-show_entries", "format=start_time",
-             "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=15,
-        )
-        if out.returncode != 0:
-            return None
-        data = json.loads(out.stdout)
-
-        def _f(v):
-            try:
-                return float(v)
-            except (TypeError, ValueError):
+            video_stream = next((s for s in container.streams if s.type == "video"), None)
+            if video_stream is None:
                 return None
-
-        res = {"fmt_start": _f(data.get("format", {}).get("start_time")),
-               "v_start": None, "a_start": None, "v_dur": None}
-        for s in data.get("streams", []):
-            if s.get("codec_type") == "video" and res["v_start"] is None:
-                res["v_start"] = _f(s.get("start_time"))
-                res["v_dur"] = _f(s.get("duration"))
-            elif s.get("codec_type") == "audio" and res["a_start"] is None:
-                res["a_start"] = _f(s.get("start_time"))
-        return res if res["v_start"] is not None else None
+            for packet in container.demux(video_stream):
+                for frame in packet.decode():
+                    frame_bgr = frame.to_ndarray(format="bgr24")
+                    marker_ts, crc_ok = bitc.decode(frame_bgr)
+                    return marker_ts if crc_ok and marker_ts is not None else None
+            return None
+        finally:
+            container.close()
     except Exception:
+        LOG.debug("failed to decode first-frame BITC marker from %s", path, exc_info=True)
         return None
 
 
