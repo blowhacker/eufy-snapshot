@@ -425,115 +425,6 @@ def _response_box(box: dict | None) -> dict | None:
     return {k: round(float(box[k]), 6) for k in keys if k in box}
 
 
-# ── HLS real-time tag loop ──────────────────────────────────────────────────────
-
-def _hls_tag_loop(model, video_db, video_dir: Path, stop_event: threading.Event, predict_lock):
-    """Tag incoming HLS .ts segments in near-real-time (<5s latency)."""
-    import cv2
-    from .video import _parse_results, _CCTV_CLASS_IDS, _CONF_THRESHOLD
-
-    LOG.info("HLS tag loop started")
-    seen: dict[str, set[str]] = {}   # source_id -> set of seen filenames
-
-    while not stop_event.is_set():
-        try:
-            live_root = video_dir / "live"
-            if not live_root.exists():
-                stop_event.wait(5)
-                continue
-
-            for source_dir in live_root.iterdir():
-                if not source_dir.is_dir():
-                    continue
-                source_id = source_dir.name
-                m3u8 = source_dir / "live.m3u8"
-                if not m3u8.exists():
-                    continue
-
-                segments = _parse_hls_segments(m3u8)
-                if not segments:
-                    continue
-
-                # Evict filenames no longer in the playlist from seen set
-                current = {fn for fn, _ in segments}
-                seen.setdefault(source_id, set())
-                seen[source_id] &= current
-
-                new_segs = [(fn, ts) for fn, ts in segments
-                            if fn not in seen[source_id]]
-
-                for filename, abs_ts in new_segs:
-                    if stop_event.is_set():
-                        break
-                    ts_path = source_dir / filename
-                    if not ts_path.exists():
-                        continue
-                    seen[source_id].add(filename)
-
-                    # Record first-frame time of the open MP4 segment if not yet known.
-                    # The earliest .ts abs_ts == camera-accurate first frame of MP4.
-                    try:
-                        video_db.observe_frame_time(source_id, abs_ts)
-                    except Exception:
-                        LOG.exception("observe_frame_time failed")
-
-                    # Sample 2 frames from the segment (0s and ~1s) → 1fps coverage
-                    cap = cv2.VideoCapture(str(ts_path))
-                    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-                    mid_frame_idx = max(1, int(round(fps)))   # ~1s into the segment
-                    frame_samples: list[tuple[float, "any"]] = []
-                    ret, frame0 = cap.read()
-                    if ret:
-                        frame_samples.append((abs_ts, frame0))
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame_idx)
-                        ret2, frame1 = cap.read()
-                        if ret2:
-                            ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-                            offset = (ts_ms / 1000.0) if ts_ms > 0 else 1.0
-                            frame_samples.append((abs_ts + offset, frame1))
-                    cap.release()
-                    if not frame_samples:
-                        continue
-
-                    for sample_abs_ts, frame in frame_samples:
-                        try:
-                            with predict_lock:
-                                results = model.predict(
-                                    frame, classes=_CCTV_CLASS_IDS,
-                                    conf=_CONF_THRESHOLD, verbose=False,
-                                )
-                            _, _, boxes = _parse_results(results)
-                            if not boxes:
-                                continue
-                            classes = list({b["cls"] for b in boxes})
-
-                            events = []
-                            for cls in classes:
-                                cls_boxes = [b for b in boxes if b["cls"] == cls]
-                                thumb_bytes = _crop_thumb(frame, cls_boxes, cls)
-                                events.append({
-                                    "source_id":  source_id,
-                                    "abs_ts":     sample_abs_ts,
-                                    "class":      cls,
-                                    "confidence": max((b["conf"] for b in cls_boxes), default=0.0),
-                                    "boxes_json": json.dumps(cls_boxes),
-                                    "thumb_jpeg": thumb_bytes,
-                                })
-                            video_db.insert_hls_events(events)
-                        except Exception:
-                            LOG.exception("HLS tag error: %s", filename)
-
-            # Prune stale hls_events older than 2h
-            video_db.prune_hls_events(max_age_seconds=7200)
-
-        except Exception:
-            LOG.exception("HLS tag loop error — continuing")
-
-        stop_event.wait(1)   # check for new segments every 1s
-
-    LOG.info("HLS tag loop stopped")
-
-
 # ── Backfill loop ──────────────────────────────────────────────────────────────
 
 def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event, predict_lock):
@@ -560,41 +451,16 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
                     break
                 seg = dict(row)
                 seg_path = video_dir / seg["path"]
-                media_start = seg.get("media_epoch")
-                duration = seg.get("duration_sec")
-                if duration is None:
-                    duration = float(seg["end_ts"]) - float(seg["start_ts"])
-                media_end = float(media_start) + max(0.0, float(duration))
 
-                # Check if HLS real-time tagging already covered this segment
-                hls_evts = video_db.get_hls_events(
-                    source_id=seg["source_id"],
-                    since=float(media_start),
-                    until=media_end,
-                )
-                if hls_evts:
-                    if seg_path.exists():
-                        n = _yolo_tag_video(
-                            model, seg_path, seg["id"], video_db, predict_lock
-                        )
-                        LOG.info("HLS events + MP4 YOLO (%d frames): %s",
-                                 n, seg["path"][-35:])
-                    else:
-                        video_db.mark_scanned(seg["id"])
-                    video_db.delete_hls_events(
-                        seg["source_id"], float(media_start), media_end
-                    )
-                    dets = video_db.detections_for_segment(seg["id"])
-                    n_evt = extract_events(seg, dets, video_db)
-                    if n_evt:
-                        LOG.info("extracted %d events: %s", n_evt, seg["path"][-35:])
-                    continue
-
+                # B4: backfill is gap-filler only (segments the live detector
+                # did not claim — scanned_at IS NULL). The old HLS-covered
+                # re-tag branch is gone with hls_events (that was the
+                # double-YOLO). Just YOLO the recorded MP4.
                 if seg_path.exists():
                     n = _yolo_tag_video(
                         model, seg_path, seg["id"], video_db, predict_lock
                     )
-                    LOG.info("tagged %d frames: %s", n, seg["path"][-35:])
+                    LOG.info("backfilled %d frames: %s", n, seg["path"][-35:])
                 else:
                     video_db.mark_scanned(seg["id"])
                 dets = video_db.detections_for_segment(seg["id"])
@@ -740,12 +606,12 @@ def run(video_db_path: Path, video_dir: Path):
     )
     backfill_thread.start()
 
-    hls_tag_thread = threading.Thread(
-        target=_hls_tag_loop,
-        args=(model, video_db, video_dir, stop_event, predict_lock),
-        daemon=True, name="hls-tag"
-    )
-    hls_tag_thread.start()
+    # B4: the live detector (relay, subsecond) is now the authoritative live
+    # pass. The old HLS-tag loop (YOLO on .ts fragments) is gone — it was the
+    # second of the double-YOLO. Backfill stays gap-filler-only (scanned_at
+    # IS NULL); the recorder still sets open-segment media_epoch via its own
+    # 5s _observe_live_anchor poll (the tag loop's observe_frame_time was
+    # redundant).
 
     live_detector_thread = None
     if os.environ.get("WANYARD_LIVE_DETECTOR", "") == "1":

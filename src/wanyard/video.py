@@ -546,13 +546,6 @@ class VideoSegmentDB:
                 " ORDER BY vd.abs_ts",
                 (source_id, since, until),
             ).fetchall()
-            hls_rows = conn.execute(
-                "SELECT source_id, abs_ts, class, confidence, boxes_json"
-                " FROM hls_events"
-                " WHERE source_id=? AND abs_ts>=? AND abs_ts<=?"
-                " ORDER BY abs_ts",
-                (source_id, since, until),
-            ).fetchall()
 
         detections = [{
             "segment_id":  r["segment_id"],
@@ -566,30 +559,6 @@ class VideoSegmentDB:
             "boxes":       json.loads(r["boxes_json"])   if r["boxes_json"]   else [],
             "classes":     json.loads(r["classes_json"]) if r["classes_json"] else [],
         } for r in rows]
-        by_frame: dict[tuple[str, float], dict] = {}
-        for r in hls_rows:
-            key = (r["source_id"], round(float(r["abs_ts"]), 2))
-            if key not in by_frame:
-                by_frame[key] = {
-                    "segment_id": None,
-                    "source_id": r["source_id"],
-                    "abs_ts": r["abs_ts"],
-                    "media_epoch": None,
-                    "ts_offset": None,
-                    "has_human": False,
-                    "confidence": 0.0,
-                    "boxes": [],
-                    "classes": [],
-                    "provisional": True,
-                }
-            det = by_frame[key]
-            boxes = json.loads(r["boxes_json"]) if r["boxes_json"] else []
-            det["boxes"].extend(boxes)
-            det["classes"].append(r["class"])
-            det["confidence"] = max(det["confidence"], r["confidence"])
-            if r["class"] == "person":
-                det["has_human"] = True
-        detections.extend(by_frame.values())
         detections.sort(key=lambda d: d["abs_ts"])
         return detections
 
@@ -1748,9 +1717,9 @@ class VideoSegmentDB:
                 _worldize_event_row(row)
                 events.append(row)
         events = _filter_with_polygons(events, polygons)
-        # Merge real-time HLS events (tagged within seconds of capture)
-        hls = self.get_hls_events(source_id=source_id, since=since, zone_id=zone_id)
-        events.extend(hls)
+        # B4: provisional events come from the live detector's video_detections
+        # (chained into tracklets above). The HLS-tag loop is gone, so there is
+        # no separate hls_events stream to merge.
         events.sort(key=lambda r: r["abs_ts"], reverse=True)
         return events
 
@@ -1926,45 +1895,34 @@ class VideoSegmentDB:
                 "classes": json.loads(r["classes_json"]) if r["classes_json"] else [],
             }
 
-        # Latest HLS real-time detections (primary source while MP4 is open)
-        hls_cutoff = time.time() - 30  # only last 30s of HLS events are "live"
+        # B4: live overlay boxes now come from the live detector's
+        # video_detections (subsecond, relay-fed) instead of the retired
+        # HLS-tag stream. Each row is already one frame with all its boxes, so
+        # no per-class merge is needed. Return ALL recent frames so the client
+        # can pick the detection matching the displayed video time (the HLS
+        # video player still buffers several seconds behind the live edge).
+        det_cutoff = time.time() - 30  # last 30s counts as "live"
         with self._connect() as conn:
-            hls_where = ["abs_ts >= ?"]
-            hls_params: list = [hls_cutoff]
+            rec_where = ["d.abs_ts >= ?"]
+            rec_params: list = [det_cutoff]
             if source_id and source_id != "all":
-                hls_where.append("source_id=?"); hls_params.append(source_id)
-            hls_rows = conn.execute(
-                f"SELECT source_id, abs_ts, class, confidence, boxes_json"
-                f" FROM hls_events WHERE {' AND '.join(hls_where)}"
-                " ORDER BY abs_ts DESC",
-                hls_params,
+                rec_where.append("d.source_id=?"); rec_params.append(source_id)
+            rec_rows = conn.execute(
+                "SELECT d.source_id, d.abs_ts, d.has_human, d.confidence,"
+                " d.boxes_json, d.classes_json"
+                f" FROM video_detections d WHERE {' AND '.join(rec_where)}"
+                " ORDER BY d.abs_ts",
+                rec_params,
             ).fetchall()
 
-        # Group by (source_id, abs_ts) — each frame is one detection with all
-        # its boxes merged across class rows. Return ALL recent frames so the
-        # client can pick the detection matching the displayed video time
-        # (HLS player typically buffers 3-6s behind live edge).
-        by_frame: dict[tuple, dict] = {}
-        for r in hls_rows:
-            key = (r["source_id"], round(r["abs_ts"], 2))
-            if key not in by_frame:
-                by_frame[key] = {
-                    "source_id": r["source_id"],
-                    "abs_ts": r["abs_ts"],
-                    "has_human": False,
-                    "confidence": 0.0,
-                    "boxes": [],
-                    "classes": [],
-                }
-            det = by_frame[key]
-            boxes = json.loads(r["boxes_json"]) if r["boxes_json"] else []
-            det["boxes"].extend(boxes)
-            det["classes"].append(r["class"])
-            det["confidence"] = max(det["confidence"], r["confidence"])
-            if r["class"] == "person":
-                det["has_human"] = True
-
-        recent = sorted(by_frame.values(), key=lambda d: d["abs_ts"])
+        recent = [{
+            "source_id": r["source_id"],
+            "abs_ts": r["abs_ts"],
+            "has_human": bool(r["has_human"]),
+            "confidence": r["confidence"],
+            "boxes": json.loads(r["boxes_json"]) if r["boxes_json"] else [],
+            "classes": json.loads(r["classes_json"]) if r["classes_json"] else [],
+        } for r in rec_rows]
 
         # Latest-per-source for backward compatibility (used by client when no
         # HLS player timing is available)
@@ -2735,7 +2693,11 @@ def _yolo_socket_request(req: dict, timeout: float) -> dict:
 #   det = per-frame detections from recorded segments. Unlike object_events
 #         'appeared', this sees the whole presence, not just the entry instant,
 #         so a person who walks into a zone is caught.
-_NOTIFICATION_KINDS = ("hls", "det")
+# B4: the live detector's video_detections ('det') is the authoritative live
+# pass. 'hls' is retired — the HLS-tag loop no longer writes hls_events. The
+# fetcher + cursor machinery for 'hls' stay defined (harmless) so retained
+# cursors survive; just no longer iterated.
+_NOTIFICATION_KINDS = ("det",)
 _NOTIFICATION_KIND_MAX_ID_TABLE = {"hls": "hls_events", "det": "video_detections"}
 
 
