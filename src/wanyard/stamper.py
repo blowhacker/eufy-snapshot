@@ -229,9 +229,12 @@ class _StamperWorker:
             # EINVALs for VFR streams, e.g. avg 15 != base 20).
             out_tb = Fraction(1, 90000)
             vout.codec_context.time_base = out_tb
-            # ~2s keyframe interval so the downstream HLS (hls_time 2) and short
-            # records are seekable; we control GOP now that we re-encode.
-            gop = max(1, int(round(2 * float(vin.average_rate or 15))))
+            # Keyframe interval. HLS segments can only break on keyframes, so the
+            # GOP is the floor on live segment duration (and thus live latency).
+            # Default 2s (seekable records); set WANYARD_STAMP_GOP_SECONDS=1 for
+            # lower-latency live (more I-frames, slightly fatter).
+            gop_seconds = float(self._src_env("GOP_SECONDS", "2"))
+            gop = max(1, int(round(gop_seconds * float(vin.average_rate or 15))))
             vout.options = self._video_options(codec, gop)
             aout = None
             if ain is not None:
