@@ -1250,6 +1250,7 @@ const liveTail = {
   bitcTimeOffset: null,
   targetTs: null,
   nativeDelay: LIVE_NATIVE_DEFAULT_DELAY_SECONDS,
+  usingNativeLowLatency: false,
   stats: null,
 };
 
@@ -3442,7 +3443,12 @@ async function startLiveTail(srcId = null, options = {}) {
     return false;
   }
 
-  if (liveTail.active && liveTail.srcId === chosen && seekTs != null) {
+  const restartNativeForTimestamp = liveTail.active
+    && liveTail.srcId === chosen
+    && seekTs != null
+    && liveTail.usingNativeLowLatency;
+
+  if (liveTail.active && liveTail.srcId === chosen && seekTs != null && !restartNativeForTimestamp) {
     const win = await fetchLiveWindow(chosen);
     if (!liveWindowContains(win, seekTs) || !seekLiveVideoToTs(seekTs, win)) {
       setStatus("BUFFERING");
@@ -3454,7 +3460,7 @@ async function startLiveTail(srcId = null, options = {}) {
     el.liveVideo.play().catch(() => {});
     return true;
   }
-  if ((liveTail.active || liveTail.starting) && liveTail.srcId === chosen) return true;
+  if ((liveTail.active || liveTail.starting) && liveTail.srcId === chosen && !restartNativeForTimestamp) return true;
 
   let liveWindow = null;
   if (seekTs != null) {
@@ -3511,6 +3517,7 @@ async function startLiveTail(srcId = null, options = {}) {
     ? LiveDelayStats.delayForSource(chosen)
     : LIVE_NATIVE_DEFAULT_DELAY_SECONDS;
   liveTail.nativeDelay = nativeDelay;
+  liveTail.usingNativeLowLatency = useNativeLowLatency;
   liveTail.stats = useNativeLowLatency ? new LiveDelayStats(chosen, nativeDelay) : null;
 
   el.liveVideo.onerror = null;  // clear before re-wiring
@@ -3625,6 +3632,7 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   liveTail.bitcTimeOffset = null;
   liveTail.targetTs = null;
   liveTail.nativeDelay = LIVE_NATIVE_DEFAULT_DELAY_SECONDS;
+  liveTail.usingNativeLowLatency = false;
   liveTail.stats = null;
   // Restore URL: remove live=1 and ts params
   const _p = new URLSearchParams(location.search);
