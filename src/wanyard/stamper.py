@@ -72,6 +72,12 @@ class _StamperWorker:
         self.out_url = f"rtsp://{out_host or relay_host}:8554/{source_id}{_STAMPED_SUFFIX}"
         self.crf = os.environ.get("WANYARD_STAMP_CRF", "18")
         self.preset = os.environ.get("WANYARD_STAMP_PRESET", "ultrafast")
+        # Optional VBV cap. crf alone re-encodes already-lean CCTV ~14x fatter
+        # (visually-lossless of low-bitrate source); a maxrate ceiling bounds the
+        # motion peaks for predictable retention. BITC marker is unaffected by
+        # bitrate (solid 8px luma cells decode ~99% even at native 0.85 Mbps).
+        self.maxrate = os.environ.get("WANYARD_STAMP_MAXRATE")
+        self.bufsize = os.environ.get("WANYARD_STAMP_BUFSIZE")
         self.thread = threading.Thread(
             target=self.run, daemon=True, name=f"stamper-{source_id}")
 
@@ -131,6 +137,9 @@ class _StamperWorker:
             vout.options = {"preset": self.preset, "tune": "zerolatency",
                             "crf": self.crf, "g": str(gop),
                             "keyint_min": str(gop)}
+            if self.maxrate:
+                vout.options["maxrate"] = self.maxrate
+                vout.options["bufsize"] = self.bufsize or self.maxrate
             aout = None
             if ain is not None:
                 rate = getattr(ain.codec_context, "sample_rate", None) or 8000
