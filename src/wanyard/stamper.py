@@ -170,11 +170,21 @@ class _StamperWorker:
     def _video_options(self, codec: str, gop: int) -> dict[str, str]:
         opts = {"g": str(gop), "keyint_min": str(gop)}
         if codec == "h264_nvenc":
-            # VBR + constant-quality (cq); no tune=zerolatency (it disables
-            # B-frames/lookahead and wrecks quality). Relay tolerates ~1-2s.
-            opts.update({"preset": self.nvenc_preset, "rc": "vbr", "cq": self.cq})
+            # Low-latency tuning is mandatory, not optional: the live detector
+            # drops frames whose age exceeds 1.0s (_MAX_LIVE_LAG_SECONDS), and
+            # NVENC's default lookahead/output-delay buffering pushes end-to-end
+            # latency past that, starving detection entirely. tune=ll + no
+            # B-frames / lookahead / output delay keeps latency under the gate.
+            # Quality comes from cq + bitrate, not from B-frames, so the look is
+            # unaffected.
+            opts.update({"preset": self.nvenc_preset, "tune": "ll", "rc": "vbr",
+                         "cq": self.cq, "bf": "0", "rc-lookahead": "0",
+                         "delay": "0"})
         else:
-            opts.update({"preset": self.preset, "crf": self.crf})
+            # zerolatency: same reason — keep the re-encode within the live
+            # detector's 1.0s staleness gate.
+            opts.update({"preset": self.preset, "tune": "zerolatency",
+                         "crf": self.crf})
         if self.maxrate:
             opts["maxrate"] = self.maxrate
             opts["bufsize"] = self.bufsize or self.maxrate
