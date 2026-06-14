@@ -117,6 +117,11 @@ services:
       - WANYARD_STAMP_CQ=25
       - WANYARD_STAMP_MAXRATE=2.5M
       - WANYARD_STAMP_BUFSIZE=5M
+      # A/B eyeball (staging): front mirrors camera-native bitrate (cap forces
+      # cq to ride ~0.85M = prod size), garden stays on the global cq25 cap.
+      # Remove both lines to put front back on the global config.
+      - WANYARD_STAMP_TAPO_FRONT_MAXRATE=0.85M
+      - WANYARD_STAMP_TAPO_FRONT_BUFSIZE=1.7M
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

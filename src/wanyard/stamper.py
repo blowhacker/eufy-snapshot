@@ -14,6 +14,7 @@ from __future__ import annotations
 import collections
 import logging
 import os
+import re
 import threading
 import time
 from fractions import Fraction
@@ -102,28 +103,40 @@ class _StamperWorker:
         self.local_stop = threading.Event()
         self.in_url = f"rtsp://{relay_host}:8554/{source_id}"
         self.out_url = f"rtsp://{out_host or relay_host}:8554/{source_id}{_STAMPED_SUFFIX}"
+        # Every knob takes a per-source override (cameras differ in native
+        # bitrate, so a single global cap is a compromise): WANYARD_STAMP_<SRC>_
+        # <KEY> wins over the global WANYARD_STAMP_<KEY>, where <SRC> is the
+        # source_id upper-cased with non-alnum -> _ (tapo-front -> TAPO_FRONT).
         # Encoder: "auto" prefers h264_nvenc when the GPU probe succeeds, else
         # libx264 (no hard GPU dependency — non-NVIDIA boxes fall back cleanly).
-        self.encoder = os.environ.get("WANYARD_STAMP_ENCODER", "auto")
+        self.encoder = self._src_env("ENCODER", "auto")
         # Quality targets (per encoder). x264 uses crf; nvenc uses cq. Both are
         # quality-targeted so easy/static scenes stay lean and only motion costs
         # bits — mirrors the camera's own rate control.
-        self.crf = os.environ.get("WANYARD_STAMP_CRF", "23")
-        self.cq = os.environ.get("WANYARD_STAMP_CQ", "25")
+        self.crf = self._src_env("CRF", "23")
+        self.cq = self._src_env("CQ", "25")
         # libx264 default veryfast, not ultrafast: ultrafast re-encodes
         # already-compressed CCTV so inefficiently it looks like garbage even at
         # native bitrate. nvenc has its own preset knob.
-        self.preset = os.environ.get("WANYARD_STAMP_PRESET", "veryfast")
-        self.nvenc_preset = os.environ.get("WANYARD_STAMP_NVENC_PRESET", "p5")
+        self.preset = self._src_env("PRESET", "veryfast")
+        self.nvenc_preset = self._src_env("NVENC_PRESET", "p5")
         # VBV cap above camera native (re-encoding compressed video needs
         # headroom to match the original's look). crf/cq keep the average near
         # native; maxrate just bounds motion peaks for predictable retention.
         # BITC marker is bitrate-independent (solid 8px luma cells decode ~99%
         # even at 0.85 Mbps).
-        self.maxrate = os.environ.get("WANYARD_STAMP_MAXRATE")
-        self.bufsize = os.environ.get("WANYARD_STAMP_BUFSIZE")
+        self.maxrate = self._src_env("MAXRATE")
+        self.bufsize = self._src_env("BUFSIZE")
         self.thread = threading.Thread(
             target=self.run, daemon=True, name=f"stamper-{source_id}")
+
+    def _src_env(self, key: str, default: str | None = None) -> str | None:
+        """Per-source env with global fallback: WANYARD_STAMP_<SRC>_<KEY>."""
+        tok = re.sub(r"[^A-Z0-9]+", "_", self.source_id.upper())
+        return os.environ.get(
+            f"WANYARD_STAMP_{tok}_{key}",
+            os.environ.get(f"WANYARD_STAMP_{key}", default),
+        )
 
     def start(self) -> None:
         self.thread.start()
