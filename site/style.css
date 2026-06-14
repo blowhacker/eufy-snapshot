@@ -198,6 +198,27 @@ hr{border:none;border-top:1px solid var(--line-soft);margin:0}
 }
 .cmd .copy:hover{color:var(--txt);background:var(--surf-2)}
 .cmd .copy.copied{color:var(--green)}
+
+/* Themed thin scrollbars for the horizontal-scroll code/diagram blocks —
+   the browser default is a fat grey bar that reads as "unstyled". */
+.cmd code,.flow,.code-block pre{
+  scrollbar-width:thin;
+  scrollbar-color:var(--line) transparent;
+}
+.cmd code::-webkit-scrollbar,
+.flow::-webkit-scrollbar,
+.code-block pre::-webkit-scrollbar{height:8px}
+.cmd code::-webkit-scrollbar-track,
+.flow::-webkit-scrollbar-track,
+.code-block pre::-webkit-scrollbar-track{background:transparent}
+.cmd code::-webkit-scrollbar-thumb,
+.flow::-webkit-scrollbar-thumb,
+.code-block pre::-webkit-scrollbar-thumb{
+  background:var(--line);border-radius:4px;
+}
+.cmd code::-webkit-scrollbar-thumb:hover,
+.flow::-webkit-scrollbar-thumb:hover,
+.code-block pre::-webkit-scrollbar-thumb:hover{background:var(--txt-4)}
 .cta-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .btn{
   display:inline-flex;align-items:center;gap:8px;
