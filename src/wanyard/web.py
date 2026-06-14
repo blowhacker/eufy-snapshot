@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,13 +24,14 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from . import native_hls
 from .config import AppConfig
 
 LOG = logging.getLogger(__name__)
 
 _THUMB_W  = 160
 _IMG_CACHE = "public, max-age=604800, immutable"
-_GZIP_SKIP_PREFIXES = ("/video/live/",)
+_GZIP_SKIP_PREFIXES = ("/video/live/", "/video/native-live/")
 
 
 class _PathAwareGZipMiddleware:
@@ -1102,6 +1104,24 @@ def make_app(
         window = await asyncio.to_thread(_read_live_hls_window, video_dir, source_id)
         return JSONResponse({"window": window})
 
+    async def api_video_native_live(request: Request) -> JSONResponse:
+        source_id = request.query_params.get("source") or None
+        if not native_hls.safe_path_part(source_id):
+            return JSONResponse({"native": None})
+        if not native_hls.base_url():
+            return JSONResponse({"native": None})
+        known = {s["id"] for s in _sources_list(config, source_db)}
+        if known and source_id not in known:
+            return JSONResponse({"native": None}, status_code=404)
+        source_path = native_hls.source_path(source_id)
+        return JSONResponse({
+            "native": {
+                "source_id": source_id,
+                "path": source_path,
+                "url": native_hls.public_manifest_url(source_id),
+            }
+        })
+
     def _class_filter(raw: str | None) -> set[str]:
         if not raw:
             return set()
@@ -1567,6 +1587,37 @@ def make_app(
         return FileResponse(path, media_type=media,
                             headers={"Cache-Control": "no-cache, no-store"})
 
+    async def serve_native_live_hls(request: Request) -> Response:
+        source_path = request.path_params.get("source_path", "")
+        asset = request.path_params.get("asset", "")
+        upstream = native_hls.upstream_url(
+            source_path,
+            asset,
+            request.url.query,
+        )
+        if not upstream:
+            return Response(status_code=404)
+        headers = {}
+        range_header = request.headers.get("range")
+        if range_header:
+            headers["Range"] = range_header
+        try:
+            status, body, content_type, response_headers = await asyncio.to_thread(
+                native_hls.fetch_asset,
+                upstream,
+                headers,
+            )
+        except urllib.error.HTTPError as exc:
+            return Response(status_code=exc.code)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return Response(status_code=502)
+        return Response(
+            content=body,
+            media_type=native_hls.media_type(asset, content_type),
+            status_code=status,
+            headers={"Cache-Control": "no-cache, no-store", **response_headers},
+        )
+
     routes = [
         Route("/",                           lambda r: FileResponse(static_dir / "video2.html", headers={"Cache-Control": "no-cache"})),
         Route("/settings",                  lambda r: FileResponse(static_dir / "settings.html", headers={"Cache-Control": "no-cache"})),
@@ -1593,10 +1644,12 @@ def make_app(
         Route("/api/video/overlays",        api_video_overlays),
         Route("/api/video/live",            api_video_live_status),
         Route("/api/video/live-window",     api_video_live_window),
+        Route("/api/video/native-live",     api_video_native_live),
         Route("/api/video/source-status",   api_video_source_status),
         Route("/api/video/clip",            api_video_clip),
         Route("/video/files/{path:path}",   serve_video_file),
         Route("/video/live/{source_id}/{filename}", serve_live_hls),
+        Route("/video/native-live/{source_path}/{asset}", serve_native_live_hls),
         Route("/api/sources",                    api_sources,             methods=["GET", "POST"]),
         Route("/api/sources/{source_id}",        api_delete_source,       methods=["DELETE"]),
         Route("/api/settings/status",            api_settings_status),

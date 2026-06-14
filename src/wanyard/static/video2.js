@@ -1534,6 +1534,14 @@ async function fetchLiveWindow(srcId) {
   return data.window || null;
 }
 
+async function fetchNativeLiveSource(srcId) {
+  const p = new URLSearchParams({ source: srcId });
+  const r = await fetch(`/api/video/native-live?${p}`, { cache:"no-store" }).catch(() => null);
+  if (!r?.ok) return null;
+  const data = await r.json().catch(() => ({}));
+  return data.native || null;
+}
+
 function liveWindowContains(win, ts) {
   return Boolean(win
     && ts >= win.start_ts - LIVE_DVR_TOLERANCE_SECONDS
@@ -3234,7 +3242,12 @@ async function startLiveTail(srcId = null, options = {}) {
   setStatus("LIVE");
   replaceLiveHistory(chosen, seekTs);
 
-  const hlsUrl = `/video/live/${encodeURIComponent(chosen)}/live.m3u8`;
+  const nativeLive = seekTs == null ? await fetchNativeLiveSource(chosen) : null;
+  if (token !== liveTail.token) return false;
+  const useNativeLowLatency = Boolean(nativeLive?.url);
+  const hlsUrl = useNativeLowLatency
+    ? nativeLive.url
+    : `/video/live/${encodeURIComponent(chosen)}/live.m3u8`;
 
   el.liveVideo.onerror = null;  // clear before re-wiring
   el.liveVideo.onerror = e => {
@@ -3250,25 +3263,27 @@ async function startLiveTail(srcId = null, options = {}) {
     const preferNative = Boolean(canNative && shouldUseNativeHls());
     const HlsCtor = preferNative ? null : await loadHlsJs().catch(() => null);
     const canUseHlsJs = Boolean(HlsCtor?.isSupported?.());
-    console.log("HLS attach:", hlsUrl, "hls.js:", canUseHlsJs, "native:", !!canNative, "preferNative:", preferNative);
+    console.log("HLS attach:", hlsUrl, "ll-hls:", useNativeLowLatency, "hls.js:", canUseHlsJs, "native:", !!canNative, "preferNative:", preferNative);
     if (canUseHlsJs) {
       if (token !== liveTail.token) return;
       if (liveTail.hls) { liveTail.hls.destroy(); liveTail.hls = null; }
-      const hlsConfig = {
-        lowLatencyMode: false,
-        // Ride 2 segments back from the live edge (default 3) for lower latency.
-        // liveSyncDurationCount (the sync TARGET) is safe; only the separate
-        // liveMaxLatencyDurationCount triggers the init catchup bug (currentTime=0
-        // → apparent latency=60s >> limit → max poll rate), so that stays omitted.
-        liveSyncDurationCount: 2,
-      };
-      if (seekTs != null && liveWindow) hlsConfig.startPosition = liveMediaOffsetForTs(liveWindow, seekTs);
+      const hlsConfig = useNativeLowLatency
+        ? { lowLatencyMode: true }
+        : {
+            lowLatencyMode: false,
+            // Ride 2 segments back from the live edge (default 3) for lower latency.
+            // liveSyncDurationCount (the sync TARGET) is safe; only the separate
+            // liveMaxLatencyDurationCount triggers the init catchup bug (currentTime=0
+            // → apparent latency=60s >> limit → max poll rate), so that stays omitted.
+            liveSyncDurationCount: 2,
+          };
+      if (!useNativeLowLatency && seekTs != null && liveWindow) hlsConfig.startPosition = liveMediaOffsetForTs(liveWindow, seekTs);
       const hls = new HlsCtor(hlsConfig);
       liveTail.hls = hls;
       hls.loadSource(hlsUrl);
       hls.attachMedia(el.liveVideo);
       hls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
-        if (seekTs != null && liveWindow) seekLiveVideoToTs(seekTs, liveWindow);
+        if (!useNativeLowLatency && seekTs != null && liveWindow) seekLiveVideoToTs(seekTs, liveWindow);
         updateLivePlaybackRate();
         el.liveVideo.play().catch(() => {});
       });
@@ -3283,7 +3298,7 @@ async function startLiveTail(srcId = null, options = {}) {
       el.liveVideo.src = hlsUrl;
       el.liveVideo.load();
       el.liveVideo.addEventListener("loadedmetadata", () => {
-        if (seekTs != null && liveWindow) seekLiveVideoToTs(seekTs, liveWindow);
+        if (!useNativeLowLatency && seekTs != null && liveWindow) seekLiveVideoToTs(seekTs, liveWindow);
         updateLivePlaybackRate();
         el.liveVideo.play().catch(e => console.warn("play() failed:", e));
       }, { once: true });
