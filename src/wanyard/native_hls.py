@@ -5,6 +5,20 @@ import urllib.request
 from urllib.parse import quote
 
 MANIFEST_NAME = "video1_stream.m3u8"
+DEFAULT_PORT = 8888
+
+
+def hls_port() -> int:
+    raw = os.environ.get("WANYARD_MEDIAMTX_HLS_PORT", "").strip()
+    if not raw:
+        return DEFAULT_PORT
+    try:
+        port = int(raw)
+    except ValueError:
+        return DEFAULT_PORT
+    if 1 <= port <= 65535:
+        return port
+    return DEFAULT_PORT
 
 
 def safe_path_part(value: str | None) -> bool:
@@ -21,7 +35,7 @@ def base_url() -> str | None:
     if not raw:
         relay_host = os.environ.get("WANYARD_RELAY_HOST", "").strip()
         if relay_host:
-            raw = f"http://{relay_host}:8888"
+            raw = f"http://{relay_host}:{hls_port()}"
     return raw.rstrip("/") if raw else None
 
 

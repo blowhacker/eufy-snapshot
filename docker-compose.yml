@@ -59,7 +59,7 @@ services:
       - YOLO_SOCKET=/run/yolo/yolo.sock
       - WANYARD_RELAY_HOST=mediamtx
       - WANYARD_RELAY_PATH_SUFFIX=-stamped
-      - WANYARD_NATIVE_HLS_BASE_URL=http://mediamtx:8888
+      - WANYARD_MEDIAMTX_HLS_PORT=${WANYARD_MEDIAMTX_HLS_PORT:-8888}
       # Stamper emits HEVC; tag the .mp4 archive hvc1 so Chrome/Safari play it.
       - WANYARD_RECORD_VIDEO_TAG=hvc1
     volumes:
@@ -78,6 +78,7 @@ services:
     command: ["-c", "/app/config.yaml", "gen-mediamtx", "--out", "/run/mediamtx/mediamtx.yml"]
     environment:
       - VIDEO_DIR=/app/video
+      - WANYARD_MEDIAMTX_HLS_PORT=${WANYARD_MEDIAMTX_HLS_PORT:-8888}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

@@ -62,7 +62,8 @@ class RelayCutoverTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                "WANYARD_NATIVE_HLS_BASE_URL": "http://mediamtx:8888",
+                "WANYARD_RELAY_HOST": "mediamtx",
+                "WANYARD_MEDIAMTX_HLS_PORT": "8891",
                 "WANYARD_RELAY_PATH_SUFFIX": "-stamped",
             },
             clear=True,
@@ -81,13 +82,16 @@ class RelayCutoverTests(unittest.TestCase):
                     "video1_stream.m3u8",
                     "_HLS_msn=7&_HLS_part=3",
                 ),
-                "http://mediamtx:8888/tapo-front-stamped/video1_stream.m3u8?_HLS_msn=7&_HLS_part=3",
+                "http://mediamtx:8891/tapo-front-stamped/video1_stream.m3u8?_HLS_msn=7&_HLS_part=3",
             )
 
     def test_native_hls_rejects_unsafe_proxy_paths(self) -> None:
         with mock.patch.dict(
             os.environ,
-            {"WANYARD_NATIVE_HLS_BASE_URL": "http://mediamtx:8888"},
+            {
+                "WANYARD_RELAY_HOST": "mediamtx",
+                "WANYARD_MEDIAMTX_HLS_PORT": "8891",
+            },
             clear=True,
         ):
             self.assertIsNone(
@@ -96,6 +100,16 @@ class RelayCutoverTests(unittest.TestCase):
             self.assertIsNone(
                 native_hls.upstream_url("tapo-front", "../video1_stream.m3u8")
             )
+
+    def test_native_hls_port_invalid_values_fall_back_to_default(self) -> None:
+        for raw in ("", "bad", "0", "70000"):
+            with self.subTest(raw=raw):
+                with mock.patch.dict(
+                    os.environ,
+                    {"WANYARD_MEDIAMTX_HLS_PORT": raw},
+                    clear=True,
+                ):
+                    self.assertEqual(native_hls.hls_port(), native_hls.DEFAULT_PORT)
 
 
 if __name__ == "__main__":

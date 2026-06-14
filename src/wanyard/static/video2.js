@@ -3821,6 +3821,20 @@ function interpolateBox(a, b, t) {
   };
 }
 
+function clamp01(v) {
+  return Math.max(0, Math.min(1, Number(v)));
+}
+
+function translateBox(box, dx, dy) {
+  return {
+    ...box,
+    x1: clamp01(Number(box.x1) + dx),
+    y1: clamp01(Number(box.y1) + dy),
+    x2: clamp01(Number(box.x2) + dx),
+    y2: clamp01(Number(box.y2) + dy),
+  };
+}
+
 // Overlay association: chain per-frame boxes into short tracklets so a box only
 // interpolates toward the SAME object. Greedy nearest-center glides one box onto
 // a different object across the frame (busy road). Two cheap, ML-free gates fix it:
@@ -3834,6 +3848,7 @@ const _OVL_GATE_K     = 2.5;   // gate grows with speed*dt (fast straight movers
 const _OVL_WARM_GATE  = 0.40;  // first link has no velocity — near old greedy, lets fast tracks start
 const _OVL_MIN_SPEED  = 0.04;  // below this (per s) treat as stationary; skip heading veto
 const _OVL_LEAD       = 0.15;  // s — tiny forward tolerance so the current frame still shows
+const _OVL_LIVE_PREDICT = 1.0; // s — live edge can outrun YOLO; project short, recent tracks only
 
 // Pure: chain a detection list into tracklets. Shared by the recorded overlay
 // (cached on st.overlays.seq) and the live overlay (cached on liveTail.recentSeq).
@@ -3919,9 +3934,11 @@ function liveTracklets() {
   return tracks;
 }
 
-// Sample tracklet boxes at time ts: interpolate within a bracketed span, else
-// persist the most recent PAST detection (causal). Unfiltered — caller filters.
-function boxesFromTracklets(tracks, ts) {
+// Sample tracklet boxes at time ts: interpolate within a bracketed span. For
+// live edge only, optionally extrapolate a short distance from track velocity
+// when the displayed frame has outrun the newest YOLO result.
+function boxesFromTracklets(tracks, ts, opts = {}) {
+  const predictForwardSeconds = Number(opts.predictForwardSeconds || 0);
   const out = [];
   for (const t of tracks) {
     const pts = t.pts;
@@ -3934,6 +3951,14 @@ function boxesFromTracklets(tracks, ts) {
       }
     }
     if (drawn) continue;                       // interpolated within the tracklet
+    if (predictForwardSeconds > 0 && t.vx != null && t.vy != null && pts.length >= 2) {
+      const last = pts[pts.length - 1];
+      const age = ts - last.ts;
+      if (age > 0 && age <= predictForwardSeconds) {
+        out.push(translateBox(last.box, t.vx * age, t.vy * age));
+        continue;
+      }
+    }
     // else persist the most recent PAST detection (causal): a box must never
     // appear before its own detection, or it looks like the box predicts the
     // object and the subject "rides into" a box already sitting ahead.
@@ -4032,12 +4057,14 @@ function drawBoxes(ts) {
 
 function drawLiveBoxes() {
   // The displayed frame carries its exact BITC time in the burned marker. HLS
-  // playback lags ~8s while the detector is realtime, so recentDets brackets the
-  // marker time → interpolate boxes (same tracklet machinery as the recorded
-  // overlay) for a smooth glide instead of snapping at the 2fps detector rate.
+  // playback can now be close enough to the edge that YOLO arrives after the
+  // frame. Interpolate when recentDets brackets the marker time; otherwise
+  // predict a bounded live-only box from the latest track velocity.
   const markerTs = decodeLiveMarker(el.liveVideo);
   if (markerTs == null || !liveTail.recentDets.length) { drawBoxList(el.liveVideo, []); return; }
-  let boxes = boxesFromTracklets(liveTracklets(), markerTs);
+  let boxes = boxesFromTracklets(liveTracklets(), markerTs, {
+    predictForwardSeconds: _OVL_LIVE_PREDICT,
+  });
   if (!boxes.length) {                       // gap fallback: nearest detection within 1s
     let best = null, bestDist = Infinity;
     for (const d of liveTail.recentDets) {

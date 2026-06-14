@@ -134,6 +134,7 @@ def cmd_derive_episodes(args) -> int:
 
 def cmd_gen_mediamtx(args, config: AppConfig) -> int:
     from .capture import resolve_rtsp_url
+    from .native_hls import hls_port
 
     source_db = SourceDB(config.db_path) if config.db_path else None
     if not source_db:
@@ -153,7 +154,7 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
     # Low-latency HLS (fMP4 partial segments) for live view — sub-2s vs the
     # recorder's ~1-4s .ts HLS, and HEVC plays more robustly in fMP4 than TS.
     config_lines.append("hls: yes")
-    config_lines.append("hlsAddress: :8888")
+    config_lines.append(f"hlsAddress: :{hls_port()}")
     config_lines.append("hlsVariant: lowLatency")
     config_lines.append("hlsAlwaysRemux: yes")
     config_lines.append("hlsAllowOrigin: '*'")
