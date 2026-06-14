@@ -1041,7 +1041,18 @@ const LIVE_TIMELINE_FUTURE_PAD_SECONDS = 600;
 const LIVE_EDGE_RATE_RESET_SECONDS = 4;
 const LIVE_DET_WINDOW_SECONDS = 6;
 const LIVE_DET_POLL_MS = 500;
-const LIVE_NATIVE_ANNOTATION_DELAY_SECONDS = 3.0;
+const LIVE_NATIVE_DEFAULT_DELAY_SECONDS = 3.0;
+const LIVE_DELAY_STORAGE_VERSION = 1;
+const LIVE_DELAY_STORAGE_PREFIX = "wanyard.liveDelay.v1.";
+const LIVE_DELAY_STATS_WINDOW_SECONDS = 5 * 60;
+const LIVE_DELAY_FRAME_SAMPLE_MS = 250;
+const LIVE_DELAY_MIN_SECONDS = 1.0;
+const LIVE_DELAY_MAX_SECONDS = 3.0;
+const LIVE_DELAY_TARGET_LEAD_SECONDS = 0.35;
+const LIVE_DELAY_SAVE_CHANGE_SECONDS = 0.25;
+const LIVE_DELAY_MIN_DET_SAMPLES = 20;
+const LIVE_DELAY_MIN_FRAME_SAMPLES = 120;
+const LIVE_DELAY_MAX_STORAGE_AGE_SECONDS = 7 * 24 * 60 * 60;
 const ABSOLUTE_SEEK_RETRIES = 6;
 const ABSOLUTE_SEEK_RETRY_MS = 750;
 const ZONE_ALL = "all";
@@ -1238,6 +1249,8 @@ const liveTail = {
   window: null,
   bitcTimeOffset: null,
   targetTs: null,
+  nativeDelay: LIVE_NATIVE_DEFAULT_DELAY_SECONDS,
+  stats: null,
 };
 
 function urlTimestamp(ts) {
@@ -1247,6 +1260,240 @@ function urlTimestamp(ts) {
   if (ts == null || !Number.isFinite(n) || n <= 0) return null;
   return n.toFixed(3).replace(/\.?0+$/, "");
 }
+
+function clampLiveDelay(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return LIVE_NATIVE_DEFAULT_DELAY_SECONDS;
+  return Math.max(LIVE_DELAY_MIN_SECONDS, Math.min(LIVE_DELAY_MAX_SECONDS, n));
+}
+
+function liveDelayStorageKey(sourceId) {
+  return `${LIVE_DELAY_STORAGE_PREFIX}${encodeURIComponent(sourceId || "unknown")}`;
+}
+
+function readLiveDelayStats(sourceId) {
+  try {
+    const raw = localStorage.getItem(liveDelayStorageKey(sourceId));
+    if (!raw) return null;
+    const saved = JSON.parse(raw);
+    if (saved?.version !== LIVE_DELAY_STORAGE_VERSION) return null;
+    const age = Date.now() / 1000 - Number(saved.updatedAt || 0);
+    if (!Number.isFinite(age) || age < 0 || age > LIVE_DELAY_MAX_STORAGE_AGE_SECONDS) return null;
+    return saved;
+  } catch {
+    return null;
+  }
+}
+
+function writeLiveDelayStats(sourceId, value) {
+  try {
+    localStorage.setItem(liveDelayStorageKey(sourceId), JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function summarizeValues(values) {
+  const xs = values.map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+  const n = xs.length;
+  if (!n) return { count: 0 };
+  const sum = xs.reduce((a, b) => a + b, 0);
+  const mean = sum / n;
+  const variance = xs.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / n;
+  const pct = p => {
+    if (n === 1) return xs[0];
+    const idx = (n - 1) * p;
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    return lo === hi ? xs[lo] : xs[lo] + (xs[hi] - xs[lo]) * (idx - lo);
+  };
+  const round = v => Math.round(v * 1000) / 1000;
+  return {
+    count: n,
+    min: round(xs[0]),
+    max: round(xs[n - 1]),
+    mean: round(mean),
+    stddev: round(Math.sqrt(variance)),
+    p50: round(pct(0.50)),
+    p90: round(pct(0.90)),
+    p95: round(pct(0.95)),
+    p99: round(pct(0.99)),
+  };
+}
+
+class LiveDelayStats {
+  constructor(sourceId, initialDelay) {
+    this.sourceId = sourceId;
+    this.startedAt = Date.now() / 1000;
+    this.initialDelay = clampLiveDelay(initialDelay);
+    this.saved = readLiveDelayStats(sourceId);
+    this.samples = {
+      detectorLag: [],
+      wallLatency: [],
+      latestDetLead: [],
+      latestDetLag: [],
+      pollRtt: [],
+      pollInterval: [],
+    };
+    this.overlayCounts = { interpolated: 0, held: 0, mixed: 0, fallback: 0, empty: 0 };
+    this.seenDetections = new Map();
+    this.lastPollAt = null;
+    this.lastFrameSampleAt = 0;
+    this.lastSavedAt = 0;
+  }
+
+  static delayForSource(sourceId) {
+    const saved = readLiveDelayStats(sourceId);
+    return saved?.delay != null ? clampLiveDelay(saved.delay) : LIVE_NATIVE_DEFAULT_DELAY_SECONDS;
+  }
+
+  recordPollTiming(startedAt, finishedAt) {
+    if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) return;
+    this.#push("pollRtt", finishedAt - startedAt, finishedAt);
+    if (this.lastPollAt != null) this.#push("pollInterval", startedAt - this.lastPollAt, finishedAt);
+    this.lastPollAt = startedAt;
+  }
+
+  recordDetections(detections, now = Date.now() / 1000) {
+    if (!Array.isArray(detections)) return;
+    for (const d of detections) {
+      if (d?.source_id !== this.sourceId || !(d.boxes || []).length) continue;
+      const ts = Number(d.abs_ts);
+      if (!Number.isFinite(ts) || ts < this.startedAt - 0.5) continue;
+      const key = `${Math.round(ts * 1000)}`;
+      if (this.seenDetections.has(key)) continue;
+      this.seenDetections.set(key, now);
+      this.#push("detectorLag", now - ts, now);
+    }
+    this.#trimSeen(now);
+    this.saveIfReady();
+  }
+
+  recordFrame(markerTs, overlayMode, latestDet, now = Date.now() / 1000) {
+    if (!Number.isFinite(markerTs)) return;
+    const nowMs = now * 1000;
+    if (nowMs - this.lastFrameSampleAt < LIVE_DELAY_FRAME_SAMPLE_MS) return;
+    this.lastFrameSampleAt = nowMs;
+    this.#push("wallLatency", now - markerTs, now);
+    if (latestDet) {
+      const detTs = Number(latestDet.abs_ts);
+      if (Number.isFinite(detTs) && detTs >= this.startedAt - 0.5) {
+        this.#push("latestDetLead", detTs - markerTs, now);
+        this.#push("latestDetLag", now - detTs, now);
+      }
+    }
+    const mode = this.overlayCounts[overlayMode] == null ? "empty" : overlayMode;
+    this.overlayCounts[mode]++;
+    this.saveIfReady();
+  }
+
+  summary() {
+    const detectorLag = summarizeValues(this.samples.detectorLag.map(s => s.v));
+    const wallLatency = summarizeValues(this.samples.wallLatency.map(s => s.v));
+    const latestDetLead = summarizeValues(this.samples.latestDetLead.map(s => s.v));
+    const latestDetLag = summarizeValues(this.samples.latestDetLag.map(s => s.v));
+    const pollRtt = summarizeValues(this.samples.pollRtt.map(s => s.v));
+    const pollInterval = summarizeValues(this.samples.pollInterval.map(s => s.v));
+    const overlaySamples = Object.values(this.overlayCounts).reduce((a, b) => a + b, 0);
+    const pct = count => overlaySamples ? Math.round((count / overlaySamples) * 1000) / 10 : 0;
+    const recommendedDelay = this.recommendedDelay();
+    const savedDelay = this.saved?.delay != null ? clampLiveDelay(this.saved.delay) : null;
+    return {
+      version: LIVE_DELAY_STORAGE_VERSION,
+      sourceId: this.sourceId,
+      delay: savedDelay ?? this.initialDelay,
+      activeDelay: this.initialDelay,
+      savedDelay,
+      recommendedDelay,
+      samples: {
+        detectorLag: detectorLag.count,
+        wallLatency: wallLatency.count,
+        overlay: overlaySamples,
+      },
+      detectorLagKind: "firstSeenAt - abs_ts",
+      wallLatencyKind: "browserNow - decodedBITC",
+      detectorLag,
+      wallLatency,
+      latestDetLead,
+      latestDetLag,
+      pollRtt,
+      pollInterval,
+      overlay: {
+        sampled: overlaySamples,
+        interpolatedPct: pct(this.overlayCounts.interpolated),
+        heldPct: pct(this.overlayCounts.held),
+        mixedPct: pct(this.overlayCounts.mixed),
+        fallbackPct: pct(this.overlayCounts.fallback),
+        emptyPct: pct(this.overlayCounts.empty),
+      },
+      updatedAt: Date.now() / 1000,
+    };
+  }
+
+  recommendedDelay() {
+    const detectorLag = summarizeValues(this.samples.detectorLag.map(s => s.v));
+    const wallLatency = summarizeValues(this.samples.wallLatency.map(s => s.v));
+    if (detectorLag.count < LIVE_DELAY_MIN_DET_SAMPLES) return null;
+    if (wallLatency.count < LIVE_DELAY_MIN_FRAME_SAMPLES) return null;
+    const raw = Math.max(
+      detectorLag.p95 + LIVE_DELAY_TARGET_LEAD_SECONDS,
+      detectorLag.p99 + LIVE_DELAY_TARGET_LEAD_SECONDS / 2,
+    );
+    return clampLiveDelay(raw);
+  }
+
+  saveIfReady(force = false) {
+    const now = Date.now() / 1000;
+    if (!force && now - this.lastSavedAt < 5) return false;
+    const summary = this.summary();
+    const previousDelay = this.saved?.delay;
+    if (!force && summary.recommendedDelay == null) return false;
+    let delay = summary.recommendedDelay ?? clampLiveDelay(previousDelay ?? this.initialDelay);
+    if (!force && previousDelay != null &&
+        Math.abs(summary.recommendedDelay - clampLiveDelay(previousDelay)) < LIVE_DELAY_SAVE_CHANGE_SECONDS) {
+      delay = clampLiveDelay(previousDelay);
+    }
+    const saved = {
+      ...summary,
+      delay,
+      savedDelay: delay,
+    };
+    if (!writeLiveDelayStats(this.sourceId, saved)) return false;
+    this.saved = saved;
+    this.lastSavedAt = now;
+    return true;
+  }
+
+  #push(name, value, now) {
+    const v = Number(value);
+    if (!Number.isFinite(v) || v < -10 || v > 60) return;
+    const xs = this.samples[name];
+    xs.push({ t: now, v });
+    const cutoff = now - LIVE_DELAY_STATS_WINDOW_SECONDS;
+    while (xs.length && xs[0].t < cutoff) xs.shift();
+  }
+
+  #trimSeen(now) {
+    const cutoff = now - LIVE_DELAY_STATS_WINDOW_SECONDS;
+    for (const [key, firstSeenAt] of this.seenDetections) {
+      if (firstSeenAt < cutoff) this.seenDetections.delete(key);
+    }
+  }
+}
+
+window.wanyardLiveDelay = {
+  current: () => liveTail.stats?.summary() ?? null,
+  saved: (sourceId = liveTail.srcId) => sourceId ? readLiveDelayStats(sourceId) : null,
+  clear: (sourceId = liveTail.srcId) => {
+    if (!sourceId) return false;
+    try {
+      localStorage.removeItem(liveDelayStorageKey(sourceId));
+      return true;
+    } catch {
+      return false;
+    }
+  },
+};
 
 // ── Derived views ─────────────────────────────────────
 // All segments for source — used for timeline bands (always show coverage)
@@ -3260,6 +3507,11 @@ async function startLiveTail(srcId = null, options = {}) {
   const hlsUrl = useNativeLowLatency
     ? nativeLive.url
     : `/video/live/${encodeURIComponent(chosen)}/live.m3u8`;
+  const nativeDelay = useNativeLowLatency
+    ? LiveDelayStats.delayForSource(chosen)
+    : LIVE_NATIVE_DEFAULT_DELAY_SECONDS;
+  liveTail.nativeDelay = nativeDelay;
+  liveTail.stats = useNativeLowLatency ? new LiveDelayStats(chosen, nativeDelay) : null;
 
   el.liveVideo.onerror = null;  // clear before re-wiring
   el.liveVideo.onerror = e => {
@@ -3275,7 +3527,7 @@ async function startLiveTail(srcId = null, options = {}) {
     const preferNative = Boolean(canNative && shouldUseNativeHls());
     const HlsCtor = preferNative ? null : await loadHlsJs().catch(() => null);
     const canUseHlsJs = Boolean(HlsCtor?.isSupported?.());
-    console.log("HLS attach:", hlsUrl, "ll-hls:", useNativeLowLatency, "hls.js:", canUseHlsJs, "native:", !!canNative, "preferNative:", preferNative);
+    console.log("HLS attach:", hlsUrl, "ll-hls:", useNativeLowLatency, "delay:", nativeDelay, "hls.js:", canUseHlsJs, "native:", !!canNative, "preferNative:", preferNative);
     if (canUseHlsJs) {
       if (token !== liveTail.token) return;
       if (liveTail.hls) { liveTail.hls.destroy(); liveTail.hls = null; }
@@ -3285,8 +3537,8 @@ async function startLiveTail(srcId = null, options = {}) {
             // Smooth annotated live: stay far enough behind LL-HLS edge for
             // the relay detector to populate boxes, instead of seeking/pausing
             // per detection frame.
-            liveSyncDuration: LIVE_NATIVE_ANNOTATION_DELAY_SECONDS,
-            liveMaxLatencyDuration: LIVE_NATIVE_ANNOTATION_DELAY_SECONDS + 3,
+            liveSyncDuration: nativeDelay,
+            liveMaxLatencyDuration: nativeDelay + 3,
           }
         : {
             lowLatencyMode: false,
@@ -3350,6 +3602,7 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   if (invalidate) liveTail.token++;
   clearTimeout(liveTail.pollTimer);   // self-chained setTimeout now
   clearInterval(liveTail.clockTimer);
+  liveTail.stats?.saveIfReady(true);
   if (liveTail.cancelFrame) { liveTail.cancelFrame(); liveTail.cancelFrame = null; }
   liveTail.pollTimer = null;
   liveTail.clockTimer = null;
@@ -3371,6 +3624,8 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   liveTail.window = null;
   liveTail.bitcTimeOffset = null;
   liveTail.targetTs = null;
+  liveTail.nativeDelay = LIVE_NATIVE_DEFAULT_DELAY_SECONDS;
+  liveTail.stats = null;
   // Restore URL: remove live=1 and ts params
   const _p = new URLSearchParams(location.search);
   _p.delete("live"); _p.delete("ts");
@@ -3388,6 +3643,7 @@ async function pollLiveTail() {
   if (!liveTail.active || !liveTail.srcId) return;
   const token = liveTail.token;   // self-chained below; never overlaps (was setInterval)
   try {
+    const pollStartedAt = Date.now() / 1000;
     const p = new URLSearchParams({ source: liveTail.srcId });
     const focusTs = liveTailCurrentTs();
     if (Number.isFinite(focusTs)) {
@@ -3396,7 +3652,9 @@ async function pollLiveTail() {
     }
     appendZoneParam(p);
     const r = await fetch(`/api/video/live?${p}`, { cache:"no-store" }).catch(() => null);
+    const pollFinishedAt = Date.now() / 1000;
     if (token !== liveTail.token) return;   // stopped/restarted during fetch → drop
+    liveTail.stats?.recordPollTiming(pollStartedAt, pollFinishedAt);
     if (!r?.ok) return;
     const data = await r.json();
     if (token !== liveTail.token) return;
@@ -3405,6 +3663,7 @@ async function pollLiveTail() {
     mergeClassCounts(data.events || []);
     liveTail.latestDet = (data.detections || []).find(d => d.source_id === liveTail.srcId) ?? liveTail.latestDet;
     liveTail.recentDets = (data.recent_detections || []).filter(d => d.source_id === liveTail.srcId);
+    liveTail.stats?.recordDetections(liveTail.recentDets, pollFinishedAt);
     liveTail.recentSeq++;   // invalidate the live tracklet cache
     renderClsCtrl();
     timeline.setData(allSegsForSrc(), filteredEvts());
@@ -3939,9 +4198,10 @@ function liveTracklets() {
 }
 
 // Sample tracklet boxes at time ts: interpolate within a bracketed span, else
-// persist the most recent PAST detection (causal). Unfiltered — caller filters.
-function boxesFromTracklets(tracks, ts) {
+// persist the most recent PAST detection (causal). Unfiltered; caller filters.
+function sampleTrackletBoxes(tracks, ts) {
   const out = [];
+  let interpolated = 0, held = 0;
   for (const t of tracks) {
     const pts = t.pts;
     let drawn = false;
@@ -3949,6 +4209,7 @@ function boxesFromTracklets(tracks, ts) {
       const a = pts[i], b = pts[i + 1];
       if (ts >= a.ts && ts <= b.ts && (b.ts - a.ts) <= _OVL_MAX_GAP) {
         out.push(interpolateBox(a.box, b.box, (ts - a.ts) / ((b.ts - a.ts) || 1)));
+        interpolated++;
         drawn = true; break;
       }
     }
@@ -3961,9 +4222,17 @@ function boxesFromTracklets(tracks, ts) {
       const age = ts - p.ts;                   // >0 = past, small <0 = current frame
       if (age >= -_OVL_LEAD && age <= _OVL_SNAP && (!recent || p.ts > recent.ts)) recent = p;
     }
-    if (recent) out.push(recent.box);
+    if (recent) {
+      out.push(recent.box);
+      held++;
+    }
   }
-  return out;
+  const mode = !out.length ? "empty" : (interpolated && held ? "mixed" : (interpolated ? "interpolated" : "held"));
+  return { boxes: out, mode };
+}
+
+function boxesFromTracklets(tracks, ts) {
+  return sampleTrackletBoxes(tracks, ts).boxes;
 }
 
 function boxesAtOverlayTime(ts) {
@@ -4055,20 +4324,30 @@ function drawLiveBoxes() {
   // bracket the marker time or land exactly on the latest boxes.
   const markerTs = decodeLiveMarker(el.liveVideo);
   if (markerTs == null) { drawBoxList(el.liveVideo, []); return; }
-  let boxes = liveTail.recentDets.length ? boxesFromTracklets(liveTracklets(), markerTs) : [];
+  const sample = liveTail.recentDets.length
+    ? sampleTrackletBoxes(liveTracklets(), markerTs)
+    : { boxes: [], mode: "empty" };
+  let boxes = sample.boxes;
+  let overlayMode = sample.mode;
+  const latest = latestLiveBoxDetection();
   if (!boxes.length) {                       // gap fallback: nearest detection within 1s
     let best = null, bestDist = Infinity;
     for (const d of liveTail.recentDets) {
       const dist = Math.abs(d.abs_ts - markerTs);
       if (dist < bestDist) { best = d; bestDist = dist; }
     }
-    const latest = latestLiveBoxDetection();
     if (latest) {
       const dist = Math.abs(Number(latest.abs_ts) - markerTs);
       if (dist < bestDist) { best = latest; bestDist = dist; }
     }
-    if (best && bestDist < 1.0) boxes = best.boxes || [];
+    if (best && bestDist < 1.0) {
+      boxes = best.boxes || [];
+      overlayMode = "fallback";
+    } else {
+      overlayMode = "empty";
+    }
   }
+  liveTail.stats?.recordFrame(markerTs, overlayMode, latest);
   drawBoxList(el.liveVideo, _filterBoxes(boxes));
 }
 
