@@ -3008,7 +3008,14 @@ class VideoWorker:
                     deadline = time.time() + _MAX_SEGMENT_SECONDS
                     while time.time() < deadline and not self._stop.is_set():
                         if self._proc.poll() is not None:
-                            LOG.warning("ffmpeg exited early for %s", self.source.id)
+                            err = b""
+                            try:
+                                err = self._proc.stderr.read() or b""
+                            except Exception:
+                                pass
+                            LOG.warning("ffmpeg exited early for %s (rc=%s): %s",
+                                        self.source.id, self._proc.returncode,
+                                        err.decode("utf-8", "replace")[-1200:])
                             break
                         if self._seg_id and not getattr(self, "_anchor_set", False):
                             self._observe_marker_anchor()
