@@ -1227,8 +1227,12 @@ const liveTail = {
   token: 0,
   pollTimer: null,
   clockTimer: null,
+  cancelFrame: null,   // teardown for the per-frame overlay loop (rVFC/rAF)
   latestDet: null,
   recentDets: [],   // recent detections buffer (sorted by abs_ts asc)
+  recentSeq: 0,     // bumped when recentDets is replaced → tracklet cache key
+  _tracklets: null,
+  _trackletsSeq: -1,
   window: null,
   bitcTimeOffset: null,
   targetTs: null,
@@ -3292,10 +3296,10 @@ async function startLiveTail(srcId = null, options = {}) {
   try {
     await _attachHls();
     if (token !== liveTail.token) return;
-    await pollLiveTail();
+    await pollLiveTail();   // self-chains its own setTimeout while active
     if (token !== liveTail.token) return;
-    liveTail.pollTimer = setInterval(pollLiveTail, 1500);
     liveTail.clockTimer = setInterval(updateLiveTailClock, 500);
+    startLiveFrameLoop();
     liveTail.starting = false;
     updateLivePlaybackRate();
     return true;
@@ -3311,8 +3315,9 @@ async function startLiveTail(srcId = null, options = {}) {
 
 function stopLiveTail(updateMode = true, invalidate = true) {
   if (invalidate) liveTail.token++;
-  clearInterval(liveTail.pollTimer);
+  clearTimeout(liveTail.pollTimer);   // self-chained setTimeout now
   clearInterval(liveTail.clockTimer);
+  if (liveTail.cancelFrame) { liveTail.cancelFrame(); liveTail.cancelFrame = null; }
   liveTail.pollTimer = null;
   liveTail.clockTimer = null;
   if (liveTail.hls) { liveTail.hls.destroy(); liveTail.hls = null; }
@@ -3328,6 +3333,8 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   liveTail.srcId = null;
   liveTail.latestDet = null;
   liveTail.recentDets = [];
+  liveTail.recentSeq++;
+  liveTail._tracklets = null;
   liveTail.window = null;
   liveTail.bitcTimeOffset = null;
   liveTail.targetTs = null;
@@ -3346,25 +3353,35 @@ function stopLiveTail(updateMode = true, invalidate = true) {
 
 async function pollLiveTail() {
   if (!liveTail.active || !liveTail.srcId) return;
-  const p = new URLSearchParams({ source: liveTail.srcId });
-  const focusTs = liveTailCurrentTs();
-  if (Number.isFinite(focusTs)) {
-    p.set("det_since", (focusTs - LIVE_DET_WINDOW_SECONDS).toFixed(3));
-    p.set("det_until", (focusTs + LIVE_DET_WINDOW_SECONDS).toFixed(3));
+  const token = liveTail.token;   // self-chained below; never overlaps (was setInterval)
+  try {
+    const p = new URLSearchParams({ source: liveTail.srcId });
+    const focusTs = liveTailCurrentTs();
+    if (Number.isFinite(focusTs)) {
+      p.set("det_since", (focusTs - LIVE_DET_WINDOW_SECONDS).toFixed(3));
+      p.set("det_until", (focusTs + LIVE_DET_WINDOW_SECONDS).toFixed(3));
+    }
+    appendZoneParam(p);
+    const r = await fetch(`/api/video/live?${p}`, { cache:"no-store" }).catch(() => null);
+    if (token !== liveTail.token) return;   // stopped/restarted during fetch → drop
+    if (!r?.ok) return;
+    const data = await r.json();
+    if (token !== liveTail.token) return;
+    mergeSegments(data.segments || []);
+    replaceProvisionalEvents(data.events || [], liveTail.srcId);
+    mergeClassCounts(data.events || []);
+    liveTail.latestDet = (data.detections || []).find(d => d.source_id === liveTail.srcId) ?? liveTail.latestDet;
+    liveTail.recentDets = (data.recent_detections || []).filter(d => d.source_id === liveTail.srcId);
+    liveTail.recentSeq++;   // invalidate the live tracklet cache
+    renderClsCtrl();
+    timeline.setData(allSegsForSrc(), filteredEvts());
+    scheduleNearestEvents(true);
+    updateLiveTailClock();
+  } finally {
+    if (token === liveTail.token && liveTail.active) {
+      liveTail.pollTimer = setTimeout(pollLiveTail, 1500);
+    }
   }
-  appendZoneParam(p);
-  const r = await fetch(`/api/video/live?${p}`, { cache:"no-store" }).catch(() => null);
-  if (!r?.ok) return;
-  const data = await r.json();
-  mergeSegments(data.segments || []);
-  replaceProvisionalEvents(data.events || [], liveTail.srcId);
-  mergeClassCounts(data.events || []);
-  liveTail.latestDet = (data.detections || []).find(d => d.source_id === liveTail.srcId) ?? liveTail.latestDet;
-  liveTail.recentDets = (data.recent_detections || []).filter(d => d.source_id === liveTail.srcId);
-  renderClsCtrl();
-  timeline.setData(allSegsForSrc(), filteredEvts());
-  scheduleNearestEvents(true);
-  updateLiveTailClock();
 }
 
 function updateLiveTailClock() {
@@ -3380,8 +3397,34 @@ function updateLiveTailClock() {
   timeline.setPlayhead(ts);
   setTimestampChip(ts, liveTail.srcId, true);
   setStatus("LIVE");
-  drawLiveBoxes();
   drawZones();
+  // box overlay is driven per displayed frame (startLiveFrameLoop), not here
+}
+
+// Draw the live overlay once per displayed video frame so interpolated boxes
+// glide smoothly. requestVideoFrameCallback fires only on actual paints (and
+// pauses with the tab); falls back to rAF where unsupported.
+function startLiveFrameLoop() {
+  const v = el.liveVideo;
+  if (typeof v.requestVideoFrameCallback === "function") {
+    let id;
+    const onFrame = () => {
+      if (!liveTail.active) return;
+      drawLiveBoxes();
+      id = v.requestVideoFrameCallback(onFrame);
+    };
+    id = v.requestVideoFrameCallback(onFrame);
+    liveTail.cancelFrame = () => v.cancelVideoFrameCallback(id);
+  } else {
+    let id;
+    const tick = () => {
+      if (!liveTail.active) return;
+      drawLiveBoxes();
+      id = requestAnimationFrame(tick);
+    };
+    id = requestAnimationFrame(tick);
+    liveTail.cancelFrame = () => cancelAnimationFrame(id);
+  }
 }
 
 // ── Player controls ───────────────────────────────────
@@ -3778,10 +3821,10 @@ const _OVL_WARM_GATE  = 0.40;  // first link has no velocity — near old greedy
 const _OVL_MIN_SPEED  = 0.04;  // below this (per s) treat as stationary; skip heading veto
 const _OVL_LEAD       = 0.15;  // s — tiny forward tolerance so the current frame still shows
 
-function overlayTracklets() {
-  const o = st.overlays;
-  if (o._tracklets && o._trackletsSeq === o.seq) return o._tracklets;
-  const samples = (o.detections || [])
+// Pure: chain a detection list into tracklets. Shared by the recorded overlay
+// (cached on st.overlays.seq) and the live overlay (cached on liveTail.recentSeq).
+function buildTracklets(detections) {
+  const samples = (detections || [])
     .map(d => ({ ts: Number(d.abs_ts), boxes: (d.boxes || []) }))   // unfiltered; filtered at draw
     .filter(s => Number.isFinite(s.ts) && s.boxes.length)
     .sort((a, b) => a.ts - b.ts);
@@ -3841,15 +3884,32 @@ function overlayTracklets() {
         tracks.push({ cls: cand.cls, vx: null, vy: null,
                       pts: [{ ts: s.ts, box: cand.box, cx: cand.cx, cy: cand.cy }] });
   }
+  return tracks;
+}
+
+function overlayTracklets() {
+  const o = st.overlays;
+  if (o._tracklets && o._trackletsSeq === o.seq) return o._tracklets;
+  const tracks = buildTracklets(o.detections || []);
   o._tracklets = tracks;
   o._trackletsSeq = o.seq;
   return tracks;
 }
 
-function boxesAtOverlayTime(ts) {
-  if (!Number.isFinite(Number(ts))) return [];
+function liveTracklets() {
+  const o = liveTail;
+  if (o._tracklets && o._trackletsSeq === o.recentSeq) return o._tracklets;
+  const tracks = buildTracklets(o.recentDets || []);
+  o._tracklets = tracks;
+  o._trackletsSeq = o.recentSeq;
+  return tracks;
+}
+
+// Sample tracklet boxes at time ts: interpolate within a bracketed span, else
+// persist the most recent PAST detection (causal). Unfiltered — caller filters.
+function boxesFromTracklets(tracks, ts) {
   const out = [];
-  for (const t of overlayTracklets()) {
+  for (const t of tracks) {
     const pts = t.pts;
     let drawn = false;
     for (let i = 0; i + 1 < pts.length; i++) {
@@ -3870,7 +3930,12 @@ function boxesAtOverlayTime(ts) {
     }
     if (recent) out.push(recent.box);
   }
-  return _filterBoxes(out);                     // class/zone filter applied at draw
+  return out;
+}
+
+function boxesAtOverlayTime(ts) {
+  if (!Number.isFinite(Number(ts))) return [];
+  return _filterBoxes(boxesFromTracklets(overlayTracklets(), ts));   // class/zone filter at draw
 }
 
 // ── BITC marker: read the world-time burned into the displayed frame ──────────
@@ -3952,20 +4017,22 @@ function drawBoxes(ts) {
 }
 
 function drawLiveBoxes() {
-  // The displayed frame carries its exact BITC time in the burned marker —
-  // read it and match the nearest detection on the SAME (detector) clock. This
-  // replaces matching against transport/player clocks, which can lead the subject.
-  let det = null;
+  // The displayed frame carries its exact BITC time in the burned marker. HLS
+  // playback lags ~8s while the detector is realtime, so recentDets brackets the
+  // marker time → interpolate boxes (same tracklet machinery as the recorded
+  // overlay) for a smooth glide instead of snapping at the 2fps detector rate.
   const markerTs = decodeLiveMarker(el.liveVideo);
-  if (markerTs != null && liveTail.recentDets.length) {
+  if (markerTs == null || !liveTail.recentDets.length) { drawBoxList(el.liveVideo, []); return; }
+  let boxes = boxesFromTracklets(liveTracklets(), markerTs);
+  if (!boxes.length) {                       // gap fallback: nearest detection within 1s
     let best = null, bestDist = Infinity;
     for (const d of liveTail.recentDets) {
       const dist = Math.abs(d.abs_ts - markerTs);
       if (dist < bestDist) { best = d; bestDist = dist; }
     }
-    det = (best && bestDist < 1.0) ? best : null;
+    if (best && bestDist < 1.0) boxes = best.boxes || [];
   }
-  drawBoxList(el.liveVideo, _filterBoxes(det?.boxes));
+  drawBoxList(el.liveVideo, _filterBoxes(boxes));
 }
 
 function _filterBoxes(boxes) {
