@@ -236,21 +236,6 @@ CREATE TABLE IF NOT EXISTS notification_confirmations (
 CREATE INDEX IF NOT EXISTS nconf_status_updated
     ON notification_confirmations(status, updated_at);
 
--- Real-time detections from HLS .ts segments, pending MP4 backfill.
--- Rows here make events appear in the UI within seconds of detection.
--- Consumed and deleted by _backfill_loop when the MP4 segment closes.
-CREATE TABLE IF NOT EXISTS hls_events (
-    id          INTEGER PRIMARY KEY,
-    source_id   TEXT    NOT NULL,
-    abs_ts      REAL    NOT NULL,
-    class       TEXT    NOT NULL,
-    confidence  REAL    NOT NULL DEFAULT 0,
-    boxes_json  TEXT,
-    thumb_jpeg  BLOB,
-    created_at  REAL    NOT NULL DEFAULT (unixepoch('now'))
-);
-CREATE INDEX IF NOT EXISTS hevt_source_ts ON hls_events(source_id, abs_ts);
-
 -- Per-rule progress cursor over each event source table. Tracks the highest
 -- row id already considered for notifications, keyed by insertion order (NOT
 -- abs_ts) so late, backdated object_events — inserted after their segment
@@ -1738,97 +1723,6 @@ class VideoSegmentDB:
             self._provisional_tracklet_cache[seg_id] = (now, cached_rows)
         return [dict(row) for row in cached_rows]
 
-    # ── HLS real-time event store ──────────────────────────────────────────
-    def insert_hls_events(self, events: list[dict]) -> None:
-        """Store provisional events detected from live HLS .ts segments."""
-        area_cache: dict[str, list[list[dict]]] = {}
-        filtered: list[dict] = []
-        for event in events:
-            source_id = event.get("source_id")
-            if not source_id:
-                continue
-            if source_id not in area_cache:
-                area_cache[source_id] = self.activity_areas(source_id)
-            if _event_allowed_by_areas(event, area_cache[source_id]):
-                filtered.append(event)
-        if not filtered:
-            return
-        with self._connect() as conn:
-            conn.executemany(
-                "INSERT INTO hls_events(source_id, abs_ts, class, confidence, boxes_json, thumb_jpeg)"
-                " VALUES(:source_id,:abs_ts,:class,:confidence,:boxes_json,:thumb_jpeg)",
-                filtered,
-            )
-
-    def get_hls_thumb(self, hls_event_id: int) -> bytes | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT thumb_jpeg FROM hls_events WHERE id=?", (hls_event_id,)
-            ).fetchone()
-        return bytes(row["thumb_jpeg"]) if row and row["thumb_jpeg"] else None
-
-    def get_hls_events(self, source_id: str | None = None,
-                       since: float | None = None,
-                       until: float | None = None,
-                       zone_id=None) -> list[dict]:
-        cutoff = time.time() - _PROVISIONAL_GRACE_SECONDS
-        live_cutoff = time.time() - _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS
-        epoch = _segment_media_epoch_sql("s")
-        coverage_end = f"({epoch} + COALESCE(s.duration_sec, s.end_ts - s.start_ts))"
-        where, params = [
-            "abs_ts>=?",
-            "("
-            "abs_ts>=?"
-            " OR EXISTS ("
-            "SELECT 1 FROM segments s"
-            " WHERE s.source_id=hls_events.source_id"
-            " AND s.end_ts IS NOT NULL"
-            f" AND {epoch} IS NOT NULL"
-            f" AND {epoch}<=hls_events.abs_ts"
-            f" AND {coverage_end}>hls_events.abs_ts"
-            ")"
-            ")",
-        ], [cutoff, live_cutoff]
-        if source_id and source_id != "all":
-            where.append("source_id=?"); params.append(source_id)
-        if since is not None:
-            where.append("abs_ts>=?"); params.append(since)
-        if until is not None:
-            where.append("abs_ts<=?"); params.append(until)
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM hls_events WHERE {' AND '.join(where)}"
-                " ORDER BY abs_ts DESC",
-                params,
-            ).fetchall()
-        events = [{
-            "id":          f"h:{r['source_id']}:{r['abs_ts']:.2f}",
-            "hls_id":      r["id"],
-            "source_id":   r["source_id"],
-            "abs_ts":      r["abs_ts"],
-            "class":       r["class"],
-            "confidence":  r["confidence"],
-            "boxes_json":  r["boxes_json"],
-            "provisional": True,
-            "start_off":   0.0,
-            "end_off":     _LIVE_HLS_SEGMENT_SECONDS,
-            "segment_id":  None,
-        } for r in rows]
-        return _filter_with_polygons(events, self.zone_polygons(source_id, zone_id))
-
-    def delete_hls_events(self, source_id: str, since: float, until: float) -> int:
-        with self._connect() as conn:
-            cur = conn.execute(
-                "DELETE FROM hls_events WHERE source_id=? AND abs_ts>=? AND abs_ts<=?",
-                (source_id, since, until),
-            )
-            return cur.rowcount
-
-    def prune_hls_events(self, max_age_seconds: float = _PROVISIONAL_GRACE_SECONDS) -> None:
-        cutoff = time.time() - max_age_seconds
-        with self._connect() as conn:
-            conn.execute("DELETE FROM hls_events WHERE abs_ts<?", (cutoff,))
-
     def live_status(self, source_id: str | None = None, zone_id=None,
                     det_since: float | None = None,
                     det_until: float | None = None) -> dict:
@@ -2693,12 +2587,10 @@ def _yolo_socket_request(req: dict, timeout: float) -> dict:
 #   det = per-frame detections from recorded segments. Unlike object_events
 #         'appeared', this sees the whole presence, not just the entry instant,
 #         so a person who walks into a zone is caught.
-# B4: the live detector's video_detections ('det') is the authoritative live
-# pass. 'hls' is retired — the HLS-tag loop no longer writes hls_events. The
-# fetcher + cursor machinery for 'hls' stay defined (harmless) so retained
-# cursors survive; just no longer iterated.
+# The live detector's video_detections ('det') is the authoritative live pass.
+# (The retired 'hls' HLS-tag-loop path and its hls_events store are gone.)
 _NOTIFICATION_KINDS = ("det",)
-_NOTIFICATION_KIND_MAX_ID_TABLE = {"hls": "hls_events", "det": "video_detections"}
+_NOTIFICATION_KIND_MAX_ID_TABLE = {"det": "video_detections"}
 
 
 def _notification_kind_max_id(conn: sqlite3.Connection, kind: str) -> int:
@@ -2759,42 +2651,9 @@ def _notification_events_after(
     polygons = _notification_zone_polygons(conn, rule["source_id"], rule["zone_ref"])
     if polygons is None:
         return [], start_id
-    if kind == "hls":
-        return _notification_hls_events_after(conn, rule, polygons, start_id, limit)
     if kind == "det":
         return _notification_det_events_after(conn, rule, polygons, start_id, limit)
     return [], start_id
-
-
-def _notification_hls_events_after(
-    conn: sqlite3.Connection,
-    rule: dict,
-    polygons: list[list[dict]],
-    start_id: int,
-    limit: int,
-) -> tuple[list[dict], int]:
-    source_id = rule["source_id"]
-    classes = set(rule.get("classes") or [])
-    rows = conn.execute(
-        "SELECT id, source_id, abs_ts, class, confidence, boxes_json, thumb_jpeg"
-        " FROM hls_events WHERE id>? ORDER BY id ASC LIMIT ?",
-        (start_id, max(1, int(limit))),
-    ).fetchall()
-    max_id = start_id
-    events = []
-    for r in rows:
-        d = dict(r)
-        if d["id"] > max_id:
-            max_id = d["id"]
-        if d["source_id"] != source_id:
-            continue
-        if classes and d["class"] not in classes:
-            continue
-        d["_kind"] = "hls"
-        events.append(d)
-    if polygons:
-        events = _filter_with_polygons(events, polygons)
-    return events, max_id
 
 
 def _notification_det_events_after(
@@ -3006,16 +2865,12 @@ def _notification_event_ref(event: dict) -> str:
     kind = event.get("_kind")
     if kind == "object":
         return f"o:{event['id']}"
-    if kind == "hls":
-        return f"h:{event['id']}"
     if kind == "det":
         return f"d:{event['id']}"
     return str(event["id"])
 
 
 def _notification_thumb_url(event: dict, event_ref: str) -> str:
-    if event.get("_kind") == "hls":
-        return f"/api/video/hls-thumb/{event['id']}"
     return f"/api/video/event-thumb/{event_ref}"
 
 

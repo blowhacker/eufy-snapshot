@@ -564,7 +564,7 @@ def read_frame(conn: sqlite3.Connection, video_dir: Path,
     return FrameResult(None, loc.reason, "none", None)
 
 
-# ── shadow-mode invariant check ─────────────────────────────────────────────
+# ── BITC round-trip invariant check ─────────────────────────────────────────
 
 @dataclass(frozen=True)
 class RoundTrip:

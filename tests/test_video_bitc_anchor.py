@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import json
+import sqlite3
 import tempfile
 import types
 import unittest
@@ -387,6 +388,75 @@ class VideoBitcAnchorTests(unittest.TestCase):
         x0, y0, width, height = bitc.geometry(model.frames[0])
         self.assertTrue(np.all(model.frames[0][y0 : y0 + height, x0 : x0 + width, :] == 0))
         self.assertTrue(capture.released)
+
+
+class BitcRoundTripInvariantTests(unittest.TestCase):
+    """check_detection_round_trip: resolve(media->BITC(detection)) must land on a
+    usable asset whose BITC time equals the detection's, within EPS. The invariant
+    is on BITC time, not offset (a boundary-duplicate instant resolves to the
+    adjacent segment at a different offset and is still correct)."""
+
+    def _conn(self, media_epoch: float, abs_ts: float) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            "CREATE TABLE segments(id INTEGER PRIMARY KEY, media_epoch REAL);"
+            "CREATE TABLE video_detections("
+            "id INTEGER PRIMARY KEY, source_id TEXT, abs_ts REAL, segment_id INTEGER);"
+        )
+        conn.execute("INSERT INTO segments(id, media_epoch) VALUES(1,?)", (media_epoch,))
+        conn.execute(
+            "INSERT INTO video_detections(id, source_id, abs_ts, segment_id)"
+            " VALUES(1,'cam',?,1)", (abs_ts,))
+        return conn
+
+    @staticmethod
+    def _loc(epoch: float, media_offset: float):
+        return types.SimpleNamespace(
+            provider="mp4",
+            anchor=types.SimpleNamespace(media_to_bitc=lambda off: epoch + off),
+            media_offset=media_offset,
+            reason="ok",
+        )
+
+    def test_ok_when_resolved_bitc_matches(self) -> None:
+        conn = self._conn(media_epoch=1000.0, abs_ts=1005.0)   # expected offset 5.0
+        with mock.patch.object(media_time, "resolve", return_value=self._loc(1000.0, 5.0)):
+            rt = media_time.check_detection_round_trip(conn, Path("/x"), 1)
+        self.assertTrue(rt.ok)
+        self.assertEqual(rt.status, "ok")
+        self.assertFalse(rt.alternate)
+        self.assertLess(rt.world_delta, media_time.EPS)
+
+    def test_alternate_segment_same_instant_is_ok(self) -> None:
+        # boundary duplicate: adjacent segment (epoch 1002, offset 3) -> same BITC
+        conn = self._conn(media_epoch=1000.0, abs_ts=1005.0)   # expected offset 5.0
+        with mock.patch.object(media_time, "resolve", return_value=self._loc(1002.0, 3.0)):
+            rt = media_time.check_detection_round_trip(conn, Path("/x"), 1)
+        self.assertTrue(rt.ok)
+        self.assertTrue(rt.alternate)                          # offset differs, BITC matches
+
+    def test_world_mismatch_when_resolved_bitc_drifts(self) -> None:
+        conn = self._conn(media_epoch=1000.0, abs_ts=1005.0)
+        with mock.patch.object(media_time, "resolve", return_value=self._loc(1000.0, 9.0)):
+            rt = media_time.check_detection_round_trip(conn, Path("/x"), 1)
+        self.assertFalse(rt.ok)
+        self.assertEqual(rt.status, "world_mismatch")
+
+    def test_no_detection_for_missing_row(self) -> None:
+        conn = self._conn(media_epoch=1000.0, abs_ts=1005.0)
+        rt = media_time.check_detection_round_trip(conn, Path("/x"), 999)
+        self.assertFalse(rt.ok)
+        self.assertEqual(rt.status, "no_detection")
+
+    def test_propagates_resolve_failure(self) -> None:
+        conn = self._conn(media_epoch=1000.0, abs_ts=1005.0)
+        miss = types.SimpleNamespace(provider="none", anchor=None,
+                                     media_offset=None, reason="no_anchor")
+        with mock.patch.object(media_time, "resolve", return_value=miss):
+            rt = media_time.check_detection_round_trip(conn, Path("/x"), 1)
+        self.assertFalse(rt.ok)
+        self.assertEqual(rt.status, "no_anchor")
 
 
 if __name__ == "__main__":

@@ -335,7 +335,7 @@ class _LiveDetectorSupervisor:
         self.relay_host = os.environ.get("WANYARD_RELAY_HOST", "mediamtx").strip() or "mediamtx"
         self.path_suffix = os.environ.get("WANYARD_RELAY_PATH_SUFFIX", "").strip()
         self.fps = float(os.environ.get("WANYARD_LIVE_FPS", "2.0") or "2.0")
-        self.claim = os.environ.get("WANYARD_SHADOW_CLAIM", "1") == "1"
+        self.claim = os.environ.get("WANYARD_DETECTOR_CLAIM", "1") == "1"
         self.workers: dict[str, _SourceWorker] = {}
         self.thread = threading.Thread(
             target=self.run,

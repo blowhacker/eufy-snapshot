@@ -559,20 +559,6 @@ def make_app(
     async def api_video_event_thumb(request: Request) -> Response:
         return await _serve_event_thumb(request.path_params["event_id"])
 
-    async def api_video_hls_thumb(request: Request) -> Response:
-        if not video_db:
-            return Response(status_code=404)
-        hls_id = request.path_params.get("hls_id", "")
-        try:
-            hls_id_int = int(hls_id)
-        except ValueError:
-            return Response(status_code=400)
-        data = await asyncio.to_thread(video_db.get_hls_thumb, hls_id_int)
-        if not data:
-            return Response(status_code=404)
-        return Response(content=data, media_type="image/jpeg",
-                        headers={"Cache-Control": _IMG_CACHE})
-
     async def api_video_live_thumb(request: Request) -> Response:
         """Crop a thumbnail for a provisional (open-segment) event from the
         live HLS .ts fragments, using the burned-in BITC timecode to find the
@@ -1587,7 +1573,6 @@ def make_app(
         Route("/api/health",                api_health),
         Route("/api/thumb",                 api_thumb),
         Route("/api/video/event-thumb/{event_id}", api_video_event_thumb),
-        Route("/api/video/hls-thumb/{hls_id}", api_video_hls_thumb),
         Route("/api/video/live-thumb",      api_video_live_thumb),
         Route("/api/video/segment-at",      api_video_segment_at),
         Route("/api/video/resolve",         api_video_resolve),

@@ -2167,11 +2167,9 @@ function _makeThumbNode(evt, baseTs) {
   media = document.createElement("img");
   media.loading = "lazy";
   media.alt = "";
-  media.src = evt.hls_id
-    ? `/api/video/hls-thumb/${evt.hls_id}`
-    : `/api/video/event-thumb/${encodeURIComponent(String(evt.id))}`;
+  media.src = `/api/video/event-thumb/${encodeURIComponent(String(evt.id))}`;
   media.onerror = () => {
-    if (!evt.provisional || evt.hls_id) return;
+    if (!evt.provisional) return;
     const fallback = document.createElement("div");
     fallback.className = "ev-thumb-live";
     fallback.textContent = "LIVE";
