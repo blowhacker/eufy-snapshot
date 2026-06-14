@@ -55,6 +55,8 @@ services:
       - YOLO_SOCKET=/run/yolo/yolo.sock
       - WANYARD_RELAY_HOST=mediamtx
       - WANYARD_RELAY_PATH_SUFFIX=-stamped
+      # Stamper emits HEVC; tag the .mp4 archive hvc1 so Chrome/Safari play it.
+      - WANYARD_RECORD_VIDEO_TAG=hvc1
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
@@ -113,14 +115,14 @@ services:
       # targeted (cq/crf) with a VBV cap above camera native (~1.6M garden /
       # ~0.8M front): re-encoding compressed video needs headroom to match the
       # original's look; the cap just bounds motion peaks for retention.
-      - WANYARD_STAMP_ENCODER=auto
-      - WANYARD_STAMP_CQ=25
+      # All cameras HEVC for the trial. cq28 (not 25): at cq25 HEVC sat at the
+      # 2.5M cap = no storage win vs h264; cq28 lets HEVC's ~30% efficiency drop
+      # the bitrate at ~h264-cq25 quality, which is the whole point. Recorder
+      # tags the .mp4 hvc1 for browser playback (WANYARD_RECORD_VIDEO_TAG).
+      - WANYARD_STAMP_ENCODER=hevc_nvenc
+      - WANYARD_STAMP_CQ=28
       - WANYARD_STAMP_MAXRATE=2.5M
       - WANYARD_STAMP_BUFSIZE=5M
-      # HEVC playback test (staging): garden encodes h265 (recorder -c copy
-      # carries it to both .mp4 archive and .ts live HLS), front stays h264 as
-      # a control. Verify Chrome plays both recorded + live-overlay, then decide.
-      - WANYARD_STAMP_TAPO_GARDEN_ENCODER=hevc_nvenc
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

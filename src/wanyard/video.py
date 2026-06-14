@@ -3048,6 +3048,13 @@ class VideoWorker:
         self._prune_live_dir()
         seg_path = date_dir / dt.strftime("%Y-%m-%d_%H-%M-%S.mp4")
         rel_path = seg_path.relative_to(self.video_dir).as_posix()
+        # HEVC in MP4: ffmpeg's mov muxer defaults to the 'hev1' tag, which
+        # Chrome/Safari refuse — 'hvc1' is required for browser playback. Set
+        # WANYARD_RECORD_VIDEO_TAG=hvc1 when the stamper emits HEVC. Applies to
+        # the .mp4 archive only (the .ts HLS uses no mp4 codec tag). Leave unset
+        # for h264 (tagging h264 as hvc1 is invalid).
+        vtag = os.environ.get("WANYARD_RECORD_VIDEO_TAG")
+        mp4_tag = ["-tag:v", vtag] if vtag else []
         try:
             self._proc = subprocess.Popen(
                 [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
@@ -3060,7 +3067,7 @@ class VideoWorker:
                  "-rtsp_transport", self.source.rtsp_transport,
                  "-i", url,
                  # Archive: MP4 with faststart
-                 "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
+                 "-c:v", "copy", *mp4_tag, "-c:a", "aac", "-b:a", "64k",
                  "-movflags", "+faststart", str(seg_path),
                  # Live: rolling HLS. ffmpeg deletes the active window; startup
                  # pruning clears unreferenced files from older ffmpeg writers.
