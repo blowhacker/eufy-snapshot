@@ -2401,10 +2401,10 @@ function eventTag(cls) {
 
 function eventDurationLabel(evt) {
   const seconds = Math.max(1, Math.round((evt.end_off ?? 0) - (evt.start_off ?? 0)));
-  if (seconds < 60) return `+${seconds}s`;
+  if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
-  return s ? `+${m}m ${s}s` : `+${m}m`;
+  return s ? `${m}m ${s}s` : `${m}m`;
 }
 
 function bucketStart(ts) {

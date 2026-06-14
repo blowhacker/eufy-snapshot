@@ -15,7 +15,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
+import urllib.request
 
 from . import bitc
 
@@ -52,6 +53,7 @@ _BITC_ANCHOR_SCAN_SECONDS = 5.0
 _BITC_ANCHOR_SCAN_FRAMES = 150
 _BITC_ZERO_CONTAINER_PTS = "container_pts"
 _BITC_ZERO_FIRST_FRAME = "first_frame"
+_RECORD_RELAY_WAIT_SECONDS = 180.0
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS segments (
@@ -397,6 +399,10 @@ class VideoSegmentDB:
                 "UPDATE segments SET scanned_at=? WHERE id=?",
                 (time.time() if scanned_at is None else float(scanned_at), segment_id),
             )
+
+    def delete_segment(self, segment_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM segments WHERE id=?", (segment_id,))
 
     def open_live_segment(self, source_id: str) -> dict | None:
         with self._connect() as conn:
@@ -3051,6 +3057,8 @@ class VideoWorker:
         ffmpeg = shutil.which("ffmpeg")
         if not url or not ffmpeg:
             return
+        if not self._wait_for_relay_path(url):
+            return
         dt       = datetime.fromtimestamp(ts, tz=timezone.utc)
         date_dir = self.video_dir / self.source.id / dt.strftime("%Y/%m/%d")
         date_dir.mkdir(parents=True, exist_ok=True)
@@ -3154,6 +3162,18 @@ class VideoWorker:
         self._seg_start = 0.0
         if seg_id:
             if seg_path:
+                try:
+                    file_size = seg_path.stat().st_size
+                except OSError:
+                    file_size = 0
+                if file_size <= 0:
+                    LOG.warning(
+                        "discarding failed segment seg=%d src=%s path=%s: no MP4 produced",
+                        seg_id, self.source.id, seg_path,
+                    )
+                    self.db.delete_segment(seg_id)
+                    return
+
                 media_epoch = _decode_bitc_media_epoch(seg_path)
                 if media_epoch is not None:
                     self.db.set_segment_media_start(seg_id, media_epoch)
@@ -3164,10 +3184,52 @@ class VideoWorker:
                 else:
                     LOG.warning(
                         "BITC-ANCHOR seg=%d src=%s no readable frame-0 marker; "
-                        "leaving media_epoch NULL",
+                        "marking invalid so backfill does not queue it",
                         seg_id, self.source.id,
                     )
+                    self.db.mark_scanned(seg_id)
             self.db.close_segment(seg_id, ts, None, None)
+
+    def _wait_for_relay_path(self, url: str) -> bool:
+        relay_host = os.environ.get("WANYARD_RELAY_HOST", "").strip()
+        if not relay_host:
+            return True
+        parsed = urlparse(url)
+        path = parsed.path.lstrip("/")
+        if not path or parsed.hostname != relay_host:
+            return True
+        try:
+            timeout = float(os.environ.get(
+                "WANYARD_RECORD_WAIT_FOR_RELAY_SECONDS",
+                str(_RECORD_RELAY_WAIT_SECONDS),
+            ))
+        except (TypeError, ValueError):
+            timeout = _RECORD_RELAY_WAIT_SECONDS
+        if timeout <= 0:
+            return True
+
+        deadline = time.time() + timeout
+        logged = False
+        while not self._stop.is_set():
+            if _mediamtx_path_ready(relay_host, path):
+                if logged:
+                    LOG.info("relay path ready for %s: %s", self.source.id, path)
+                return True
+            if not logged:
+                LOG.info(
+                    "waiting for relay path before recording %s: %s",
+                    self.source.id, path,
+                )
+                logged = True
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                LOG.warning(
+                    "relay path not ready after %.0fs for %s: %s",
+                    timeout, self.source.id, path,
+                )
+                return False
+            self._stop.wait(min(1.0, remaining))
+        return False
 
 
 def _decode_bitc_media_epoch(
@@ -3251,6 +3313,19 @@ def _frame_pts_seconds(frame) -> float | None:
         return float(pts * time_base)
     except (TypeError, ValueError):
         return None
+
+
+def _mediamtx_path_ready(relay_host: str, path: str) -> bool:
+    url = f"http://{relay_host}:9997/v3/paths/list"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return False
+    for item in payload.get("items") or []:
+        if item.get("name") == path:
+            return bool(item.get("ready"))
+    return False
 
 
 def _write_webvtt(path: Path, sprite_name: str, w: int, h: int,

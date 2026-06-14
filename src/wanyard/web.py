@@ -1402,12 +1402,19 @@ def make_app(
         import shutil as _shutil
         disk = _shutil.disk_usage(video_dir or Path("."))
         pending = 0
+        ignored_invalid = 0
         total_segs = 0
         latest_event_ts = None
         if video_db:
             with video_db._connect() as conn:
                 pending = conn.execute(
                     "SELECT COUNT(*) FROM segments s WHERE s.end_ts IS NOT NULL"
+                    " AND s.media_epoch IS NOT NULL"
+                    " AND s.scanned_at IS NULL"
+                ).fetchone()[0]
+                ignored_invalid = conn.execute(
+                    "SELECT COUNT(*) FROM segments s WHERE s.end_ts IS NOT NULL"
+                    " AND s.media_epoch IS NULL"
                     " AND s.scanned_at IS NULL"
                 ).fetchone()[0]
                 total_segs = conn.execute(
@@ -1453,6 +1460,7 @@ def make_app(
             "source_sizes": source_sizes,
             "segments": total_segs,
             "backfill_pending": pending,
+            "backfill_ignored_invalid": ignored_invalid,
             "yolo_connected": yolo_ok,
             "backfill_alive": backfill_alive,
             "recording_threads": recording_threads,

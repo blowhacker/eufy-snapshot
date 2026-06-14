@@ -30,6 +30,8 @@ async function loadStatus() {
   const deadCams  = Object.entries(threads).filter(([,alive])=>!alive).map(([id])=>id);
   const yoloOk    = d.yolo_connected;
   const bfDone    = d.backfill_pending === 0;
+  const invalid   = d.backfill_ignored_invalid || 0;
+  const ignoredText = invalid > 0 ? ` · ignored ${invalid} invalid clips` : '';
   const anyDead   = deadCams.length > 0;
 
   const healthEl  = document.getElementById('pipelineHealth');
@@ -48,11 +50,11 @@ async function loadStatus() {
     chipClass = 'warn'; chipTxt.textContent = 'Detection offline';
   } else if (!bfDone && d.backfill_pending > 0) {
     healthClass = 'warn'; healthText = 'Processing';
-    subText = `${d.backfill_pending} clips queued for detection · last event ${fmt.ts(d.latest_event_ts)}`;
+    subText = `${d.backfill_pending} clips queued for detection${ignoredText} · last event ${fmt.ts(d.latest_event_ts)}`;
     chipClass = 'warn'; chipTxt.textContent = `Processing: ${d.backfill_pending} clips`;
   } else {
     healthClass = 'ok'; healthText = 'Healthy';
-    subText = `Detection active · all clips tagged · last event ${fmt.ts(d.latest_event_ts)}`;
+    subText = `Detection active · all clips tagged${ignoredText} · last event ${fmt.ts(d.latest_event_ts)}`;
     chipClass = ''; chipTxt.textContent = 'All systems healthy';
   }
 
