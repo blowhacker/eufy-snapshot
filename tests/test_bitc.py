@@ -18,6 +18,18 @@ if str(SRC) not in sys.path:
 from wanyard import bitc
 
 
+def _yuv420_to_bgr24(y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Full-range BT.601 yuv420p -> bgr24, chroma nearest-upsampled by 2."""
+    yf = y.astype(np.float32)
+    uf = np.repeat(np.repeat(u, 2, axis=0), 2, axis=1).astype(np.float32) - 128.0
+    vf = np.repeat(np.repeat(v, 2, axis=0), 2, axis=1).astype(np.float32) - 128.0
+    r = yf + 1.402 * vf
+    g = yf - 0.344136 * uf - 0.714136 * vf
+    b = yf + 1.772 * uf
+    bgr = np.stack([b, g, r], axis=-1)
+    return np.clip(bgr, 0, 255).astype(np.uint8)
+
+
 class BitcCodecTests(unittest.TestCase):
     def test_round_trip_random_values(self) -> None:
         rng = random.Random(0xB17C)
@@ -62,6 +74,24 @@ class BitcCodecTests(unittest.TestCase):
         ] = replacement
         self.assertEqual(bitc.decode_value(frame), (None, False))
         self.assertEqual(bitc.decode(frame), (None, False))
+
+    def test_render_yuv420_decodes_over_saturated_chroma(self) -> None:
+        # yuv420p planes with adversarial chroma: a black luma cell sitting on
+        # saturated chroma converts to a bright bgr24 cell and would misread as
+        # white unless render_yuv420 neutralises the chroma. 720p, even dims.
+        h, w = 720, 1280
+        rng = random.Random(0x420)
+        for _ in range(200):
+            unix_seconds = rng.uniform(1_700_000_000.0, 2_700_000_000.0)
+            value = bitc.encode_value(unix_seconds)
+            y = np.full((h, w), 40, dtype=np.uint8)          # dark luma
+            u = np.full((h // 2, w // 2), 255, dtype=np.uint8)  # saturated chroma
+            v = np.full((h // 2, w // 2), 255, dtype=np.uint8)
+            bitc.render_yuv420(y, u, v, value)
+            bgr = _yuv420_to_bgr24(y, u, v)
+            decoded, crc_ok = bitc.decode_value(bgr)
+            self.assertTrue(crc_ok)
+            self.assertEqual(decoded, value)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for the lossy BITC test")

@@ -21,6 +21,7 @@ HEIGHT = CELL
 _MAX_VALUE = 1 << NPAY
 _WHITE = 255
 _THRESHOLD = 128
+_CHROMA_NEUTRAL = 128
 
 
 def encode_value(unix_seconds: float) -> int:
@@ -74,6 +75,30 @@ def render(frame_bgr: np.ndarray, value: int) -> np.ndarray:
 def render_time(frame_bgr: np.ndarray, unix_seconds: float) -> np.ndarray:
     """Burn ``unix_seconds`` into ``frame_bgr``."""
     return render(frame_bgr, encode_value(unix_seconds))
+
+
+def render_yuv420(y: np.ndarray, u: np.ndarray, v: np.ndarray, value: int) -> None:
+    """Burn ``value`` into yuv420p planes in place.
+
+    The marker is black/white, i.e. pure luma: cells are written into the
+    full-res ``y`` plane and the chroma planes are neutralised (128) over the
+    strip so the marker reads back cleanly regardless of scene chroma. Each
+    plane is a 2D ``uint8`` view ``(rows, stride)`` — column padding in the
+    stride is left untouched.
+
+    This avoids the bgr24 round-trip (two full-frame colourspace conversions
+    per frame) that :func:`render` would force on a decoded yuv420p frame.
+    """
+    value = _validate_value(value)
+    x0, y0, width, _ = geometry(int(y.shape[0]))
+    bits = _bits_for_value(value)
+    for i, bit in enumerate(bits):
+        x1 = x0 + i * CELL
+        y[y0 : y0 + CELL, x1 : x1 + CELL] = _WHITE if bit else 0
+    cy0, cy1 = y0 // 2, (y0 + CELL) // 2
+    cx0, cx1 = x0 // 2, (x0 + width) // 2
+    u[cy0:cy1, cx0:cx1] = _CHROMA_NEUTRAL
+    v[cy0:cy1, cx0:cx1] = _CHROMA_NEUTRAL
 
 
 def decode(frame_bgr: np.ndarray) -> tuple[float | None, bool]:

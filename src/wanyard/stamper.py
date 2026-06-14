@@ -169,18 +169,29 @@ class _StamperWorker:
                         abs_ts = anchor.observe(rtp, wall)
                         if rtp0 is None:
                             rtp0 = rtp
-                        img = frame.to_ndarray(format="bgr24")
+                        # Stamp directly into the decoded yuv420p planes: the
+                        # marker is pure luma, so write the Y cells and
+                        # neutralise chroma in place. Avoids the bgr24
+                        # round-trip (two full-frame colourspace conversions
+                        # per frame just to touch a luma strip).
+                        if frame.format.name != "yuv420p":
+                            frame = frame.reformat(format="yuv420p")
                         try:
-                            bitc.render(img, bitc.encode_value(abs_ts))
+                            value = bitc.encode_value(abs_ts)
                         except ValueError:
                             LOG.warning("stamper %s abs_ts %.3f out of range",
                                         self.source_id, abs_ts)
-                        of = av.VideoFrame.from_ndarray(img, format="bgr24")
+                        else:
+                            yb, ub, vb = frame.planes
+                            y = np.frombuffer(yb, np.uint8).reshape(-1, yb.line_size)
+                            u = np.frombuffer(ub, np.uint8).reshape(-1, ub.line_size)
+                            vp = np.frombuffer(vb, np.uint8).reshape(-1, vb.line_size)
+                            bitc.render_yuv420(y, u, vp, value)
                         pts = int(round((rtp - rtp0) * 90000))
-                        of.pts = pts if pts > last_pts else last_pts + 1
-                        last_pts = of.pts
-                        of.time_base = out_tb
-                        for op in vout.encode(of):
+                        frame.pts = pts if pts > last_pts else last_pts + 1
+                        last_pts = frame.pts
+                        frame.time_base = out_tb
+                        for op in vout.encode(frame):
                             out.mux(op)
                 elif aout is not None and packet.stream is ain:
                     packet.stream = aout
