@@ -109,11 +109,14 @@ services:
     environment:
       - VIDEO_DIR=/app/video
       - WANYARD_RELAY_HOST=mediamtx
-      - WANYARD_STAMP_CRF=18
-      # VBV cap: crf18 alone bloats lean CCTV ~14x. 1 Mbps ceiling ~= native;
-      # BITC marker decodes ~99% even at 0.85 Mbps (bitrate-independent).
-      - WANYARD_STAMP_MAXRATE=1M
-      - WANYARD_STAMP_BUFSIZE=2M
+      # Encoder auto-detects NVENC (GPU) and falls back to libx264. Quality-
+      # targeted (cq/crf) with a VBV cap above camera native (~1.6M garden /
+      # ~0.8M front): re-encoding compressed video needs headroom to match the
+      # original's look; the cap just bounds motion peaks for retention.
+      - WANYARD_STAMP_ENCODER=auto
+      - WANYARD_STAMP_CQ=25
+      - WANYARD_STAMP_MAXRATE=2.5M
+      - WANYARD_STAMP_BUFSIZE=5M
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

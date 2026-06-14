@@ -31,6 +31,36 @@ _DISC_FORWARD = 5.0        # rtp step above this (s) = discontinuity → reancho
 _PATH_REFRESH_SECONDS = 30.0
 _STAMPED_SUFFIX = "-stamped"
 
+_nvenc_probe: bool | None = None
+
+
+def _nvenc_available() -> bool:
+    """True if h264_nvenc can actually open + encode on this host.
+
+    Cached: the codec is compiled into ffmpeg regardless of hardware, so we
+    open a tiny encoder and push one frame — that fails without a real NVIDIA
+    GPU, which is exactly the signal we want.
+    """
+    global _nvenc_probe
+    if _nvenc_probe is not None:
+        return _nvenc_probe
+    try:
+        import av
+
+        cc = av.codec.CodecContext.create("h264_nvenc", "w")
+        cc.width = 64
+        cc.height = 64
+        cc.pix_fmt = "yuv420p"
+        cc.time_base = Fraction(1, 30)
+        cc.open()
+        cc.encode(av.VideoFrame(64, 64, "yuv420p"))
+        cc.encode(None)
+        _nvenc_probe = True
+    except Exception as exc:
+        LOG.info("h264_nvenc unavailable, using libx264: %s", exc)
+        _nvenc_probe = False
+    return _nvenc_probe
+
 
 class _StampAnchor:
     """abs_ts = rtp + delta, delta = min(wall - rtp) over a rolling window.
@@ -70,12 +100,24 @@ class _StamperWorker:
         self.local_stop = threading.Event()
         self.in_url = f"rtsp://{relay_host}:8554/{source_id}"
         self.out_url = f"rtsp://{out_host or relay_host}:8554/{source_id}{_STAMPED_SUFFIX}"
-        self.crf = os.environ.get("WANYARD_STAMP_CRF", "18")
-        self.preset = os.environ.get("WANYARD_STAMP_PRESET", "ultrafast")
-        # Optional VBV cap. crf alone re-encodes already-lean CCTV ~14x fatter
-        # (visually-lossless of low-bitrate source); a maxrate ceiling bounds the
-        # motion peaks for predictable retention. BITC marker is unaffected by
-        # bitrate (solid 8px luma cells decode ~99% even at native 0.85 Mbps).
+        # Encoder: "auto" prefers h264_nvenc when the GPU probe succeeds, else
+        # libx264 (no hard GPU dependency — non-NVIDIA boxes fall back cleanly).
+        self.encoder = os.environ.get("WANYARD_STAMP_ENCODER", "auto")
+        # Quality targets (per encoder). x264 uses crf; nvenc uses cq. Both are
+        # quality-targeted so easy/static scenes stay lean and only motion costs
+        # bits — mirrors the camera's own rate control.
+        self.crf = os.environ.get("WANYARD_STAMP_CRF", "23")
+        self.cq = os.environ.get("WANYARD_STAMP_CQ", "25")
+        # libx264 default veryfast, not ultrafast: ultrafast re-encodes
+        # already-compressed CCTV so inefficiently it looks like garbage even at
+        # native bitrate. nvenc has its own preset knob.
+        self.preset = os.environ.get("WANYARD_STAMP_PRESET", "veryfast")
+        self.nvenc_preset = os.environ.get("WANYARD_STAMP_NVENC_PRESET", "p5")
+        # VBV cap above camera native (re-encoding compressed video needs
+        # headroom to match the original's look). crf/cq keep the average near
+        # native; maxrate just bounds motion peaks for predictable retention.
+        # BITC marker is bitrate-independent (solid 8px luma cells decode ~99%
+        # even at 0.85 Mbps).
         self.maxrate = os.environ.get("WANYARD_STAMP_MAXRATE")
         self.bufsize = os.environ.get("WANYARD_STAMP_BUFSIZE")
         self.thread = threading.Thread(
@@ -108,6 +150,34 @@ class _StamperWorker:
         while not self.stopped() and time.time() < end:
             time.sleep(min(0.25, max(0.0, end - time.time())))
 
+    def _video_codec(self) -> str:
+        """Resolve the output video encoder.
+
+        ``auto`` uses h264_nvenc when a real GPU encode probe succeeds (the
+        codec is compiled in even on non-NVIDIA hosts, so presence alone is not
+        enough — we must actually open it), otherwise libx264.
+        """
+        if self.encoder == "libx264":
+            return "libx264"
+        if self.encoder == "nvenc":
+            return "h264_nvenc"
+        codec = "h264_nvenc" if _nvenc_available() else "libx264"
+        LOG.info("stamper %s encoder=auto resolved to %s", self.source_id, codec)
+        return codec
+
+    def _video_options(self, codec: str, gop: int) -> dict[str, str]:
+        opts = {"g": str(gop), "keyint_min": str(gop)}
+        if codec == "h264_nvenc":
+            # VBR + constant-quality (cq); no tune=zerolatency (it disables
+            # B-frames/lookahead and wrecks quality). Relay tolerates ~1-2s.
+            opts.update({"preset": self.nvenc_preset, "rc": "vbr", "cq": self.cq})
+        else:
+            opts.update({"preset": self.preset, "crf": self.crf})
+        if self.maxrate:
+            opts["maxrate"] = self.maxrate
+            opts["bufsize"] = self.bufsize or self.maxrate
+        return opts
+
     def _stream(self) -> None:
         import av
 
@@ -120,7 +190,8 @@ class _StamperWorker:
 
             out = av.open(self.out_url, "w", format="rtsp",
                           options={"rtsp_transport": "tcp"})
-            vout = out.add_stream("libx264", rate=vin.average_rate or 15)
+            codec = self._video_codec()
+            vout = out.add_stream(codec, rate=vin.average_rate or 15)
             vout.width = vin.codec_context.width
             vout.height = vin.codec_context.height
             vout.pix_fmt = "yuv420p"
@@ -134,12 +205,7 @@ class _StamperWorker:
             # ~2s keyframe interval so the downstream HLS (hls_time 2) and short
             # records are seekable; we control GOP now that we re-encode.
             gop = max(1, int(round(2 * float(vin.average_rate or 15))))
-            vout.options = {"preset": self.preset, "tune": "zerolatency",
-                            "crf": self.crf, "g": str(gop),
-                            "keyint_min": str(gop)}
-            if self.maxrate:
-                vout.options["maxrate"] = self.maxrate
-                vout.options["bufsize"] = self.bufsize or self.maxrate
+            vout.options = self._video_options(codec, gop)
             aout = None
             if ain is not None:
                 rate = getattr(ain.codec_context, "sample_rate", None) or 8000
