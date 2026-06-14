@@ -47,13 +47,15 @@ def _nvenc_available() -> bool:
     try:
         import av
 
+        # 1280x720, not a tiny frame: NVENC rejects sub-minimum dimensions with
+        # EINVAL (a 64x64 probe gives a false negative — the encoder is fine).
         cc = av.codec.CodecContext.create("h264_nvenc", "w")
-        cc.width = 64
-        cc.height = 64
+        cc.width = 1280
+        cc.height = 720
         cc.pix_fmt = "yuv420p"
         cc.time_base = Fraction(1, 30)
         cc.open()
-        cc.encode(av.VideoFrame(64, 64, "yuv420p"))
+        cc.encode(av.VideoFrame(1280, 720, "yuv420p"))
         cc.encode(None)
         _nvenc_probe = True
     except Exception as exc:
