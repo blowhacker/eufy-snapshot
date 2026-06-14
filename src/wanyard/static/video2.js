@@ -4114,7 +4114,8 @@ function interpolateBox(a, b, t) {
 //   CV-gate    — predict next pos from velocity; reject if the miss (2nd derivative)
 //                is implausible. Fast-but-straight stays; teleport/heading-flip cut.
 const _OVL_MAX_GAP    = 2.5;   // s — never bridge a bigger hole
-const _OVL_SNAP       = 0.8;   // s — show a lone/edge sample within this window
+const _OVL_FADE_START = 0.3;   // s — a held box stays solid this long, then starts to fade
+const _OVL_FADE_FULL  = 1.5;   // s — held box fully faded out (and dropped) by here
 const _OVL_GATE_FLOOR = 0.22;  // normalized center units — generous; keep glides smooth
 const _OVL_GATE_K     = 2.5;   // gate grows with speed*dt (fast straight movers get slack)
 const _OVL_WARM_GATE  = 0.40;  // first link has no velocity — near old greedy, lets fast tracks start
@@ -4205,6 +4206,16 @@ function liveTracklets() {
   return tracks;
 }
 
+// Opacity for a held/recovered box by how stale it is (seconds since its
+// backing detection): solid until _OVL_FADE_START, then eases to 0 by
+// _OVL_FADE_FULL. Recomputed every frame, so a fresh detection (staleness ~0)
+// snaps it back to 1 — the fade undoes itself, no persistent state.
+function _ovlFadeOpacity(staleness) {
+  if (staleness <= _OVL_FADE_START) return 1;
+  if (staleness >= _OVL_FADE_FULL) return 0;
+  return 1 - (staleness - _OVL_FADE_START) / (_OVL_FADE_FULL - _OVL_FADE_START);
+}
+
 // Sample tracklet boxes at time ts: interpolate within a bracketed span, else
 // persist the most recent PAST detection (causal). Unfiltered; caller filters.
 function sampleTrackletBoxes(tracks, ts) {
@@ -4228,10 +4239,12 @@ function sampleTrackletBoxes(tracks, ts) {
     let recent = null;
     for (const p of pts) {
       const age = ts - p.ts;                   // >0 = past, small <0 = current frame
-      if (age >= -_OVL_LEAD && age <= _OVL_SNAP && (!recent || p.ts > recent.ts)) recent = p;
+      if (age >= -_OVL_LEAD && age <= _OVL_FADE_FULL && (!recent || p.ts > recent.ts)) recent = p;
     }
     if (recent) {
-      out.push(recent.box);
+      // Hold the box, fading it as it goes stale (copy so we never mutate the
+      // cached detection box). Fresh samples reset the age → opacity back to 1.
+      out.push({ ...recent.box, opacity: _ovlFadeOpacity(ts - recent.ts) });
       held++;
     }
   }
@@ -4349,7 +4362,8 @@ function drawLiveBoxes() {
       if (dist < bestDist) { best = latest; bestDist = dist; }
     }
     if (best && bestDist < 1.0) {
-      boxes = best.boxes || [];
+      const op = _ovlFadeOpacity(bestDist);
+      boxes = (best.boxes || []).map(b => ({ ...b, opacity: op }));
       overlayMode = "fallback";
     } else {
       overlayMode = "empty";
@@ -4407,7 +4421,8 @@ function drawBoxList(v, boxes) {
     const color   = classColor(box.cls);
     const x = ox+box.x1*rw, y = oy+box.y1*rh;
     const w = (box.x2-box.x1)*rw, h = (box.y2-box.y1)*rh;
-    ctx.globalAlpha = primary ? 1 : 0.55;
+    const fade = box.opacity ?? 1;             // 1 = fresh; <1 = stale, fading out
+    ctx.globalAlpha = (primary ? 1 : 0.55) * fade;
     ctx.strokeStyle = color; ctx.lineWidth = primary ? 2.5 : 1;
     ctx.strokeRect(x,y,w,h);
     if (primary) {
@@ -4416,7 +4431,7 @@ function drawBoxList(v, boxes) {
       const tw = ctx.measureText(lbl).width+6;
       const ty = y>18?y-18:y+h;
       ctx.fillStyle=color; ctx.fillRect(x-1,ty,tw,16);
-      ctx.globalAlpha=1; ctx.fillStyle="#050709";
+      ctx.globalAlpha=fade; ctx.fillStyle="#050709";
       ctx.fillText(lbl,x+2,ty+11);
     }
   });
