@@ -174,15 +174,17 @@ class _StamperWorker:
         """
         if self.encoder == "libx264":
             return "libx264"
-        if self.encoder == "nvenc":
+        if self.encoder in ("nvenc", "h264_nvenc"):
             return "h264_nvenc"
+        if self.encoder in ("hevc", "hevc_nvenc", "h265_nvenc"):
+            return "hevc_nvenc"
         codec = "h264_nvenc" if _nvenc_available() else "libx264"
         LOG.info("stamper %s encoder=auto resolved to %s", self.source_id, codec)
         return codec
 
     def _video_options(self, codec: str, gop: int) -> dict[str, str]:
         opts = {"g": str(gop), "keyint_min": str(gop)}
-        if codec == "h264_nvenc":
+        if codec.endswith("_nvenc"):
             # Low-latency tuning is mandatory, not optional: the live detector
             # drops frames whose age exceeds 1.0s (_MAX_LIVE_LAG_SECONDS), and
             # NVENC's default lookahead/output-delay buffering pushes end-to-end

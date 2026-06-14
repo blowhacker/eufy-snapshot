@@ -117,6 +117,10 @@ services:
       - WANYARD_STAMP_CQ=25
       - WANYARD_STAMP_MAXRATE=2.5M
       - WANYARD_STAMP_BUFSIZE=5M
+      # HEVC playback test (staging): garden encodes h265 (recorder -c copy
+      # carries it to both .mp4 archive and .ts live HLS), front stays h264 as
+      # a control. Verify Chrome plays both recorded + live-overlay, then decide.
+      - WANYARD_STAMP_TAPO_GARDEN_ENCODER=hevc_nvenc
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
