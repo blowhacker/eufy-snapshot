@@ -1040,6 +1040,9 @@ const LIVE_DVR_EDGE_PAD_SECONDS = 0.25;
 const LIVE_TIMELINE_FUTURE_PAD_SECONDS = 600;
 const LIVE_EDGE_RATE_RESET_SECONDS = 4;
 const LIVE_DET_WINDOW_SECONDS = 6;
+const LIVE_DET_POLL_MS = 500;
+const LIVE_DET_SYNC_TOLERANCE_SECONDS = 0.20;
+const LIVE_DET_SYNC_MAX_AGE_SECONDS = 12;
 const ABSOLUTE_SEEK_RETRIES = 6;
 const ABSOLUTE_SEEK_RETRY_MS = 750;
 const ZONE_ALL = "all";
@@ -1233,6 +1236,7 @@ const liveTail = {
   recentSeq: 0,     // bumped when recentDets is replaced → tracklet cache key
   _tracklets: null,
   _trackletsSeq: -1,
+  syncToDetections: false,
   window: null,
   bitcTimeOffset: null,
   targetTs: null,
@@ -1578,6 +1582,53 @@ function seekLiveVideoToTs(ts, win) {
   liveTail.targetTs = ts;
   liveTail.bitcTimeOffset = ts - target;
   return true;
+}
+
+function seekLiveVideoToMarkerTs(ts, tolerance = LIVE_DET_SYNC_TOLERANCE_SECONDS) {
+  if (ts == null || !Number.isFinite(Number(ts))) return false;
+  const markerTs = decodeLiveMarker(el.liveVideo);
+  if (markerTs == null) return false;
+  const delta = Number(ts) - markerTs;
+  if (Math.abs(delta) <= tolerance) return true;
+  let target = (el.liveVideo.currentTime || 0) + delta;
+  const ranges = el.liveVideo.seekable;
+  if (ranges?.length) {
+    const start = ranges.start(0);
+    const end = ranges.end(ranges.length - 1);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return false;
+    if (target < start - tolerance || target > end + tolerance) return false;
+    target = Math.max(start, Math.min(end, target));
+  }
+  try {
+    el.liveVideo.currentTime = target;
+  } catch {
+    return false;
+  }
+  liveTail.targetTs = Number(ts);
+  liveTail.bitcTimeOffset = Number(ts) - target;
+  return true;
+}
+
+function latestLiveBoxDetection() {
+  const dets = (liveTail.recentDets || [])
+    .filter(d => d.source_id === liveTail.srcId && (d.boxes || []).length)
+    .sort((a, b) => Number(a.abs_ts) - Number(b.abs_ts));
+  if (dets.length) return dets[dets.length - 1];
+  return (liveTail.latestDet?.source_id === liveTail.srcId && (liveTail.latestDet.boxes || []).length)
+    ? liveTail.latestDet
+    : null;
+}
+
+function syncLiveVideoToLatestBoxes(force = false) {
+  if (!liveTail.active || !liveTail.syncToDetections) return false;
+  const det = latestLiveBoxDetection();
+  if (!det || !Number.isFinite(Number(det.abs_ts))) return false;
+  const age = Date.now() / 1000 - Number(det.abs_ts);
+  if (age > LIVE_DET_SYNC_MAX_AGE_SECONDS) return false;
+  return seekLiveVideoToMarkerTs(
+    Number(det.abs_ts),
+    force ? LIVE_DET_SYNC_TOLERANCE_SECONDS / 2 : LIVE_DET_SYNC_TOLERANCE_SECONDS,
+  );
 }
 
 function liveTailCurrentTs() {
@@ -3245,6 +3296,7 @@ async function startLiveTail(srcId = null, options = {}) {
   const nativeLive = seekTs == null ? await fetchNativeLiveSource(chosen) : null;
   if (token !== liveTail.token) return false;
   const useNativeLowLatency = Boolean(nativeLive?.url);
+  liveTail.syncToDetections = useNativeLowLatency && seekTs == null;
   const hlsUrl = useNativeLowLatency
     ? nativeLive.url
     : `/video/live/${encodeURIComponent(chosen)}/live.m3u8`;
@@ -3349,6 +3401,7 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   liveTail.recentDets = [];
   liveTail.recentSeq++;
   liveTail._tracklets = null;
+  liveTail.syncToDetections = false;
   liveTail.window = null;
   liveTail.bitcTimeOffset = null;
   liveTail.targetTs = null;
@@ -3387,13 +3440,14 @@ async function pollLiveTail() {
     liveTail.latestDet = (data.detections || []).find(d => d.source_id === liveTail.srcId) ?? liveTail.latestDet;
     liveTail.recentDets = (data.recent_detections || []).filter(d => d.source_id === liveTail.srcId);
     liveTail.recentSeq++;   // invalidate the live tracklet cache
+    syncLiveVideoToLatestBoxes(true);
     renderClsCtrl();
     timeline.setData(allSegsForSrc(), filteredEvts());
     scheduleNearestEvents(true);
     updateLiveTailClock();
   } finally {
     if (token === liveTail.token && liveTail.active) {
-      liveTail.pollTimer = setTimeout(pollLiveTail, 1500);
+      liveTail.pollTimer = setTimeout(pollLiveTail, LIVE_DET_POLL_MS);
     }
   }
 }
@@ -3406,6 +3460,7 @@ function updateLiveTailClock() {
     el.liveVideo.play().catch(() => {});
   }
 
+  syncLiveVideoToLatestBoxes(false);
   const ts = liveTailCurrentTs();
   updateLivePlaybackRate(ts);
   timeline.setPlayhead(ts);
@@ -3821,20 +3876,6 @@ function interpolateBox(a, b, t) {
   };
 }
 
-function clamp01(v) {
-  return Math.max(0, Math.min(1, Number(v)));
-}
-
-function translateBox(box, dx, dy) {
-  return {
-    ...box,
-    x1: clamp01(Number(box.x1) + dx),
-    y1: clamp01(Number(box.y1) + dy),
-    x2: clamp01(Number(box.x2) + dx),
-    y2: clamp01(Number(box.y2) + dy),
-  };
-}
-
 // Overlay association: chain per-frame boxes into short tracklets so a box only
 // interpolates toward the SAME object. Greedy nearest-center glides one box onto
 // a different object across the frame (busy road). Two cheap, ML-free gates fix it:
@@ -3848,7 +3889,6 @@ const _OVL_GATE_K     = 2.5;   // gate grows with speed*dt (fast straight movers
 const _OVL_WARM_GATE  = 0.40;  // first link has no velocity — near old greedy, lets fast tracks start
 const _OVL_MIN_SPEED  = 0.04;  // below this (per s) treat as stationary; skip heading veto
 const _OVL_LEAD       = 0.15;  // s — tiny forward tolerance so the current frame still shows
-const _OVL_LIVE_PREDICT = 1.0; // s — live edge can outrun YOLO; project short, recent tracks only
 
 // Pure: chain a detection list into tracklets. Shared by the recorded overlay
 // (cached on st.overlays.seq) and the live overlay (cached on liveTail.recentSeq).
@@ -3934,11 +3974,9 @@ function liveTracklets() {
   return tracks;
 }
 
-// Sample tracklet boxes at time ts: interpolate within a bracketed span. For
-// live edge only, optionally extrapolate a short distance from track velocity
-// when the displayed frame has outrun the newest YOLO result.
-function boxesFromTracklets(tracks, ts, opts = {}) {
-  const predictForwardSeconds = Number(opts.predictForwardSeconds || 0);
+// Sample tracklet boxes at time ts: interpolate within a bracketed span, else
+// persist the most recent PAST detection (causal). Unfiltered — caller filters.
+function boxesFromTracklets(tracks, ts) {
   const out = [];
   for (const t of tracks) {
     const pts = t.pts;
@@ -3951,14 +3989,6 @@ function boxesFromTracklets(tracks, ts, opts = {}) {
       }
     }
     if (drawn) continue;                       // interpolated within the tracklet
-    if (predictForwardSeconds > 0 && t.vx != null && t.vy != null && pts.length >= 2) {
-      const last = pts[pts.length - 1];
-      const age = ts - last.ts;
-      if (age > 0 && age <= predictForwardSeconds) {
-        out.push(translateBox(last.box, t.vx * age, t.vy * age));
-        continue;
-      }
-    }
     // else persist the most recent PAST detection (causal): a box must never
     // appear before its own detection, or it looks like the box predicts the
     // object and the subject "rides into" a box already sitting ahead.
@@ -4057,19 +4087,21 @@ function drawBoxes(ts) {
 
 function drawLiveBoxes() {
   // The displayed frame carries its exact BITC time in the burned marker. HLS
-  // playback can now be close enough to the edge that YOLO arrives after the
-  // frame. Interpolate when recentDets brackets the marker time; otherwise
-  // predict a bounded live-only box from the latest track velocity.
+  // playback is held near the freshest YOLO timestamp, so recentDets should
+  // bracket the marker time or land exactly on the latest boxes.
   const markerTs = decodeLiveMarker(el.liveVideo);
-  if (markerTs == null || !liveTail.recentDets.length) { drawBoxList(el.liveVideo, []); return; }
-  let boxes = boxesFromTracklets(liveTracklets(), markerTs, {
-    predictForwardSeconds: _OVL_LIVE_PREDICT,
-  });
+  if (markerTs == null) { drawBoxList(el.liveVideo, []); return; }
+  let boxes = liveTail.recentDets.length ? boxesFromTracklets(liveTracklets(), markerTs) : [];
   if (!boxes.length) {                       // gap fallback: nearest detection within 1s
     let best = null, bestDist = Infinity;
     for (const d of liveTail.recentDets) {
       const dist = Math.abs(d.abs_ts - markerTs);
       if (dist < bestDist) { best = d; bestDist = dist; }
+    }
+    const latest = latestLiveBoxDetection();
+    if (latest) {
+      const dist = Math.abs(Number(latest.abs_ts) - markerTs);
+      if (dist < bestDist) { best = latest; bestDist = dist; }
     }
     if (best && bestDist < 1.0) boxes = best.boxes || [];
   }
