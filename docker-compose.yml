@@ -43,9 +43,13 @@ services:
     image: wanyard:latest
     container_name: wanyard
     restart: unless-stopped
-    # web port is published per-env in docker-compose.override.yml
-    # (staging 8092, prod 8091); app must be on the project network so it
-    # can reach `mediamtx` by service name
+    # Web port. Defaults to 8091 so a fresh `git clone && docker compose up` is
+    # reachable at localhost:8091 (matches config.yaml's port). Override per
+    # deploy with WANYARD_WEB_PORT in a local .env (e.g. staging sets 8092) so
+    # the prod/staging instances on one host don't collide. App is on the
+    # project network so it can reach `mediamtx` by service name.
+    ports:
+      - "${WANYARD_WEB_PORT:-8091}:${WANYARD_WEB_PORT:-8091}"
     logging:
       driver: json-file
       options: {max-size: "50m", max-file: "3"}
