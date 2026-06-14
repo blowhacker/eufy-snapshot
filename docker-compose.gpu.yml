@@ -7,3 +7,16 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  stamper:
+    # NVIDIA_DRIVER_CAPABILITIES must include `video` for NVENC/NVDEC
+    # (the default compute,utility set does not inject libnvidia-encode/decode).
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
