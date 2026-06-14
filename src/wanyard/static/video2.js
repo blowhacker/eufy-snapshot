@@ -3256,10 +3256,11 @@ async function startLiveTail(srcId = null, options = {}) {
       if (liveTail.hls) { liveTail.hls.destroy(); liveTail.hls = null; }
       const hlsConfig = {
         lowLatencyMode: false,
-        // liveSyncDurationCount / liveMaxLatencyDurationCount intentionally omitted.
-        // Explicit liveMaxLatencyDurationCount triggers catchup mode during init
-        // (currentTime=0 → apparent latency=60s >> 12s limit → max poll rate).
-        // HLS.js defaults handle live sync correctly without this bug.
+        // Ride 2 segments back from the live edge (default 3) for lower latency.
+        // liveSyncDurationCount (the sync TARGET) is safe; only the separate
+        // liveMaxLatencyDurationCount triggers the init catchup bug (currentTime=0
+        // → apparent latency=60s >> limit → max poll rate), so that stays omitted.
+        liveSyncDurationCount: 2,
       };
       if (seekTs != null && liveWindow) hlsConfig.startPosition = liveMediaOffsetForTs(liveWindow, seekTs);
       const hls = new HlsCtor(hlsConfig);

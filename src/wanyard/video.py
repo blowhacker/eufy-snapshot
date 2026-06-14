@@ -22,7 +22,9 @@ from . import bitc
 LOG = logging.getLogger(__name__)
 
 _MAX_SEGMENT_SECONDS = 600
-_LIVE_HLS_SEGMENT_SECONDS = 2
+# 1s live segments (was 2): halves the per-segment component of live latency.
+# hls.js rides N segments back from the edge, so smaller segments = closer.
+_LIVE_HLS_SEGMENT_SECONDS = 1
 _LIVE_HLS_LIST_SIZE = _MAX_SEGMENT_SECONDS // _LIVE_HLS_SEGMENT_SECONDS
 _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS = (
     _LIVE_HLS_SEGMENT_SECONDS * (_LIVE_HLS_LIST_SIZE + 30)
