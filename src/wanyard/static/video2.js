@@ -1237,6 +1237,8 @@ const liveTail = {
   _tracklets: null,
   _trackletsSeq: -1,
   syncToDetections: false,
+  syncDetTs: null,
+  holdingForDetections: false,
   window: null,
   bitcTimeOffset: null,
   targetTs: null,
@@ -1584,12 +1586,13 @@ function seekLiveVideoToTs(ts, win) {
   return true;
 }
 
-function seekLiveVideoToMarkerTs(ts, tolerance = LIVE_DET_SYNC_TOLERANCE_SECONDS) {
+function seekLiveVideoToMarkerTs(ts, tolerance = LIVE_DET_SYNC_TOLERANCE_SECONDS, opts = {}) {
   if (ts == null || !Number.isFinite(Number(ts))) return false;
   const markerTs = decodeLiveMarker(el.liveVideo);
   if (markerTs == null) return false;
   const delta = Number(ts) - markerTs;
   if (Math.abs(delta) <= tolerance) return true;
+  if (delta < 0 && opts.allowBackward === false) return false;
   let target = (el.liveVideo.currentTime || 0) + delta;
   const ranges = el.liveVideo.seekable;
   if (ranges?.length) {
@@ -1619,16 +1622,33 @@ function latestLiveBoxDetection() {
     : null;
 }
 
-function syncLiveVideoToLatestBoxes(force = false) {
-  if (!liveTail.active || !liveTail.syncToDetections) return false;
+function liveDetectionTargetTs() {
   const det = latestLiveBoxDetection();
-  if (!det || !Number.isFinite(Number(det.abs_ts))) return false;
-  const age = Date.now() / 1000 - Number(det.abs_ts);
-  if (age > LIVE_DET_SYNC_MAX_AGE_SECONDS) return false;
-  return seekLiveVideoToMarkerTs(
-    Number(det.abs_ts),
-    force ? LIVE_DET_SYNC_TOLERANCE_SECONDS / 2 : LIVE_DET_SYNC_TOLERANCE_SECONDS,
-  );
+  if (!det || !Number.isFinite(Number(det.abs_ts))) return null;
+  const ts = Number(det.abs_ts);
+  const age = Date.now() / 1000 - ts;
+  if (age > LIVE_DET_SYNC_MAX_AGE_SECONDS) return liveTail.syncDetTs;
+  if (liveTail.syncDetTs == null || ts > liveTail.syncDetTs) {
+    liveTail.syncDetTs = ts;
+  }
+  return liveTail.syncDetTs;
+}
+
+function syncLiveVideoToLatestBoxes() {
+  if (!liveTail.active || !liveTail.syncToDetections) return false;
+  const targetTs = liveDetectionTargetTs();
+  if (targetTs == null) return false;
+  const markerTs = decodeLiveMarker(el.liveVideo);
+  if (markerTs == null) return false;
+  const delta = targetTs - markerTs;
+  if (delta > LIVE_DET_SYNC_TOLERANCE_SECONDS) {
+    seekLiveVideoToMarkerTs(targetTs, LIVE_DET_SYNC_TOLERANCE_SECONDS / 2, {
+      allowBackward: false,
+    });
+  }
+  liveTail.holdingForDetections = true;
+  if (!el.liveVideo.paused) el.liveVideo.pause();
+  return Math.abs(delta) <= LIVE_DET_SYNC_TOLERANCE_SECONDS;
 }
 
 function liveTailCurrentTs() {
@@ -3297,6 +3317,8 @@ async function startLiveTail(srcId = null, options = {}) {
   if (token !== liveTail.token) return false;
   const useNativeLowLatency = Boolean(nativeLive?.url);
   liveTail.syncToDetections = useNativeLowLatency && seekTs == null;
+  liveTail.syncDetTs = null;
+  liveTail.holdingForDetections = false;
   const hlsUrl = useNativeLowLatency
     ? nativeLive.url
     : `/video/live/${encodeURIComponent(chosen)}/live.m3u8`;
@@ -3402,6 +3424,8 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   liveTail.recentSeq++;
   liveTail._tracklets = null;
   liveTail.syncToDetections = false;
+  liveTail.syncDetTs = null;
+  liveTail.holdingForDetections = false;
   liveTail.window = null;
   liveTail.bitcTimeOffset = null;
   liveTail.targetTs = null;
@@ -3440,7 +3464,7 @@ async function pollLiveTail() {
     liveTail.latestDet = (data.detections || []).find(d => d.source_id === liveTail.srcId) ?? liveTail.latestDet;
     liveTail.recentDets = (data.recent_detections || []).filter(d => d.source_id === liveTail.srcId);
     liveTail.recentSeq++;   // invalidate the live tracklet cache
-    syncLiveVideoToLatestBoxes(true);
+    syncLiveVideoToLatestBoxes();
     renderClsCtrl();
     timeline.setData(allSegsForSrc(), filteredEvts());
     scheduleNearestEvents(true);
@@ -3456,11 +3480,11 @@ function updateLiveTailClock() {
   if (!liveTail.active) return;
 
   // Recover from paused state (tab hidden, autoplay policy, etc.)
-  if (!st.zoneEdit.active && el.liveVideo.paused && !el.liveVideo.ended) {
+  if (!liveTail.holdingForDetections && !st.zoneEdit.active && el.liveVideo.paused && !el.liveVideo.ended) {
     el.liveVideo.play().catch(() => {});
   }
 
-  syncLiveVideoToLatestBoxes(false);
+  syncLiveVideoToLatestBoxes();
   const ts = liveTailCurrentTs();
   updateLivePlaybackRate(ts);
   timeline.setPlayhead(ts);
