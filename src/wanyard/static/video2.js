@@ -3464,6 +3464,7 @@ function replaceLiveHistory(srcId, ts = null) {
 
 async function startLiveTail(srcId = null, options = {}) {
   const seekTs = Number.isFinite(options.seekTs) ? options.seekTs : null;
+  const force = Boolean(options.force);   // re-snap to the live edge even if already live
   const requestedAll = !srcId || srcId === "all";
   const chosen = chooseLiveSource(srcId);
   if (!chosen) {
@@ -3488,7 +3489,7 @@ async function startLiveTail(srcId = null, options = {}) {
     el.liveVideo.play().catch(() => {});
     return true;
   }
-  if ((liveTail.active || liveTail.starting) && liveTail.srcId === chosen && !restartNativeForTimestamp) return true;
+  if ((liveTail.active || liveTail.starting) && liveTail.srcId === chosen && !restartNativeForTimestamp && !force) return true;
 
   let liveWindow = null;
   if (seekTs != null) {
@@ -3519,6 +3520,7 @@ async function startLiveTail(srcId = null, options = {}) {
   }
 
   liveTail.active = true;
+  liveTail.userPaused = false;
   liveTail.latestDet = null;
   liveTail.recentDets = [];
   liveTail.window = liveWindow;
@@ -3715,8 +3717,9 @@ async function pollLiveTail() {
 function updateLiveTailClock() {
   if (!liveTail.active) return;
 
-  // Recover from paused state (tab hidden, autoplay policy, etc.)
-  if (!st.zoneEdit.active && el.liveVideo.paused && !el.liveVideo.ended) {
+  // Recover from INVOLUNTARY pauses (tab hidden, autoplay policy, etc.) — but
+  // not a manual click-to-pause (liveTail.userPaused), which must stick.
+  if (!liveTail.userPaused && !st.zoneEdit.active && el.liveVideo.paused && !el.liveVideo.ended) {
     el.liveVideo.play().catch(() => {});
   }
 
@@ -3759,10 +3762,14 @@ function startLiveFrameLoop() {
 function togglePlayback() {
   if (liveTail.active) {
     if (el.liveVideo.paused) {
+      liveTail.userPaused = false;
       updateLivePlaybackRate();
       el.liveVideo.play().catch(() => {});
     }
-    else el.liveVideo.pause();
+    else {
+      liveTail.userPaused = true;   // a manual pause — don't let the clock auto-resume
+      el.liveVideo.pause();
+    }
     setPlayIcon(!el.liveVideo.paused);
     return;
   }
@@ -3796,10 +3803,11 @@ el.boxes.addEventListener("click",  () => {
 el.boxes.classList.toggle("active", st.showBoxes);
 el.loop.classList.toggle("on", st.loop);
 el.liveBtn.addEventListener("click", () => {
-  // Always jump to the live edge — not a toggle. (Clicking while already live
-  // re-snaps to the edge.) To leave live, click a point on the timeline; that
-  // stops the tail and seeks to recorded.
-  startLiveTail(st.source !== "all" ? st.source : null);
+  // Always jump to the true live edge — not a toggle. force:true restarts the
+  // tail even if already live, dropping any pinned ts (so the URL goes back to
+  // ?source&live=1 with no ts — proper live, not a fixed point in the DVR).
+  // To leave live, click a point on the timeline; that stops the tail.
+  startLiveTail(st.source !== "all" ? st.source : null, { force: true });
   scrollTimelineToTs(Date.now() / 1000);
 });
 
