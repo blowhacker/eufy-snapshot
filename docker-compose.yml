@@ -46,6 +46,10 @@ services:
   app:
     build: .
     image: wanyard:latest
+    # build, don't pull: wanyard:latest isn't published, so a plain
+    # `docker compose up -d` must build it — otherwise compose retries a denied
+    # Docker Hub pull (annoying loop) before falling back to the build.
+    pull_policy: build
     container_name: wanyard
     restart: unless-stopped
     # Web port. Defaults to 8091 so a fresh `git clone && docker compose up` is
