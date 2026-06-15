@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
+import urllib.error
 import urllib.request
 from urllib.parse import quote
 
+LOG = logging.getLogger("wanyard.native_hls")
+
 MANIFEST_NAME = "video1_stream.m3u8"
 DEFAULT_PORT = 8888
+CONTROL_API_PORT = 9997
 
 
 def hls_port() -> int:
@@ -96,3 +102,66 @@ def fetch_asset(
             resp.headers.get("Content-Type"),
             passthrough,
         )
+
+
+# ── mediamtx runtime path registration ───────────────────────────────────
+# gen-mediamtx only writes paths at boot, so a camera added at runtime is
+# invisible to the relay (the stamper discovers cameras from mediamtx's path
+# list, /v3/paths/list). Register the same two paths gen-mediamtx would have
+# written, live, via the mediamtx control API — then the stamper picks the
+# camera up within its 30s refresh and <id><suffix> appears. A restart still
+# regenerates from the DB, so the two stay consistent. Best-effort: failures
+# (no relay, mediamtx down) never block the source add.
+
+def _control_api_base() -> str | None:
+    host = os.environ.get("WANYARD_RELAY_HOST", "").strip()
+    return f"http://{host}:{CONTROL_API_PORT}" if host else None
+
+
+def _relay_suffix() -> str:
+    return os.environ.get("WANYARD_RELAY_PATH_SUFFIX", "").strip()
+
+
+def _path_api_call(method: str, name: str, body: dict | None = None) -> bool:
+    base = _control_api_base()
+    if not base:
+        return False
+    verb = "add" if method == "POST" else "delete"
+    url = f"{base}/v3/config/paths/{verb}/{quote(name, safe='')}"
+    data = json.dumps(body or {}).encode() if method == "POST" else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except urllib.error.HTTPError as exc:
+        # POST on an existing path → 400; treat as already-registered.
+        if method == "POST" and exc.code == 400:
+            return True
+        LOG.info("mediamtx path %s %s -> HTTP %s", verb, name, exc.code)
+        return False
+    except Exception as exc:
+        LOG.info("mediamtx path %s %s failed: %s", verb, name, exc)
+        return False
+
+
+def register_source_paths(source_id: str, rtsp_url: str, transport: str = "tcp") -> None:
+    """Add a camera's ingest + stamped relay paths to mediamtx (live)."""
+    _path_api_call("POST", source_id, {
+        "source": rtsp_url,
+        "sourceOnDemand": True,
+        "sourceProtocol": transport if transport in ("tcp", "udp") else "tcp",
+    })
+    suffix = _relay_suffix()
+    if suffix:
+        _path_api_call("POST", f"{source_id}{suffix}", {})
+
+
+def unregister_source_paths(source_id: str) -> None:
+    """Remove a camera's relay paths from mediamtx (on source delete)."""
+    _path_api_call("DELETE", source_id)
+    suffix = _relay_suffix()
+    if suffix:
+        _path_api_call("DELETE", f"{source_id}{suffix}")
