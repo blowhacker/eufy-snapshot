@@ -3796,7 +3796,9 @@ el.boxes.addEventListener("click",  () => {
 el.boxes.classList.toggle("active", st.showBoxes);
 el.loop.classList.toggle("on", st.loop);
 el.liveBtn.addEventListener("click", () => {
-  if (liveTail.active) { stopLiveTail(); return; }
+  // Always jump to the live edge — not a toggle. (Clicking while already live
+  // re-snaps to the edge.) To leave live, click a point on the timeline; that
+  // stops the tail and seeks to recorded.
   startLiveTail(st.source !== "all" ? st.source : null);
   scrollTimelineToTs(Date.now() / 1000);
 });
