@@ -4114,8 +4114,9 @@ function interpolateBox(a, b, t) {
 //   CV-gate    — predict next pos from velocity; reject if the miss (2nd derivative)
 //                is implausible. Fast-but-straight stays; teleport/heading-flip cut.
 const _OVL_MAX_GAP    = 2.5;   // s — never bridge a bigger hole
-const _OVL_FADE_START = 0.3;   // s — a held box stays solid this long, then starts to fade
-const _OVL_FADE_FULL  = 1.5;   // s — held box fully faded out (and dropped) by here
+const _OVL_SNAP       = 0.8;   // s — recorded: show a held sample this long, then drop (no fade)
+const _OVL_FADE_START = 0.3;   // s — live: a held box stays solid this long, then starts to fade
+const _OVL_FADE_FULL  = 1.5;   // s — live: held box fully faded out (and dropped) by here
 const _OVL_GATE_FLOOR = 0.22;  // normalized center units — generous; keep glides smooth
 const _OVL_GATE_K     = 2.5;   // gate grows with speed*dt (fast straight movers get slack)
 const _OVL_WARM_GATE  = 0.40;  // first link has no velocity — near old greedy, lets fast tracks start
@@ -4218,7 +4219,11 @@ function _ovlFadeOpacity(staleness) {
 
 // Sample tracklet boxes at time ts: interpolate within a bracketed span, else
 // persist the most recent PAST detection (causal). Unfiltered; caller filters.
-function sampleTrackletBoxes(tracks, ts) {
+function sampleTrackletBoxes(tracks, ts, fade = false) {
+  // fade=true (live only): hold a stale box longer and fade it out instead of a
+  // hard drop. Recorded (fade=false) keeps the original short solid hold so a
+  // stale box never lingers/trails the subject.
+  const holdBound = fade ? _OVL_FADE_FULL : _OVL_SNAP;
   const out = [];
   let interpolated = 0, held = 0;
   for (const t of tracks) {
@@ -4239,12 +4244,12 @@ function sampleTrackletBoxes(tracks, ts) {
     let recent = null;
     for (const p of pts) {
       const age = ts - p.ts;                   // >0 = past, small <0 = current frame
-      if (age >= -_OVL_LEAD && age <= _OVL_FADE_FULL && (!recent || p.ts > recent.ts)) recent = p;
+      if (age >= -_OVL_LEAD && age <= holdBound && (!recent || p.ts > recent.ts)) recent = p;
     }
     if (recent) {
-      // Hold the box, fading it as it goes stale (copy so we never mutate the
-      // cached detection box). Fresh samples reset the age → opacity back to 1.
-      out.push({ ...recent.box, opacity: _ovlFadeOpacity(ts - recent.ts) });
+      // Recorded: solid box (original behavior). Live: copy + fade by staleness
+      // (never mutate the cached detection box; fresh samples reset opacity→1).
+      out.push(fade ? { ...recent.box, opacity: _ovlFadeOpacity(ts - recent.ts) } : recent.box);
       held++;
     }
   }
@@ -4346,7 +4351,7 @@ function drawLiveBoxes() {
   const markerTs = decodeLiveMarker(el.liveVideo);
   if (markerTs == null) { drawBoxList(el.liveVideo, []); return; }
   const sample = liveTail.recentDets.length
-    ? sampleTrackletBoxes(liveTracklets(), markerTs)
+    ? sampleTrackletBoxes(liveTracklets(), markerTs, true)   // live: fade held boxes
     : { boxes: [], mode: "empty" };
   let boxes = sample.boxes;
   let overlayMode = sample.mode;
