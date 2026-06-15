@@ -125,7 +125,7 @@ services:
       # 2.5M cap = no storage win vs h264; cq28 lets HEVC's ~30% efficiency drop
       # the bitrate at ~h264-cq25 quality, which is the whole point. Recorder
       # tags the .mp4 hvc1 for browser playback (WANYARD_RECORD_VIDEO_TAG).
-      - WANYARD_STAMP_ENCODER=hevc_nvenc
+      - WANYARD_STAMP_ENCODER=auto
       - WANYARD_STAMP_CQ=28
       - WANYARD_STAMP_MAXRATE=2.5M
       - WANYARD_STAMP_BUFSIZE=5M

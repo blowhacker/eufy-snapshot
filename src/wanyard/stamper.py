@@ -32,25 +32,26 @@ _DISC_FORWARD = 5.0        # rtp step above this (s) = discontinuity → reancho
 _PATH_REFRESH_SECONDS = 30.0
 _STAMPED_SUFFIX = "-stamped"
 
-_nvenc_probe: bool | None = None
+_nvenc_probe: dict[str, bool] = {}
 
 
-def _nvenc_available() -> bool:
-    """True if h264_nvenc can actually open + encode on this host.
+def _nvenc_available(codec: str = "h264_nvenc") -> bool:
+    """True if ``codec`` (h264_nvenc/hevc_nvenc) can actually open + encode here.
 
-    Cached: the codec is compiled into ffmpeg regardless of hardware, so we
-    open a tiny encoder and push one frame — that fails without a real NVIDIA
-    GPU, which is exactly the signal we want.
+    Cached per codec: the codec is compiled into ffmpeg regardless of hardware
+    (and a container started without gpu.yml has no GPU at all), so presence is
+    not enough — open a tiny encoder and push one frame; that fails without a
+    usable NVIDIA GPU, which is exactly the signal we want.
     """
-    global _nvenc_probe
-    if _nvenc_probe is not None:
-        return _nvenc_probe
+    if codec in _nvenc_probe:
+        return _nvenc_probe[codec]
+    ok = False
     try:
         import av
 
         # 1280x720, not a tiny frame: NVENC rejects sub-minimum dimensions with
         # EINVAL (a 64x64 probe gives a false negative — the encoder is fine).
-        cc = av.codec.CodecContext.create("h264_nvenc", "w")
+        cc = av.codec.CodecContext.create(codec, "w")
         cc.width = 1280
         cc.height = 720
         cc.pix_fmt = "yuv420p"
@@ -58,11 +59,11 @@ def _nvenc_available() -> bool:
         cc.open()
         cc.encode(av.VideoFrame(1280, 720, "yuv420p"))
         cc.encode(None)
-        _nvenc_probe = True
+        ok = True
     except Exception as exc:
-        LOG.info("h264_nvenc unavailable, using libx264: %s", exc)
-        _nvenc_probe = False
-    return _nvenc_probe
+        LOG.info("%s unavailable: %s", codec, exc)
+    _nvenc_probe[codec] = ok
+    return ok
 
 
 class _StampAnchor:
@@ -168,9 +169,11 @@ class _StamperWorker:
     def _video_codec(self) -> str:
         """Resolve the output video encoder.
 
-        ``auto`` uses h264_nvenc when a real GPU encode probe succeeds (the
-        codec is compiled in even on non-NVIDIA hosts, so presence alone is not
-        enough — we must actually open it), otherwise libx264.
+        ``auto`` prefers GPU and best codec: hevc_nvenc → h264_nvenc → libx264,
+        each gated by a real open+encode probe (the codecs are compiled in even
+        with no GPU / a container started without gpu.yml, so presence is not
+        enough). A GPU-less box (the default `docker compose up`) lands on
+        libx264 — no crash loop.
         """
         if self.encoder == "libx264":
             return "libx264"
@@ -178,8 +181,13 @@ class _StamperWorker:
             return "h264_nvenc"
         if self.encoder in ("hevc", "hevc_nvenc", "h265_nvenc"):
             return "hevc_nvenc"
-        codec = "h264_nvenc" if _nvenc_available() else "libx264"
-        LOG.info("stamper %s encoder=auto resolved to %s", self.source_id, codec)
+        for cand in ("hevc_nvenc", "h264_nvenc"):
+            if _nvenc_available(cand):
+                LOG.info("stamper %s encoder=auto resolved to %s", self.source_id, cand)
+                return cand
+        codec = "libx264"
+        LOG.info("stamper %s encoder=auto resolved to %s (no usable NVENC)",
+                 self.source_id, codec)
         return codec
 
     def _video_options(self, codec: str, gop: int) -> dict[str, str]:
