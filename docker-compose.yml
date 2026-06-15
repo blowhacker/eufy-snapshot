@@ -69,8 +69,7 @@ services:
       - WANYARD_RELAY_HOST=mediamtx
       - WANYARD_RELAY_PATH_SUFFIX=-stamped
       - WANYARD_MEDIAMTX_HLS_PORT=${WANYARD_MEDIAMTX_HLS_PORT:-8888}
-      # Stamper emits HEVC; tag the .mp4 archive hvc1 so Chrome/Safari play it.
-      - WANYARD_RECORD_VIDEO_TAG=hvc1
+      # (recorder auto-detects the stamped codec and tags hvc1 only for HEVC)
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

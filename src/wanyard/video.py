@@ -3051,6 +3051,32 @@ class VideoWorker:
         if self._seg_id or self._proc:
             self._stop_segment(time.time())
 
+    def _stamped_codec(self, url: str) -> str | None:
+        """Video codec of the stamped stream (hevc/h264/...), probed once.
+
+        The stamper auto-resolves its encoder per host (hevc_nvenc on GPU,
+        else libx264), so the recorder can't assume HEVC — it must look.
+        """
+        cached = getattr(self, "_codec_cache", None)
+        if cached is not None:
+            return cached or None
+        ffprobe = shutil.which("ffprobe")
+        codec = None
+        if ffprobe:
+            try:
+                out = subprocess.run(
+                    [ffprobe, "-v", "error", "-rtsp_transport",
+                     self.source.rtsp_transport, "-select_streams", "v:0",
+                     "-show_entries", "stream=codec_name",
+                     "-of", "default=nw=1:nk=1", url],
+                    capture_output=True, text=True, timeout=10,
+                )
+                codec = (out.stdout or "").strip().lower() or None
+            except Exception:
+                codec = None
+        self._codec_cache = codec or ""   # cache negatives too
+        return codec
+
     def _start_segment(self, ts: float) -> None:
         from .capture import resolve_rtsp_url
         url    = resolve_rtsp_url(self.source)
@@ -3065,13 +3091,12 @@ class VideoWorker:
         self._prune_live_dir()
         seg_path = date_dir / dt.strftime("%Y-%m-%d_%H-%M-%S.mp4")
         rel_path = seg_path.relative_to(self.video_dir).as_posix()
-        # HEVC in MP4: ffmpeg's mov muxer defaults to the 'hev1' tag, which
-        # Chrome/Safari refuse — 'hvc1' is required for browser playback. Set
-        # WANYARD_RECORD_VIDEO_TAG=hvc1 when the stamper emits HEVC. Applies to
-        # the .mp4 archive only (the .ts HLS uses no mp4 codec tag). Leave unset
-        # for h264 (tagging h264 as hvc1 is invalid).
-        vtag = os.environ.get("WANYARD_RECORD_VIDEO_TAG")
-        mp4_tag = ["-tag:v", vtag] if vtag else []
+        # HEVC in MP4 needs the 'hvc1' tag for Chrome/Safari (ffmpeg's mov muxer
+        # defaults to 'hev1', which they refuse). H264 must NOT be tagged hvc1 —
+        # it's incompatible and ffmpeg fails to write the header. The stamper's
+        # encoder is auto-resolved (hevc/h264/libx264), so tag only when the
+        # actual stream is HEVC. Applies to the .mp4 archive only.
+        mp4_tag = ["-tag:v", "hvc1"] if self._stamped_codec(url) == "hevc" else []
         try:
             self._proc = subprocess.Popen(
                 [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
