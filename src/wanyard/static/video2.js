@@ -1277,10 +1277,17 @@ const liveTail = {
   window: null,
   bitcTimeOffset: null,
   targetTs: null,
+  mode: null,                 // LIVE_M | PAUSED_M | DVR_M — the one source of truth
   nativeDelay: LIVE_NATIVE_DEFAULT_DELAY_SECONDS,
   usingNativeLowLatency: false,
   stats: null,
 };
+
+// Live viewer modes. Exactly one when liveTail.active; null when off (recorded).
+// LIVE  — following the edge (hls.js owns position). Green.
+// PAUSED— frozen; hls load stopped so it can't chase the edge (no jerk). Not green.
+// DVR   — seeked to a past point in the live window, playing/paused. Not green.
+const LIVE_M = "live", PAUSED_M = "paused", DVR_M = "dvr";
 
 function urlTimestamp(ts) {
   const n = Number(ts);
@@ -3483,10 +3490,12 @@ async function startLiveTail(srcId = null, options = {}) {
       setStatus("BUFFERING");
       return false;
     }
+    liveTail.mode = DVR_M;   // in-place seek to a past point = DVR, not the edge
     replaceLiveHistory(chosen, seekTs);
     updateLiveTailClock();
     updateLivePlaybackRate();
     el.liveVideo.play().catch(() => {});
+    syncLiveBtn();
     return true;
   }
   if ((liveTail.active || liveTail.starting) && liveTail.srcId === chosen && !restartNativeForTimestamp && !force) return true;
@@ -3520,7 +3529,7 @@ async function startLiveTail(srcId = null, options = {}) {
   }
 
   liveTail.active = true;
-  liveTail.userPaused = false;
+  liveTail.mode = seekTs == null ? LIVE_M : DVR_M;   // edge-follow vs seeked DVR
   liveTail.latestDet = null;
   liveTail.recentDets = [];
   liveTail.window = liveWindow;
@@ -3532,7 +3541,7 @@ async function startLiveTail(srcId = null, options = {}) {
   el.video.style.display = "none";
   el.empty.style.display = "none";
   el.liveVideo.style.display = "block";
-  el.liveBtn.classList.add("active", "on");
+  syncLiveBtn();   // green only once actually rolling at the edge (play event / clock)
   setPlayIcon(true);
   setStatus("LIVE");
   replaceLiveHistory(chosen, seekTs);
@@ -3661,6 +3670,7 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   liveTail.window = null;
   liveTail.bitcTimeOffset = null;
   liveTail.targetTs = null;
+  liveTail.mode = null;
   liveTail.nativeDelay = LIVE_NATIVE_DEFAULT_DELAY_SECONDS;
   liveTail.usingNativeLowLatency = false;
   liveTail.stats = null;
@@ -3714,12 +3724,26 @@ async function pollLiveTail() {
   }
 }
 
+// The live button is green only at the TRUE live edge, playing: in live mode,
+// not a pinned DVR seek (targetTs null), not manually paused, video rolling.
+// Otherwise it's a call-to-action ("jump back to live"), not a state light.
+function atLiveEdge() {
+  // Green is the explicit mode — no heuristics. LIVE means hls.js is following
+  // the edge; PAUSED/DVR are not the edge.
+  return liveTail.active && liveTail.mode === LIVE_M;
+}
+function syncLiveBtn() {
+  const green = atLiveEdge();
+  el.liveBtn.classList.toggle("active", green);
+  el.liveBtn.classList.toggle("on", green);
+}
+
 function updateLiveTailClock() {
   if (!liveTail.active) return;
 
   // Recover from INVOLUNTARY pauses (tab hidden, autoplay policy, etc.) — but
-  // not a manual click-to-pause (liveTail.userPaused), which must stick.
-  if (!liveTail.userPaused && !st.zoneEdit.active && el.liveVideo.paused && !el.liveVideo.ended) {
+  // never in PAUSED mode (a manual pause must stick).
+  if (liveTail.mode !== PAUSED_M && !st.zoneEdit.active && el.liveVideo.paused && !el.liveVideo.ended) {
     el.liveVideo.play().catch(() => {});
   }
 
@@ -3728,6 +3752,7 @@ function updateLiveTailClock() {
   timeline.setPlayhead(ts);
   setTimestampChip(ts, liveTail.srcId, true);
   setStatus("LIVE");
+  syncLiveBtn();   // keep the green light in sync with edge/pause/DVR state
   drawZones();
   // box overlay is driven per displayed frame (startLiveFrameLoop), not here
 }
@@ -3762,15 +3787,25 @@ function startLiveFrameLoop() {
 function togglePlayback() {
   if (liveTail.active) {
     if (el.liveVideo.paused) {
-      liveTail.userPaused = false;
-      updateLivePlaybackRate();
-      el.liveVideo.play().catch(() => {});
-    }
-    else {
-      liveTail.userPaused = true;   // a manual pause — don't let the clock auto-resume
+      // Resume from PAUSED → DVR (option a): play forward from the frozen frame,
+      // not snap to the edge. Re-attach as a seekable (non-LL) stream at that ts
+      // so it plays on without the edge-follower jerking it forward.
+      const frozenTs = liveTailCurrentTs();
+      if (Number.isFinite(frozenTs) && frozenTs > 0) {
+        startLiveTail(liveTail.srcId, { seekTs: frozenTs });   // → DVR_M
+      } else {
+        startLiveTail(liveTail.srcId, { force: true });        // fallback → LIVE_M
+      }
+    } else {
+      // Manual pause → PAUSED: freeze. stopLoad halts hls.js so its low-latency
+      // edge-recovery can't seek the frame forward (the jerk). The clock's
+      // auto-resume is gated on mode !== PAUSED.
+      liveTail.mode = PAUSED_M;
+      liveTail.hls?.stopLoad();
       el.liveVideo.pause();
     }
     setPlayIcon(!el.liveVideo.paused);
+    syncLiveBtn();
     return;
   }
   if (!player.paused) { player.pause(); return; }
@@ -3928,6 +3963,8 @@ document.addEventListener("keydown", e => {
 });
 el.video.addEventListener("click",    togglePlayback);
 el.liveVideo.addEventListener("click", togglePlayback);
+el.liveVideo.addEventListener("play",  syncLiveBtn);   // green tracks actual play/pause
+el.liveVideo.addEventListener("pause", syncLiveBtn);
 el.video.addEventListener("dblclick", toggleFullscreen);
 el.liveVideo.addEventListener("dblclick", toggleFullscreen);
 
