@@ -12,6 +12,9 @@ class V2Player {
   #rate = 1;
   #intendedTs = null;  // display target while async seek/load is in flight
   #presentedMediaTime = null;
+  #bitcEpoch = null;       // recorded clock re-anchored to the burned marker (ground truth)
+  #bitcEpochSeg = null;    // seg id the #bitcEpoch was learned for (reset on seg change)
+  #lastBitcMs = 0;         // throttle for the per-frame marker decode
   #listeners = { timeupdate: new Set(), frame: new Set(), play: new Set(), pause: new Set(), ended: new Set() };
 
   constructor(videoEl) {
@@ -205,7 +208,10 @@ class V2Player {
   get currentTs() {
     const mediaTime = this.#currentMediaTime();
     if (!this.#activeSeg || mediaTime == null) return null;
-    return this.#programDateTimeForMediaTime(mediaTime) ?? (this.#activeSeg.start_ts + mediaTime);
+    // Prefer the marker-anchored epoch (ground truth) over the cached media_epoch
+    // (seg start_ts); PDT still wins for live HLS.
+    return this.#programDateTimeForMediaTime(mediaTime)
+      ?? ((this.#bitcEpoch ?? this.#activeSeg.start_ts) + mediaTime);
   }
 
   get currentSeg() {
@@ -226,15 +232,37 @@ class V2Player {
 
   #startFrameClock() {
     if (typeof this.#v.requestVideoFrameCallback !== "function") return;
-    const tick = (_now, metadata) => {
+    const tick = (now, metadata) => {
       const mediaTime = Number(metadata?.mediaTime);
       if (Number.isFinite(mediaTime)) {
         this.#presentedMediaTime = mediaTime;
+        this.#syncBitcEpoch(mediaTime, now);   // re-anchor the clock to the marker
         this.#emit("frame");
       }
       this.#v.requestVideoFrameCallback(tick);
     };
     this.#v.requestVideoFrameCallback(tick);
+  }
+
+  // Re-anchor the recorded clock to the displayed frame's burned bitc marker.
+  // segments.media_epoch is a per-segment cache that can be wrong (a bad anchor
+  // poisons the whole segment, e.g. seg 42's 0.214s drift); the marker is ground
+  // truth. effectiveEpoch = marker - mediaTime keeps currentTs (and everything
+  // off it: overlay, timeline, the on-screen clock) on bitc. Throttled — the
+  // offset is ~constant per segment, so this is cheap, not per-frame work.
+  #syncBitcEpoch(mediaTime, nowMs) {
+    const seg = this.#activeSeg;
+    if (!seg || !Number.isFinite(seg.start_ts)) return;
+    if (seg.id !== this.#bitcEpochSeg) {       // new segment → relearn from scratch
+      this.#bitcEpoch = null; this.#bitcEpochSeg = seg.id; this.#lastBitcMs = 0;
+    }
+    if (nowMs - this.#lastBitcMs < 500) return;
+    this.#lastBitcMs = nowMs;
+    const marker = decodeLiveMarker(this.#v);
+    if (marker == null) return;                // undecodable frame → keep last epoch
+    const epoch = marker - mediaTime;
+    if (Math.abs(epoch - seg.start_ts) > 5) return;  // reject a wild/garbled decode
+    this.#bitcEpoch = epoch;
   }
 
   #currentMediaTime() {
