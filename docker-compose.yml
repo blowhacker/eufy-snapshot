@@ -3,7 +3,10 @@ services:
     # Shares the one image built by the `app` service below. Only `app` declares
     # `build:` so `docker compose up` builds wanyard:latest ONCE — three services
     # building the same tag in parallel races ("image already exists").
+    # pull_policy:never — don't race app's build by trying to pull the (unpublished)
+    # image from Docker Hub; use the local copy app produces.
     image: wanyard:latest
+    pull_policy: never
     container_name: wanyard-yolo
     restart: unless-stopped
     logging:
@@ -72,6 +75,7 @@ services:
 
   mediamtx-conf:
     image: wanyard:latest
+    pull_policy: never
     container_name: wanyard-mediamtx-conf
     restart: "no"
     logging:
@@ -102,6 +106,7 @@ services:
 
   stamper:
     image: wanyard:latest   # built by `app` (see note on yolo); no parallel build
+    pull_policy: never
     container_name: wanyard-stamper
     restart: unless-stopped
     # The image's default HEALTHCHECK is the app/yolo socket probe — wrong for
