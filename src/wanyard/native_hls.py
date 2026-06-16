@@ -9,7 +9,13 @@ from urllib.parse import quote
 
 LOG = logging.getLogger("wanyard.native_hls")
 
-MANIFEST_NAME = "video1_stream.m3u8"
+# Master (multivariant) playlist, NOT the bare media playlist
+# (video1_stream.m3u8). iOS Safari needs the master's #EXT-X-STREAM-INF CODECS
+# ="hvc1…" to start the HEVC decoder; a media playlist alone plays H.264 but
+# not HEVC on iOS (live showed blank on iPhone after the H.264→HEVC switch).
+# The master references the media playlist (relative) → still LL-HLS through
+# the same proxy. hls.js (desktop) handles a master playlist fine too.
+MANIFEST_NAME = "index.m3u8"
 DEFAULT_PORT = 8888
 CONTROL_API_PORT = 9997
 
@@ -83,6 +89,44 @@ def media_type(asset: str, upstream_type: str | None) -> str:
     if asset.endswith(".mp4") or asset.endswith(".m4s"):
         return "video/mp4"
     return "application/octet-stream"
+
+
+def prefers_native_player(user_agent: str | None) -> bool:
+    # Mirror the client's shouldUseNativeHls() (video2.js): Safari + iOS play
+    # HLS through the OS player (no MSE / hls.js). Everyone else uses hls.js.
+    # iOS Chrome/Firefox (CriOS/FxiOS) are WebKit too → caught by the iOS check.
+    ua = user_agent or ""
+    is_ios = any(tok in ua for tok in ("iPad", "iPhone", "iPod"))
+    is_safari = "Safari" in ua and not any(
+        tok in ua for tok in ("Chrome", "Chromium", "CriOS", "FxiOS", "Edg", "OPR", "Android")
+    )
+    return is_ios or is_safari
+
+
+# LL-HLS tags the native iOS/Safari player can't sustain through the proxy: it
+# chases the ~0.6s PART-HOLD-BACK edge, underruns over WiFi, and the blocking
+# playlist long-poll starves part fetches behind it on HTTP/1.1 → stalls blank.
+# Stripping these turns the media playlist into ordinary live HLS: the OS player
+# buffers a few whole segments back from the edge and plays stably (higher
+# latency, but it doesn't freeze). hls.js (desktop) still gets the full LL list.
+_LL_TAG_PREFIXES = (
+    "#EXT-X-PART:",
+    "#EXT-X-PART-INF:",
+    "#EXT-X-PRELOAD-HINT:",
+    "#EXT-X-SERVER-CONTROL:",
+    "#EXT-X-RENDITION-REPORT:",
+    "#EXT-X-SKIP:",
+)
+
+
+def strip_low_latency(body: bytes) -> bytes:
+    if b"#EXT-X-PART" not in body and b"#EXT-X-SERVER-CONTROL" not in body:
+        return body  # master playlist or already plain — leave untouched
+    out = [
+        line for line in body.split(b"\n")
+        if not any(line.startswith(p.encode()) for p in _LL_TAG_PREFIXES)
+    ]
+    return b"\n".join(out)
 
 
 def fetch_asset(

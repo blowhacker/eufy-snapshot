@@ -1624,6 +1624,13 @@ def make_app(
             return Response(status_code=exc.code)
         except (urllib.error.URLError, TimeoutError, OSError):
             return Response(status_code=502)
+        # iOS/Safari play through the OS HLS engine, which can't sustain the
+        # LL-HLS edge through this proxy (stalls blank after a few seconds).
+        # Strip the partial-segment directives so they get plain live HLS.
+        if asset.endswith(".m3u8") and native_hls.prefers_native_player(
+            request.headers.get("user-agent")
+        ):
+            body = native_hls.strip_low_latency(body)
         return Response(
             content=body,
             media_type=native_hls.media_type(asset, content_type),
