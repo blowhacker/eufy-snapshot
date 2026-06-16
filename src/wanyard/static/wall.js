@@ -132,19 +132,14 @@ function makeTile(src) {
   attachWebRTC(vRtc, src.id).then((pc) => {
     _pcs.push(pc);
     vRtc.addEventListener("playing", () => {
-      // Reveal WebRTC on its next painted frame (rVFC) so the cut lands on a real
-      // frame, not a black gap — then immediately tear HLS down. The cut is
-      // instant (opaque), so HLS is hidden behind it at once: no flicker, and it
-      // stops polling right away. Also mark live here in case WebRTC wins before
-      // HLS ever played (else the green dot wouldn't light).
-      const reveal = () => {
-        tile.classList.remove("offline");
-        tile.classList.add("live", "rtc");
-        hlsP.then((h) => { try { h?.stopLoad(); h?.destroy(); } catch {} });
-        try { vHls.pause(); vHls.removeAttribute("src"); vHls.load(); } catch {}
-      };
-      if (vRtc.requestVideoFrameCallback) vRtc.requestVideoFrameCallback(reveal);
-      else reveal();
+      // WebRTC is playing → reveal it and tear HLS down NOW (stops its polling).
+      // Reveal directly on `playing` (not gated on requestVideoFrameCallback —
+      // that can fail to fire for an opacity:0 video, leaving HLS alive forever).
+      // The cut is instant/opaque so HLS is hidden behind WebRTC immediately.
+      tile.classList.remove("offline");
+      tile.classList.add("live", "rtc");
+      hlsP.then((h) => { try { h?.stopLoad(); h?.destroy(); } catch {} });
+      try { vHls.pause(); vHls.removeAttribute("src"); vHls.load(); } catch {}
     }, { once: true });
   }).catch(() => { /* WebRTC unavailable → HLS layer stays */ });
 
