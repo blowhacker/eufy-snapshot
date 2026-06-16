@@ -123,25 +123,22 @@ function makeTile(src) {
   tile.append(vHls, vRtc, bar);
 
   const offline = () => { if (!tile.classList.contains("rtc")) tile.classList.add("offline"); };
-  vHls.addEventListener("playing", () => {
-    tile.classList.remove("offline"); tile.classList.add("live");   // green once painting
-  }, { once: true });
+  // HLS painting = first frame, but NOT green. Green means WebRTC (low latency).
+  vHls.addEventListener("playing", () => tile.classList.remove("offline"), { once: true });
 
   const hlsP = attachHls(vHls, src.id, offline);   // instant first layer
 
   attachWebRTC(vRtc, src.id).then((pc) => {
     _pcs.push(pc);
+    pc.addEventListener("connectionstatechange", () => console.log(`[wall ${src.id}] pc=${pc.connectionState}`));
     vRtc.addEventListener("playing", () => {
-      // WebRTC is playing → reveal it and tear HLS down NOW (stops its polling).
-      // Reveal directly on `playing` (not gated on requestVideoFrameCallback —
-      // that can fail to fire for an opacity:0 video, leaving HLS alive forever).
-      // The cut is instant/opaque so HLS is hidden behind WebRTC immediately.
+      console.log(`[wall ${src.id}] rtc playing → swap + teardown HLS`);
       tile.classList.remove("offline");
-      tile.classList.add("live", "rtc");
+      tile.classList.add("live", "rtc");   // GREEN = WebRTC live (not HLS)
       hlsP.then((h) => { try { h?.stopLoad(); h?.destroy(); } catch {} });
       try { vHls.pause(); vHls.removeAttribute("src"); vHls.load(); } catch {}
     }, { once: true });
-  }).catch(() => { /* WebRTC unavailable → HLS layer stays */ });
+  }).catch((e) => { console.warn(`[wall ${src.id}] webrtc failed:`, e?.message); });
 
   return tile;
 }
