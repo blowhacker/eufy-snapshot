@@ -1638,7 +1638,30 @@ def make_app(
             headers={"Cache-Control": "no-cache, no-store", **response_headers},
         )
 
+    async def serve_webrtc_whep(request: Request) -> Response:
+        # Proxy the WHEP SDP exchange to mediamtx (signaling only — the media
+        # flows direct browser<->mediamtx over ICE). Keeps :8889 internal; only
+        # the WebRTC media port is public. Used by the wall for instant live.
+        source_path = request.path_params.get("source_path", "")
+        url = native_hls.whep_url(source_path)
+        if not url:
+            return Response(status_code=404)
+        body = await request.body()
+        try:
+            status, answer, ctype = await asyncio.to_thread(native_hls.post_sdp, url, body)
+        except urllib.error.HTTPError as exc:
+            return Response(status_code=exc.code)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return Response(status_code=502)
+        return Response(
+            content=answer,
+            media_type=(ctype or "application/sdp").split(";", 1)[0].strip(),
+            status_code=status,
+            headers={"Cache-Control": "no-store"},
+        )
+
     routes = [
+        Route("/video/webrtc/{source_path}/whep", serve_webrtc_whep, methods=["POST"]),
         # Landing = the live wall (god view). A specific ?source (and not the
         # explicit ?view=wall) loads the full single-camera viewer instead, so a
         # tile's /?source=X&live=1&… link opens the viewer. ?source=all keeps the

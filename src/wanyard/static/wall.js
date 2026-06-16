@@ -5,6 +5,7 @@
 
 const WALL_SYNC = 1;      // ride the live edge — no boxes, so no detector sync
 const _hls = [];          // live hls.js instances, for teardown on rebuild
+const _pcs = [];          // live WebRTC peer connections, for teardown
 
 // Mirror video2.js shouldUseNativeHls(): Safari + iOS play HLS natively (no MSE).
 function shouldUseNativeHls() {
@@ -40,7 +41,53 @@ function rawLiveUrl(srcId) {
   return `/video/native-live/${encodeURIComponent(srcId)}/index.m3u8`;
 }
 
+// WebRTC (WHEP) — instant (sub-second) live. mediamtx serves the raw H.264
+// path over WebRTC; signaling is proxied by the app (/video/webrtc/<id>/whep),
+// media is direct browser<->mediamtx over ICE. We gather ICE fully before the
+// POST (non-trickle) so a single offer/answer connects — no PATCH/DELETE.
+function iceGatheringComplete(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise(res => {
+    const done = () => { pc.removeEventListener("icegatheringstatechange", check); res(); };
+    const check = () => { if (pc.iceGatheringState === "complete") done(); };
+    pc.addEventListener("icegatheringstatechange", check);
+    setTimeout(done, 1500);   // don't hang on a slow/again candidate
+  });
+}
+
+async function attachWebRTC(video, srcId) {
+  const pc = new RTCPeerConnection();
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.ontrack = e => { video.srcObject = e.streams[0]; video.play().catch(() => {}); };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await iceGatheringComplete(pc);
+  const r = await fetch(`/video/webrtc/${encodeURIComponent(srcId)}/whep`, {
+    method: "POST",
+    headers: { "Content-Type": "application/sdp" },
+    body: pc.localDescription.sdp,
+  }).catch(() => null);
+  if (!r?.ok) { pc.close(); throw new Error("whep " + (r?.status ?? "net")); }
+  const answer = await r.text();
+  await pc.setRemoteDescription({ type: "answer", sdp: answer });
+  return pc;
+}
+
 async function attachLive(video, srcId, onOffline) {
+  // Instant path first: WebRTC. Any failure (server off, port blocked, no
+  // codec) falls back to LL-HLS off the same raw path (~1s).
+  try {
+    const pc = await attachWebRTC(video, srcId);
+    _pcs.push(pc);
+    pc.addEventListener("connectionstatechange", () => {
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) onOffline();
+    });
+    return;
+  } catch { /* fall back to HLS */ }
+  return attachHls(video, srcId, onOffline);
+}
+
+async function attachHls(video, srcId, onOffline) {
   const url = rawLiveUrl(srcId);
 
   const canNative = video.canPlayType("application/vnd.apple.mpegurl");
@@ -98,8 +145,11 @@ function makeTile(src) {
 
 function teardown() {
   while (_hls.length) { try { _hls.pop().destroy(); } catch {} }
+  while (_pcs.length) { try { _pcs.pop().close(); } catch {} }
   const grid = document.getElementById("wall");
-  grid.querySelectorAll("video").forEach(v => { try { v.pause(); v.removeAttribute("src"); v.load(); } catch {} });
+  grid.querySelectorAll("video").forEach(v => {
+    try { v.pause(); v.srcObject = null; v.removeAttribute("src"); v.load(); } catch {}
+  });
   grid.innerHTML = "";
 }
 
