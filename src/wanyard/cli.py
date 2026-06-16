@@ -164,23 +164,6 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
     config_lines.append("hlsAlwaysRemux: yes")
     config_lines.append("hlsAllowOrigin: '*'")
     config_lines.append("")
-    # WebRTC (WHEP) for the wall's instant (sub-second) live on the raw H.264
-    # path. Signaling is proxied through the app; media (ICE) is direct
-    # browser<->mediamtx, so the UDP/TCP port must be reachable and the ICE
-    # candidates must advertise the public host (WANYARD_WEBRTC_ADDITIONAL_HOSTS,
-    # comma-separated). TCP on the same port is the fallback when UDP is blocked.
-    import os
-    config_lines.append("webrtc: yes")
-    config_lines.append("webrtcAddress: :8889")
-    config_lines.append("webrtcAllowOrigin: '*'")
-    _webrtc_hosts = os.environ.get("WANYARD_WEBRTC_ADDITIONAL_HOSTS", "").strip()
-    if _webrtc_hosts:
-        _rendered = ", ".join(h.strip() for h in _webrtc_hosts.split(",") if h.strip())
-        config_lines.append(f"webrtcAdditionalHosts: [{_rendered}]")
-    _webrtc_port = (os.environ.get("WANYARD_MEDIAMTX_WEBRTC_PORT", "").strip() or "8189")
-    config_lines.append(f"webrtcLocalUDPAddress: :{_webrtc_port}")
-    config_lines.append(f"webrtcLocalTCPAddress: :{_webrtc_port}")
-    config_lines.append("")
     config_lines.append("authInternalUsers:")
     config_lines.append("  - user: any")
     config_lines.append("    pass:")

@@ -91,28 +91,8 @@ def media_type(asset: str, upstream_type: str | None) -> str:
     return "application/octet-stream"
 
 
-WEBRTC_PORT = 8889
-
-
-def webrtc_base() -> str | None:
-    raw = os.environ.get("WANYARD_WEBRTC_BASE_URL", "").strip()
-    if not raw:
-        relay_host = os.environ.get("WANYARD_RELAY_HOST", "").strip()
-        if relay_host:
-            raw = f"http://{relay_host}:{WEBRTC_PORT}"
-    return raw.rstrip("/") if raw else None
-
-
-def whep_url(source_path_value: str) -> str | None:
-    base = webrtc_base()
-    if not base or not safe_path_part(source_path_value):
-        return None
-    return f"{base}/{quote(source_path_value, safe='')}/whep"
-
-
 def go2rtc_whep_url(source_id: str) -> str | None:
-    # go2rtc WHEP endpoint. go2rtc reads the camera from the mediamtx relay and
-    # caches the last keyframe → instant first frame (Frigate's transport).
+    # go2rtc WHEP endpoint — go2rtc is the camera ingest and serves WebRTC.
     host = (os.environ.get("WANYARD_GO2RTC_HOST", "").strip() or "go2rtc")
     if not safe_path_part(source_id):
         return None
@@ -120,7 +100,7 @@ def go2rtc_whep_url(source_id: str) -> str | None:
 
 
 def post_sdp(url: str, body: bytes) -> tuple[int, bytes, str | None]:
-    # WHEP: POST the browser's SDP offer to mediamtx, return its SDP answer.
+    # WHEP: POST the browser's SDP offer to go2rtc, return its SDP answer.
     req = urllib.request.Request(
         url, data=body, method="POST", headers={"Content-Type": "application/sdp"}
     )

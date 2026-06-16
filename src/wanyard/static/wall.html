@@ -13,15 +13,33 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/wall.css?v=wall-hls-rtc-2">
+    <link rel="stylesheet" href="/wall.css?v=wall-notify-1">
   </head>
   <body>
     <header class="wall-head">
       <div class="wall-logo"><img src="/assets/favicon.svg" alt=""></div>
       <div class="wall-title">Live</div>
       <div class="wall-sub" id="wallSub"></div>
+      <button id="wallNotifyToggle" class="ab-icon v2-notify-toggle" type="button" aria-label="Open notifications" aria-controls="wallNotifyPanel" aria-expanded="false" title="Notifications">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4.5 6.7a3.5 3.5 0 0 1 7 0v3l1.1 1.6H3.4l1.1-1.6v-3Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/><path d="M6.4 13a1.8 1.8 0 0 0 3.2 0" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/></svg>
+        <span id="wallNotifyBadge" class="v2-notify-badge" hidden>0</span>
+      </button>
+      <a class="ab-icon" href="/settings" title="Settings" aria-label="Settings">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M8 2v1.5M8 12.5V14M2 8h1.5M12.5 8H14M3.8 3.8l1 1M11.2 11.2l1 1M3.8 12.2l1-1M11.2 4.8l1-1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      </a>
     </header>
+    <section id="wallNotifyPanel" class="v2-notify-panel" hidden aria-label="Notifications">
+      <div class="v2-notify-head">
+        <div>
+          <div class="v2-notify-title">Notifications</div>
+          <div id="wallNotifySub" class="v2-notify-sub">Loading</div>
+        </div>
+        <button id="wallNotifyReadAll" class="v2-notify-mark" type="button">Mark read</button>
+      </div>
+      <div id="wallNotifyList" class="v2-notify-list"></div>
+      <div class="v2-notify-footer"><a href="/settings#notifications">Rules</a></div>
+    </section>
     <div id="wall"></div>
-    <script src="/wall.js?v=wall-hls-rtc-2"></script>
+    <script src="/wall.js?v=wall-notify-1"></script>
   </body>
 </html>

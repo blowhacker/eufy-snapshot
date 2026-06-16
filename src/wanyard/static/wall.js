@@ -179,3 +179,107 @@ build();
 // the script, and tears down media on navigate-away → tiles come back blank.
 // Rebuild from scratch (fresh attach at the current live edge) on bfcache restore.
 window.addEventListener("pageshow", e => { if (e.persisted) build(); });
+
+// ── Notifications (same bell as the viewer; click → its target viewer URL) ──
+const NOTIFY_POLL_MS = 30000;
+const _notify = { open: false, items: [], unread: 0, inflight: false };
+
+const _ne = () => ({
+  toggle: document.getElementById("wallNotifyToggle"),
+  badge: document.getElementById("wallNotifyBadge"),
+  panel: document.getElementById("wallNotifyPanel"),
+  list: document.getElementById("wallNotifyList"),
+  sub: document.getElementById("wallNotifySub"),
+  readAll: document.getElementById("wallNotifyReadAll"),
+});
+
+function notifyBadge() {
+  const { badge } = _ne();
+  if (!badge) return;
+  badge.hidden = _notify.unread <= 0;
+  badge.textContent = _notify.unread > 99 ? "99+" : String(_notify.unread);
+}
+
+function notifyAge(ts) {
+  const t = Number(ts);
+  if (!Number.isFinite(t)) return "";
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 60) return `${Math.floor(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+async function notifyRefresh() {
+  if (_notify.inflight) return;
+  _notify.inflight = true;
+  try {
+    const url = _notify.open ? "/api/notifications?limit=20" : "/api/notifications/unread-count";
+    const r = await fetch(url, { cache: "no-store" }).catch(() => null);
+    if (!r?.ok) return;
+    const d = await r.json().catch(() => ({}));
+    _notify.unread = d.unread_count || 0;
+    if (_notify.open) { _notify.items = d.notifications || []; notifyRender(); }
+    notifyBadge();
+  } finally {
+    _notify.inflight = false;
+  }
+}
+
+function notifyRender() {
+  const { list, sub, readAll } = _ne();
+  if (!list) return;
+  list.innerHTML = "";
+  if (sub) sub.textContent = _notify.unread ? `${_notify.unread} unread` : `${_notify.items.length} recent`;
+  if (readAll) readAll.disabled = _notify.unread <= 0;
+  if (!_notify.items.length) {
+    list.innerHTML = `<div class="v2-notify-empty">No notifications</div>`;
+    return;
+  }
+  _notify.items.forEach(n => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "v2-notify-row" + (n.read ? "" : " unread");
+    const thumb = n.thumb_url
+      ? `<div class="v2-notify-thumb"><img src="${n.thumb_url}" alt="" loading="lazy"></div>`
+      : `<div class="v2-notify-thumb"><div class="v2-notify-thumb-fallback">EVT</div></div>`;
+    row.innerHTML = `${thumb}<div class="v2-notify-main">
+      <div class="v2-notify-row-title"><div class="v2-notify-name"></div><div class="v2-notify-time">${notifyAge(n.event_ts || n.created_at)}</div></div>
+      <div class="v2-notify-body"></div>
+      <div class="v2-notify-meta"></div></div>`;
+    row.querySelector(".v2-notify-name").textContent = n.title || "Notification";
+    row.querySelector(".v2-notify-body").textContent = n.body || n.rule_name || "";
+    row.querySelector(".v2-notify-meta").textContent = `${n.source_id || ""} · ${n.class || "object"}`;
+    row.addEventListener("click", () => {
+      if (!n.read) fetch(`/api/notifications/${n.id}/read`, { method: "POST" }).catch(() => {});
+      location.assign(n.target_url || "/");   // → the single-camera viewer at that time
+    });
+    list.appendChild(row);
+  });
+}
+
+function notifySetOpen(open) {
+  const { panel, toggle } = _ne();
+  _notify.open = !!open;
+  if (panel) panel.hidden = !_notify.open;
+  toggle?.setAttribute("aria-expanded", _notify.open ? "true" : "false");
+  if (_notify.open) notifyRefresh();
+}
+
+(function notifyInit() {
+  const { toggle, readAll } = _ne();
+  if (!toggle) return;
+  toggle.addEventListener("click", (e) => { e.stopPropagation(); notifySetOpen(!_notify.open); });
+  readAll?.addEventListener("click", async () => {
+    await fetch("/api/notifications/read-all", { method: "POST" }).catch(() => {});
+    _notify.unread = 0;
+    _notify.items = _notify.items.map(n => ({ ...n, read: true }));
+    notifyBadge(); notifyRender();
+  });
+  document.addEventListener("click", (e) => {
+    const { panel, toggle } = _ne();
+    if (_notify.open && panel && !panel.contains(e.target) && !toggle.contains(e.target)) notifySetOpen(false);
+  });
+  notifyRefresh();
+  setInterval(notifyRefresh, NOTIFY_POLL_MS);
+})();

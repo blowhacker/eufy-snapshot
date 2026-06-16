@@ -92,10 +92,6 @@ services:
     environment:
       - VIDEO_DIR=/app/video
       - WANYARD_MEDIAMTX_HLS_PORT=${WANYARD_MEDIAMTX_HLS_PORT:-8888}
-      # Comma-separated public host(s) for WebRTC ICE candidates (the wall's
-      # instant live). Empty by default (local quickstart); set per-deploy in .env.
-      - WANYARD_WEBRTC_ADDITIONAL_HOSTS=${WANYARD_WEBRTC_ADDITIONAL_HOSTS:-}
-      - WANYARD_MEDIAMTX_WEBRTC_PORT=${WANYARD_MEDIAMTX_WEBRTC_PORT:-8189}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
@@ -113,12 +109,6 @@ services:
     logging:
       driver: json-file
       options: {max-size: "50m", max-file: "3"}
-    # WebRTC media (ICE) — direct browser<->mediamtx. WHEP signaling (:8889)
-    # stays internal (proxied by the app). UDP preferred; TCP same port is the
-    # firewall fallback.
-    ports:
-      - "${WANYARD_MEDIAMTX_WEBRTC_PORT:-8189}:${WANYARD_MEDIAMTX_WEBRTC_PORT:-8189}/udp"
-      - "${WANYARD_MEDIAMTX_WEBRTC_PORT:-8189}:${WANYARD_MEDIAMTX_WEBRTC_PORT:-8189}/tcp"
     command: ["/run/mediamtx/mediamtx.yml"]
     volumes:
       - mediamtx-conf:/run/mediamtx:ro
