@@ -168,6 +168,10 @@ services:
       # WebRTC media port. Default 8555 works for a single install; override only
       # to avoid a collision when several stacks share a host.
       - WANYARD_GO2RTC_WEBRTC_PORT=${WANYARD_GO2RTC_WEBRTC_PORT:-8555}
+      # Reachable host(s) to advertise as ICE candidates — set the LAN IP for
+      # same-network browsers (go2rtc on the bridge can't auto-detect it). STUN
+      # covers public/forwarded access on top. Empty = stun-only (public path).
+      - WANYARD_WEBRTC_ADDITIONAL_HOSTS=${WANYARD_WEBRTC_ADDITIONAL_HOSTS:-}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
