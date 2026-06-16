@@ -196,15 +196,28 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
 
 
 def _serve(app, config: AppConfig) -> None:
+    import os
     from hypercorn.asyncio import serve
     from hypercorn.config import Config as HConfig
+
+    # Bind port: WANYARD_WEB_PORT env wins over config.yaml. The compose port
+    # mapping is already driven by WANYARD_WEB_PORT, so per-deploy ports (e.g.
+    # staging 8092) live entirely in the gitignored .env — no local edit to the
+    # tracked config.yaml that a `git reset --hard` would clobber.
+    port = config.web.port
+    raw = (os.environ.get("WANYARD_WEB_PORT") or "").strip()
+    if raw:
+        try:
+            port = int(raw)
+        except ValueError:
+            pass
 
     hcfg = HConfig()
     hcfg.loglevel = "WARNING"
     hcfg.accesslog = None
-    hcfg.bind = [f"{config.web.host}:{config.web.port}"]
+    hcfg.bind = [f"{config.web.host}:{port}"]
 
-    print(f"Serving on http://{config.web.host}:{config.web.port}")
+    print(f"Serving on http://{config.web.host}:{port}")
     try:
         import uvloop
         uvloop.install()

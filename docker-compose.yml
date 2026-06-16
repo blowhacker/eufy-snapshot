@@ -69,6 +69,10 @@ services:
       - WANYARD_RELAY_HOST=mediamtx
       - WANYARD_RELAY_PATH_SUFFIX=-stamped
       - WANYARD_MEDIAMTX_HLS_PORT=${WANYARD_MEDIAMTX_HLS_PORT:-8888}
+      # App binds this (overrides config.yaml) so per-deploy ports live only in
+      # the .env, never as a local edit to the tracked config.yaml. Matches the
+      # published port above.
+      - WANYARD_WEB_PORT=${WANYARD_WEB_PORT:-8091}
       # (recorder auto-detects the stamped codec and tags hvc1 only for HEVC)
     volumes:
       - ./config.yaml:/app/config.yaml:ro
