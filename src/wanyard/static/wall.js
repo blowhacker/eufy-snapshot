@@ -3,7 +3,6 @@
 // Reuses the server's native-live proxy (master playlist + iOS LL-strip), so
 // iOS gets plain HLS and desktop Chrome gets low-latency, same as the viewer.
 
-const WALL_SYNC = 1;      // ride the live edge — no boxes, so no detector sync
 const _hls = [];          // live hls.js instances, for teardown on rebuild
 const _pcs = [];          // live WebRTC peer connections, for teardown
 
@@ -73,9 +72,12 @@ async function attachHls(video, srcId, onOffline) {
     const Hls = await loadHlsJs().catch(() => null);
     if (Hls?.isSupported?.()) {
       const hls = new Hls({
-        lowLatencyMode: true,
-        liveSyncDuration: WALL_SYNC,
-        liveMaxLatencyDuration: WALL_SYNC + 4,
+        // Placeholder + fallback only — WebRTC carries the low latency. Keep
+        // lowLatencyMode OFF so it doesn't hammer the LL-HLS blocking-reload
+        // poll (_HLS_msn/_HLS_part); regular playlist reload is plenty. Start a
+        // couple segments back; mediamtx's buffered segments still paint fast.
+        lowLatencyMode: false,
+        liveSyncDurationCount: 2,
       });
       _hls.push(hls);
       hls.loadSource(url);
@@ -138,7 +140,7 @@ function makeTile(src) {
       const reveal = () => {
         tile.classList.remove("offline");
         tile.classList.add("live", "rtc");
-        hlsP.then((h) => { try { h?.destroy(); } catch {} });
+        hlsP.then((h) => { try { h?.stopLoad(); h?.destroy(); } catch {} });
         try { vHls.pause(); vHls.removeAttribute("src"); vHls.load(); } catch {}
       };
       if (vRtc.requestVideoFrameCallback) vRtc.requestVideoFrameCallback(reveal);
