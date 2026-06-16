@@ -43,25 +43,13 @@ function rawLiveUrl(srcId) {
 
 // WebRTC (WHEP) — instant (sub-second) live. mediamtx serves the raw H.264
 // path over WebRTC; signaling is proxied by the app (/video/webrtc/<id>/whep),
-// media is direct browser<->mediamtx over ICE. We gather ICE fully before the
-// POST (non-trickle) so a single offer/answer connects — no PATCH/DELETE.
-function iceGatheringComplete(pc) {
-  if (pc.iceGatheringState === "complete") return Promise.resolve();
-  return new Promise(res => {
-    const done = () => { pc.removeEventListener("icegatheringstatechange", check); res(); };
-    const check = () => { if (pc.iceGatheringState === "complete") done(); };
-    pc.addEventListener("icegatheringstatechange", check);
-    setTimeout(done, 1500);   // don't hang on a slow/again candidate
-  });
-}
-
+// media is direct browser<->mediamtx over ICE.
 async function attachWebRTC(video, srcId) {
   const pc = new RTCPeerConnection();
   pc.addTransceiver("video", { direction: "recvonly" });
   pc.ontrack = e => { video.srcObject = e.streams[0]; video.play().catch(() => {}); };
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  await iceGatheringComplete(pc);
   const r = await fetch(`/video/webrtc/${encodeURIComponent(srcId)}/whep`, {
     method: "POST",
     headers: { "Content-Type": "application/sdp" },

@@ -110,6 +110,15 @@ def whep_url(source_path_value: str) -> str | None:
     return f"{base}/{quote(source_path_value, safe='')}/whep"
 
 
+def go2rtc_whep_url(source_id: str) -> str | None:
+    # go2rtc WHEP endpoint. go2rtc reads the camera from the mediamtx relay and
+    # caches the last keyframe → instant first frame (Frigate's transport).
+    host = (os.environ.get("WANYARD_GO2RTC_HOST", "").strip() or "go2rtc")
+    if not safe_path_part(source_id):
+        return None
+    return f"http://{host}:1984/api/webrtc?src={quote(source_id, safe='')}"
+
+
 def post_sdp(url: str, body: bytes) -> tuple[int, bytes, str | None]:
     # WHEP: POST the browser's SDP offer to mediamtx, return its SDP answer.
     req = urllib.request.Request(

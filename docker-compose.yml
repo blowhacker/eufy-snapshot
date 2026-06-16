@@ -108,6 +108,8 @@ services:
     depends_on:
       mediamtx-conf:
         condition: service_completed_successfully
+      go2rtc:
+        condition: service_started   # mediamtx sources from go2rtc now
     logging:
       driver: json-file
       options: {max-size: "50m", max-file: "3"}
@@ -159,6 +161,49 @@ services:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
 
+  # go2rtc powers the wall's INSTANT live (WebRTC/WHEP). It reads each camera
+  # from the mediamtx RTSP relay (no extra camera pull) and caches the last
+  # keyframe, so a new viewer paints immediately (mediamtx-direct waited up to
+  # one GOP). Config generated from the source DB by go2rtc-conf at boot.
+  go2rtc-conf:
+    image: wanyard:latest
+    pull_policy: never
+    container_name: wanyard-go2rtc-conf
+    restart: "no"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+    command: ["-c", "/app/config.yaml", "gen-go2rtc", "--out", "/run/go2rtc/go2rtc.yaml"]
+    environment:
+      - WANYARD_RELAY_HOST=mediamtx
+      - WANYARD_WEBRTC_ADDITIONAL_HOSTS=${WANYARD_WEBRTC_ADDITIONAL_HOSTS:-}
+      - WANYARD_GO2RTC_WEBRTC_PORT=${WANYARD_GO2RTC_WEBRTC_PORT:-8555}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - go2rtc-conf:/run/go2rtc
+
+  go2rtc:
+    image: alexxit/go2rtc:latest   # TODO pin once the spike confirms the tag
+    container_name: wanyard-go2rtc
+    restart: unless-stopped
+    depends_on:
+      go2rtc-conf:
+        condition: service_completed_successfully
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+    # WebRTC media (ICE) — direct browser<->go2rtc. The HTTP API (:1984, WHEP)
+    # stays internal (proxied by the app). UDP preferred; TCP same port fallback.
+    ports:
+      - "${WANYARD_GO2RTC_WEBRTC_PORT:-8555}:${WANYARD_GO2RTC_WEBRTC_PORT:-8555}/udp"
+      - "${WANYARD_GO2RTC_WEBRTC_PORT:-8555}:${WANYARD_GO2RTC_WEBRTC_PORT:-8555}/tcp"
+    # The image auto-loads /config/go2rtc.yaml (no command needed). go2rtc-conf
+    # wrote it into this shared volume.
+    volumes:
+      - go2rtc-conf:/config:ro
+
 volumes:
   yolo-run:
   mediamtx-conf:
+  go2rtc-conf:

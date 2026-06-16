@@ -30,6 +30,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_derive_episodes(args)
     if args.command == "gen-mediamtx":
         return cmd_gen_mediamtx(args, config)
+    if args.command == "gen-go2rtc":
+        return cmd_gen_go2rtc(args, config)
     if args.command == "stamp":
         from . import stamper
         return stamper.run()
@@ -62,6 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
     gen_mediamtx = sub.add_parser("gen-mediamtx", help="generate mediamtx config from configured sources")
     gen_mediamtx.add_argument("--out", default="/run/mediamtx/mediamtx.yml",
                                help="output path for mediamtx config (default: /run/mediamtx/mediamtx.yml)")
+    gen_go2rtc = sub.add_parser("gen-go2rtc", help="generate go2rtc config from configured sources")
+    gen_go2rtc.add_argument("--out", default="/run/go2rtc/go2rtc.yaml",
+                            help="output path for go2rtc config (default: /run/go2rtc/go2rtc.yaml)")
     sub.add_parser("stamp", help="BITC stamper: burn world-time into frames, republish <src>-stamped")
     return parser
 
@@ -189,13 +194,16 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
     config_lines.append("")
     config_lines.append("paths:")
 
+    go2rtc_host = (os.environ.get("WANYARD_GO2RTC_HOST", "").strip() or "go2rtc")
     for source in enabled_sources:
-        rtsp_url = resolve_rtsp_url(source, direct=True)
-        if rtsp_url is None:
+        if resolve_rtsp_url(source, direct=True) is None:
             logging.warning("skipping source %s: resolve_rtsp_url returned None", source.id)
             continue
+        # Source from go2rtc, not the camera: go2rtc is the single ingest (it
+        # pulls the camera once and also serves the instant WebRTC wall). mediamtx
+        # reads go2rtc's RTSP for recording/BITC — no extra camera pull.
         config_lines.append(f"  {source.id}:")
-        config_lines.append(f"    source: {rtsp_url}")
+        config_lines.append(f"    source: rtsp://{go2rtc_host}:8554/{source.id}")
         config_lines.append("    sourceProtocol: tcp")
         config_lines.append("    sourceOnDemand: yes")
         # BITC stamper republishes the marked stream here (no source = accepts
@@ -209,6 +217,60 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(config_text, encoding="utf-8")
     logging.info("wrote mediamtx config to %s", args.out)
+    return 0
+
+
+def cmd_gen_go2rtc(args, config: AppConfig) -> int:
+    # go2rtc serves the wall's instant WebRTC. It reads each camera from the
+    # mediamtx RTSP relay (NOT the camera directly → no extra camera pull) and
+    # caches the last keyframe, so a new WebRTC viewer paints immediately instead
+    # of waiting up to one GOP for the next IDR (the mediamtx-direct limitation).
+    source_db = SourceDB(config.db_path) if config.db_path else None
+    if not source_db:
+        print("error: db_path not configured", file=sys.stderr)
+        return 1
+
+    sources = [s for s in source_db.to_source_configs() if s.type == "rtsp" and s.enabled]
+    relay_host = (os.environ.get("WANYARD_RELAY_HOST", "").strip() or "mediamtx")
+    port = (os.environ.get("WANYARD_GO2RTC_WEBRTC_PORT", "").strip() or "8555")
+    hosts = [h.strip() for h in os.environ.get("WANYARD_WEBRTC_ADDITIONAL_HOSTS", "").split(",") if h.strip()]
+
+    lines = []
+    lines.append("api:")
+    lines.append('  listen: ":1984"')          # internal; WHEP is proxied by the app
+    lines.append("log:")
+    lines.append("  level: error")
+    lines.append("webrtc:")
+    lines.append(f'  listen: ":{port}"')
+    if hosts:
+        lines.append("  candidates:")
+        for h in hosts:
+            lines.append(f"    - {h}:{port}")
+    # Preload keeps go2rtc connected to each source on startup (warm producer),
+    # so the last keyframe is always buffered and new WebRTC viewers paint
+    # instantly instead of waiting for the next IDR. video-only (wall is muted).
+    # This is what makes Frigate's go2rtc live instant. (go2rtc >= 1.9.11.)
+    lines.append("preload:")
+    for s in sources:
+        lines.append(f"  {s.id}: video")
+    from .capture import resolve_rtsp_url
+    lines.append("streams:")
+    for s in sources:
+        # go2rtc is the SOLE camera ingest: it reads the camera directly (the
+        # configured URL, whatever it is — no stream-name assumptions), serves
+        # RTSP downstream to mediamtx (recording/BITC) AND WebRTC to the wall.
+        # Direct read = go2rtc's RTCP keyframe request (PLI) reaches the camera →
+        # instant first frame for new viewers, at near-zero latency (Frigate's
+        # model). One pull per camera, same budget as the old mediamtx ingest.
+        url = resolve_rtsp_url(s, direct=True)
+        if not url:
+            continue
+        lines.append(f"  {s.id}: {url}")
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    logging.info("wrote go2rtc config to %s", args.out)
     return 0
 
 

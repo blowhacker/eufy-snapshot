@@ -1639,11 +1639,11 @@ def make_app(
         )
 
     async def serve_webrtc_whep(request: Request) -> Response:
-        # Proxy the WHEP SDP exchange to mediamtx (signaling only — the media
-        # flows direct browser<->mediamtx over ICE). Keeps :8889 internal; only
-        # the WebRTC media port is public. Used by the wall for instant live.
+        # Proxy the WHEP SDP exchange to go2rtc (signaling only — media flows
+        # direct browser<->go2rtc over ICE). go2rtc keeps its API internal; only
+        # its WebRTC media port is public. Used by the wall for instant live.
         source_path = request.path_params.get("source_path", "")
-        url = native_hls.whep_url(source_path)
+        url = native_hls.go2rtc_whep_url(source_path)
         if not url:
             return Response(status_code=404)
         body = await request.body()
