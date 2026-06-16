@@ -3,7 +3,7 @@
 // Reuses the server's native-live proxy (master playlist + iOS LL-strip), so
 // iOS gets plain HLS and desktop Chrome gets low-latency, same as the viewer.
 
-const NATIVE_DELAY = 3;   // seconds behind the edge for the hls.js path
+const WALL_SYNC = 1;      // ride the live edge — no boxes, so no detector sync
 const _hls = [];          // live hls.js instances, for teardown on rebuild
 
 // Mirror video2.js shouldUseNativeHls(): Safari + iOS play HLS natively (no MSE).
@@ -31,17 +31,17 @@ function loadHlsJs() {
   return _hlsPromise;
 }
 
-async function nativeLiveUrl(srcId) {
-  const r = await fetch(`/api/video/native-live?source=${encodeURIComponent(srcId)}`,
-                        { cache: "no-store" }).catch(() => null);
-  if (!r?.ok) return null;
-  const data = await r.json().catch(() => ({}));
-  return data.native?.url || null;
+// Raw camera ingest path off mediamtx — NOT the "-stamped" (BITC) stream the
+// viewer uses. The wall shows no boxes/timecode, so it skips the stamper
+// re-encode: lower latency, and the camera's native codec (H.264) plays where
+// the stamped HEVC can't (cheap Android). Same mediamtx, just the un-suffixed
+// path, served through the same native-live proxy (iOS LL-strip still applies).
+function rawLiveUrl(srcId) {
+  return `/video/native-live/${encodeURIComponent(srcId)}/index.m3u8`;
 }
 
 async function attachLive(video, srcId, onOffline) {
-  const url = await nativeLiveUrl(srcId);
-  if (!url) { onOffline(); return; }
+  const url = rawLiveUrl(srcId);
 
   const canNative = video.canPlayType("application/vnd.apple.mpegurl");
   const preferNative = Boolean(canNative && shouldUseNativeHls());
@@ -51,8 +51,8 @@ async function attachLive(video, srcId, onOffline) {
     if (Hls?.isSupported?.()) {
       const hls = new Hls({
         lowLatencyMode: true,
-        liveSyncDuration: NATIVE_DELAY,
-        liveMaxLatencyDuration: NATIVE_DELAY + 3,
+        liveSyncDuration: WALL_SYNC,
+        liveMaxLatencyDuration: WALL_SYNC + 4,
       });
       _hls.push(hls);
       hls.loadSource(url);
