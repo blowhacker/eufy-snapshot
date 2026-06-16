@@ -74,6 +74,19 @@ advance on screen, but public queries still use BITC time.
 Recent activity thumbnails use event IDs. The server resolves those IDs back to
 BITC time and chooses live HLS or recorded MP4 through the same media boundary.
 
+## Live wall (outside the boundary)
+
+The live wall is a pure live-preview path and deliberately sits **outside** the
+BITC boundary. It plays the raw camera (via go2rtc — WebRTC, with an instant
+LL-HLS first layer), which has **no burned marker** and carries **no public
+time**: no detections, no overlays, no `ts`. It never produces scene time, so
+it doesn't violate the one-time rule. Clicking a tile hands off to the normal
+single-camera viewer, which resolves everything through this boundary as usual.
+
+go2rtc being the camera ingest (`camera → go2rtc → mediamtx → stamper`) is a
+transport change only — recording/BITC anchoring downstream is unchanged; the
+stamper still burns world time and `media_epoch` is still decoded from pixels.
+
 ## Tests
 
 Keep these regressions covered:

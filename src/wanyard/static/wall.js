@@ -61,26 +61,14 @@ async function attachWebRTC(video, srcId) {
   return pc;
 }
 
-async function attachLive(video, srcId, onOffline) {
-  // Instant path first: WebRTC. Any failure (server off, port blocked, no
-  // codec) falls back to LL-HLS off the same raw path (~1s).
-  try {
-    const pc = await attachWebRTC(video, srcId);
-    _pcs.push(pc);
-    pc.addEventListener("connectionstatechange", () => {
-      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) onOffline();
-    });
-    return;
-  } catch { /* fall back to HLS */ }
-  return attachHls(video, srcId, onOffline);
-}
-
+// LL-HLS off mediamtx. mediamtx keeps keyframe-aligned segments pre-buffered,
+// so this paints in ~200ms — the instant first layer. Returns the hls.js
+// instance (or null for native) so the tile can tear it down after the WebRTC
+// upgrade. Also the fallback if WebRTC never connects.
 async function attachHls(video, srcId, onOffline) {
   const url = rawLiveUrl(srcId);
-
   const canNative = video.canPlayType("application/vnd.apple.mpegurl");
   const preferNative = Boolean(canNative && shouldUseNativeHls());
-
   if (!preferNative) {
     const Hls = await loadHlsJs().catch(() => null);
     if (Hls?.isSupported?.()) {
@@ -94,16 +82,23 @@ async function attachHls(video, srcId, onOffline) {
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
       hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) onOffline(); });
-      return;
+      return hls;
     }
   }
   if (canNative) {
-    video.src = url;
-    video.load();
-    video.play().catch(() => {});
-  } else {
-    onOffline();   // no MSE + no native HLS (e.g. cheap Android) — see backlog
+    video.src = url; video.load(); video.play().catch(() => {});
+    return null;
   }
+  onOffline();   // no MSE + no native HLS (e.g. cheap Android) — see backlog
+  return null;
+}
+
+function mkVideo(cls) {
+  const v = document.createElement("video");
+  v.className = cls;
+  v.muted = true; v.autoplay = true; v.playsInline = true;
+  v.setAttribute("playsinline", ""); v.setAttribute("muted", "");
+  return v;
 }
 
 function makeTile(src) {
@@ -112,22 +107,44 @@ function makeTile(src) {
   // Click-through to the full viewer for this camera (live, person filter).
   tile.href = `/?source=${encodeURIComponent(src.id)}&live=1&cls=person&zone=none`;
 
-  const v = document.createElement("video");
-  v.muted = true; v.autoplay = true; v.playsInline = true;
-  v.setAttribute("playsinline", ""); v.setAttribute("muted", "");
+  // Two layers: HLS paints instantly (~200ms, the "cache layer"); WebRTC
+  // connects behind it and, on its first frame, swaps in for near-zero latency
+  // — then HLS is torn down. HLS also stays as the fallback if WebRTC fails.
+  const vHls = mkVideo("tile-hls");
+  const vRtc = mkVideo("tile-rtc");
 
   const bar = document.createElement("div");
   bar.className = "tile-bar";
   bar.innerHTML = `<span class="dot"></span><span class="name"></span>`;
   bar.querySelector(".name").textContent = src.name || src.id;
 
-  tile.append(v, bar);
+  tile.append(vHls, vRtc, bar);
 
-  const offline = () => { tile.classList.remove("live"); tile.classList.add("offline"); };
-  v.addEventListener("playing", () => { tile.classList.remove("offline"); tile.classList.add("live"); });
-  v.addEventListener("error", offline);
+  const offline = () => { if (!tile.classList.contains("rtc")) tile.classList.add("offline"); };
+  vHls.addEventListener("playing", () => {
+    tile.classList.remove("offline"); tile.classList.add("live");   // green once painting
+  }, { once: true });
 
-  attachLive(v, src.id, offline);
+  const hlsP = attachHls(vHls, src.id, offline);   // instant first layer
+
+  attachWebRTC(vRtc, src.id).then((pc) => {
+    _pcs.push(pc);
+    vRtc.addEventListener("playing", () => {
+      // Reveal WebRTC on its next painted frame (rVFC) so the cut lands on a real
+      // frame, not a black gap. Tear HLS down a beat later — it's hidden behind
+      // the opaque WebRTC by then, so no flicker.
+      const reveal = () => {
+        tile.classList.add("rtc");
+        setTimeout(() => {
+          hlsP.then((h) => { try { h?.destroy(); } catch {} });
+          try { vHls.pause(); vHls.removeAttribute("src"); vHls.load(); } catch {}
+        }, 1000);
+      };
+      if (vRtc.requestVideoFrameCallback) vRtc.requestVideoFrameCallback(reveal);
+      else reveal();
+    }, { once: true });
+  }).catch(() => { /* WebRTC unavailable → HLS layer stays */ });
+
   return tile;
 }
 

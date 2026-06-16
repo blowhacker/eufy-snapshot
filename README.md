@@ -28,15 +28,23 @@ docker compose up --build -d
 - Records stamped camera streams as continuous MP4 segments
 - Serves rolling live HLS streams for browser playback
 - Runs live YOLO detection plus MP4 backfill, with detections keyed by BITC time
+- **Live wall (god view)** — all cameras at once on the landing page, instant
+  load with near-zero-latency WebRTC; click a camera to open its full viewer
 - Web UI: live view, timeline filmstrip, event feed with class filtering, clip export
 - Auto-cleanup of old footage by age or disk usage
 
 ## Architecture
 
+Ingest: `camera → go2rtc → mediamtx → stamper → recorder/yolo`. go2rtc is the
+single camera puller; it serves the live wall over WebRTC directly (instant,
+low latency) while mediamtx sources from it for recording/BITC/HLS — no extra
+camera pull.
+
 Main services in `docker-compose.yml`:
 
 - **app** (`wanyard`) — web server, APIs, recording, HLS/MP4 serving
-- **mediamtx** — RTSP relay
+- **go2rtc** — camera ingest; serves the live wall over WebRTC (WHEP)
+- **mediamtx** — RTSP relay (sources from go2rtc), live HLS
 - **stamper** — burns BITC into frames and republishes stamped streams
 - **yolo** (`wanyard-yolo`) — live detector, thumbnail crops, MP4 backfill
 
@@ -50,5 +58,6 @@ wanyard yolo-serve   # YOLO live detection + MP4 backfill
 
 ## Web UI
 
-- `http://localhost:8091` — timeline viewer with live streams and event feed
+- `http://localhost:8091` — live wall (all cameras); click one for its viewer
+- `http://localhost:8091/?source=<id>&live=1` — single-camera timeline viewer + event feed
 - `http://localhost:8091/settings` — add/remove cameras, system status, cleanup config

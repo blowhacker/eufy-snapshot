@@ -47,18 +47,29 @@ body {
   transition: border-color 120ms;
 }
 .tile:hover { border-color: var(--amber-ring); }
-.tile video {
+/* Two stacked layers: HLS (instant first paint) and WebRTC (low-latency,
+   swaps in on its first frame). Both fill the tile; WebRTC fades over HLS
+   once .rtc is set, then HLS is hidden + torn down. */
+.tile-hls, .tile-rtc {
+  position: absolute; inset: 0;
   width: 100%; height: 100%;
   object-fit: cover;
-  display: block;
   background: #000;
 }
+.tile-hls { z-index: 0; }
+/* Instant cut, no fade: crossfading two live layers at different latencies
+   ghosts/flickers. WebRTC has a painted frame before we flip it (on `playing`),
+   so an opaque cut is clean. */
+.tile-rtc { z-index: 1; opacity: 0; }
+.tile.rtc .tile-rtc { opacity: 1; }
+.tile.rtc .tile-hls { opacity: 0; }
 
 /* Bottom bar: holds the camera name + status dot, and its opaque foot covers
    the burned BITC strip (bottom-left, ~8px tall) so no overlay canvas needed. */
 .tile-bar {
   position: absolute;
   left: 0; right: 0; bottom: 0;
+  z-index: 2;
   padding: 16px 10px 7px;
   display: flex; align-items: center; gap: 7px;
   background: linear-gradient(transparent, var(--bg-stage) 88%);
