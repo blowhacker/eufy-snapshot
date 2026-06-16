@@ -1653,6 +1653,17 @@ def make_app(
             return Response(status_code=exc.code)
         except (urllib.error.URLError, TimeoutError, OSError):
             return Response(status_code=502)
+        # Point the WebRTC host candidate at the address the browser used to
+        # reach us (Host header) — reachable by definition. Override with
+        # WANYARD_WEBRTC_ADDITIONAL_HOSTS for topologies where it isn't.
+        try:
+            sdp = answer.decode() if isinstance(answer, bytes) else answer
+            override = os.environ.get("WANYARD_WEBRTC_ADDITIONAL_HOSTS", "").split(",")[0].strip()
+            host = override or request.headers.get("host", "").rsplit(":", 1)[0]
+            if host:
+                answer = native_hls.rewrite_host_candidates(sdp, native_hls.resolve_host(host))
+        except Exception:
+            pass
         return Response(
             content=answer,
             media_type=(ctype or "application/sdp").split(";", 1)[0].strip(),

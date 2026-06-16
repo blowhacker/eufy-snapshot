@@ -214,7 +214,6 @@ def cmd_gen_go2rtc(args, config: AppConfig) -> int:
 
     sources = [s for s in source_db.to_source_configs() if s.type == "rtsp" and s.enabled]
     port = (os.environ.get("WANYARD_GO2RTC_WEBRTC_PORT", "").strip() or "8555")
-    hosts = [h.strip() for h in os.environ.get("WANYARD_WEBRTC_ADDITIONAL_HOSTS", "").split(",") if h.strip()]
 
     lines = []
     lines.append("api:")
@@ -223,15 +222,9 @@ def cmd_gen_go2rtc(args, config: AppConfig) -> int:
     lines.append("  level: error")
     lines.append("webrtc:")
     lines.append(f'  listen: ":{port}"')
-    # ICE candidates the browser will try. go2rtc runs on the docker bridge so it
-    # can't see the host's LAN IP — advertise reachable hosts explicitly via
-    # WANYARD_WEBRTC_ADDITIONAL_HOSTS (e.g. the LAN IP for same-network browsers),
-    # PLUS stun for the public IP (external / properly-forwarded access). With no
-    # hosts set, stun alone works for forwarded public access.
-    lines.append("  candidates:")
-    for h in hosts:
-        lines.append(f"    - {h}:{port}")
-    lines.append(f"    - stun:{port}")
+    # No candidates config: go2rtc emits its own (docker-bridge) host candidate on
+    # this port; the app's WHEP proxy rewrites it to the address the browser used
+    # to reach us. So WebRTC works out of the box with no host config.
     # Preload keeps go2rtc connected to each source on startup (warm producer),
     # so the last keyframe is always buffered and new WebRTC viewers paint
     # instantly instead of waiting for the next IDR. video-only (wall is muted).

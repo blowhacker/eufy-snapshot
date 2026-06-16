@@ -3,11 +3,33 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import socket
 import urllib.error
 import urllib.request
 from urllib.parse import quote
 
 LOG = logging.getLogger("wanyard.native_hls")
+
+
+def resolve_host(host: str) -> str:
+    # Resolve a hostname to an IP for an ICE candidate; fall back to the name
+    # (browsers can resolve FQDN host candidates).
+    try:
+        return socket.gethostbyname(host)
+    except (OSError, UnicodeError):
+        return host
+
+
+_HOST_CAND_RE = re.compile(r"(a=candidate:\S+ \d+ \S+ \d+ )(\S+)( \d+ typ host)")
+
+
+def rewrite_host_candidates(sdp: str, address: str) -> str:
+    # Point every `typ host` ICE candidate at `address` — the host the browser
+    # actually reached us on. go2rtc (on the docker bridge) only knows its bridge
+    # IP, which isn't reachable from the client; the address the client used to
+    # load the page is, by definition.
+    return _HOST_CAND_RE.sub(lambda m: m.group(1) + address + m.group(3), sdp)
 
 # Master (multivariant) playlist, NOT the bare media playlist
 # (video1_stream.m3u8). iOS Safari needs the master's #EXT-X-STREAM-INF CODECS

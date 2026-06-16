@@ -73,6 +73,10 @@ services:
       # the .env, never as a local edit to the tracked config.yaml. Matches the
       # published port above.
       - WANYARD_WEB_PORT=${WANYARD_WEB_PORT:-8091}
+      # Override the WebRTC ICE host the wall advertises. Default (empty) = the
+      # WHEP proxy uses the address the browser reached us on — works out of the
+      # box. Set only for topologies where that host isn't reachable for ICE.
+      - WANYARD_WEBRTC_ADDITIONAL_HOSTS=${WANYARD_WEBRTC_ADDITIONAL_HOSTS:-}
       # (recorder auto-detects the stamped codec and tags hvc1 only for HEVC)
     volumes:
       - ./config.yaml:/app/config.yaml:ro
@@ -168,10 +172,6 @@ services:
       # WebRTC media port. Default 8555 works for a single install; override only
       # to avoid a collision when several stacks share a host.
       - WANYARD_GO2RTC_WEBRTC_PORT=${WANYARD_GO2RTC_WEBRTC_PORT:-8555}
-      # Reachable host(s) to advertise as ICE candidates — set the LAN IP for
-      # same-network browsers (go2rtc on the bridge can't auto-detect it). STUN
-      # covers public/forwarded access on top. Empty = stun-only (public path).
-      - WANYARD_WEBRTC_ADDITIONAL_HOSTS=${WANYARD_WEBRTC_ADDITIONAL_HOSTS:-}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
