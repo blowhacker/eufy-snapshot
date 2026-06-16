@@ -151,10 +151,10 @@ services:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
 
-  # go2rtc powers the wall's INSTANT live (WebRTC/WHEP). It reads each camera
-  # from the mediamtx RTSP relay (no extra camera pull) and caches the last
-  # keyframe, so a new viewer paints immediately (mediamtx-direct waited up to
-  # one GOP). Config generated from the source DB by go2rtc-conf at boot.
+  # go2rtc is the camera ingest + the wall's INSTANT WebRTC. It reads each camera
+  # directly, serves RTSP to mediamtx (recording/BITC) and WebRTC to the wall.
+  # WebRTC candidates use STUN auto-discovery, so a plain `docker compose up`
+  # works with no hostname config. Config generated from the source DB at boot.
   go2rtc-conf:
     image: wanyard:latest
     pull_policy: never
@@ -165,8 +165,8 @@ services:
       options: {max-size: "50m", max-file: "3"}
     command: ["-c", "/app/config.yaml", "gen-go2rtc", "--out", "/run/go2rtc/go2rtc.yaml"]
     environment:
-      - WANYARD_RELAY_HOST=mediamtx
-      - WANYARD_WEBRTC_ADDITIONAL_HOSTS=${WANYARD_WEBRTC_ADDITIONAL_HOSTS:-}
+      # WebRTC media port. Default 8555 works for a single install; override only
+      # to avoid a collision when several stacks share a host.
       - WANYARD_GO2RTC_WEBRTC_PORT=${WANYARD_GO2RTC_WEBRTC_PORT:-8555}
     volumes:
       - ./config.yaml:/app/config.yaml:ro

@@ -204,19 +204,16 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
 
 
 def cmd_gen_go2rtc(args, config: AppConfig) -> int:
-    # go2rtc serves the wall's instant WebRTC. It reads each camera from the
-    # mediamtx RTSP relay (NOT the camera directly → no extra camera pull) and
-    # caches the last keyframe, so a new WebRTC viewer paints immediately instead
-    # of waiting up to one GOP for the next IDR (the mediamtx-direct limitation).
+    # go2rtc is the single camera ingest: it reads each camera directly, serves
+    # RTSP downstream to mediamtx (recording/BITC) and WebRTC to the wall. Reading
+    # direct + a warm producer means new WebRTC viewers paint near-instantly.
     source_db = SourceDB(config.db_path) if config.db_path else None
     if not source_db:
         print("error: db_path not configured", file=sys.stderr)
         return 1
 
     sources = [s for s in source_db.to_source_configs() if s.type == "rtsp" and s.enabled]
-    relay_host = (os.environ.get("WANYARD_RELAY_HOST", "").strip() or "mediamtx")
     port = (os.environ.get("WANYARD_GO2RTC_WEBRTC_PORT", "").strip() or "8555")
-    hosts = [h.strip() for h in os.environ.get("WANYARD_WEBRTC_ADDITIONAL_HOSTS", "").split(",") if h.strip()]
 
     lines = []
     lines.append("api:")
@@ -225,10 +222,11 @@ def cmd_gen_go2rtc(args, config: AppConfig) -> int:
     lines.append("  level: error")
     lines.append("webrtc:")
     lines.append(f'  listen: ":{port}"')
-    if hosts:
-        lines.append("  candidates:")
-        for h in hosts:
-            lines.append(f"    - {h}:{port}")
+    # STUN auto-discovers the public IP (Frigate's approach) + go2rtc also adds
+    # LAN host candidates — so WebRTC works on a plain `docker compose up` with
+    # no hostname config. Just open the WebRTC port (udp+tcp) on the firewall.
+    lines.append("  candidates:")
+    lines.append(f"    - stun:{port}")
     # Preload keeps go2rtc connected to each source on startup (warm producer),
     # so the last keyframe is always buffered and new WebRTC viewers paint
     # instantly instead of waiting for the next IDR. video-only (wall is muted).
