@@ -1,0 +1,84 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg-stage);
+  color: var(--txt);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+
+.wall-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+}
+.wall-logo {
+  width: 22px; height: 22px;
+  border-radius: var(--r);
+  background: var(--amber);
+  color: #111;
+  display: grid; place-items: center;
+  font-weight: 600; font-size: 13px;
+}
+.wall-title { font-size: 14px; font-weight: 600; }
+.wall-sub   { color: var(--txt-3); font-size: 12px; margin-left: auto; }
+
+#wall {
+  display: grid;
+  gap: 10px;
+  padding: 0 16px 16px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+.tile {
+  position: relative;
+  display: block;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: #000;
+  border: 1px solid var(--line);
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 120ms;
+}
+.tile:hover { border-color: var(--amber-ring); }
+.tile video {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+  background: #000;
+}
+
+/* Bottom bar: holds the camera name + status dot, and its opaque foot covers
+   the burned BITC strip (bottom-left, ~8px tall) so no overlay canvas needed. */
+.tile-bar {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  padding: 16px 10px 7px;
+  display: flex; align-items: center; gap: 7px;
+  background: linear-gradient(transparent, var(--bg-stage) 88%);
+  pointer-events: none;
+}
+.tile-bar .dot {
+  width: 7px; height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--amber);              /* connecting */
+  box-shadow: 0 0 0 2px rgba(0,0,0,.35);
+}
+.tile.live    .dot { background: var(--green); }
+.tile.offline .dot { background: var(--red); }
+.tile-bar .name { font-size: 12px; font-weight: 500; }
+
+.tile.offline::after {
+  content: "offline";
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  color: var(--txt-3); font-size: 12px;
+  background: rgba(6, 8, 11, .55);
+}
+
+.empty { padding: 48px 16px; text-align: center; color: var(--txt-3); }
+.empty a { color: var(--amber); }

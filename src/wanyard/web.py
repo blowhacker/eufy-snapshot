@@ -1639,7 +1639,15 @@ def make_app(
         )
 
     routes = [
-        Route("/",                           lambda r: FileResponse(static_dir / "video2.html", headers={"Cache-Control": "no-cache"})),
+        # Landing = the live wall (god view). A specific ?source (and not the
+        # explicit ?view=wall) loads the full single-camera viewer instead, so a
+        # tile's /?source=X&live=1&… link opens the viewer. ?source=all keeps the
+        # viewer's aggregate timeline.
+        Route("/", lambda r: FileResponse(
+            static_dir / ("video2.html"
+                          if r.query_params.get("source") and r.query_params.get("view") != "wall"
+                          else "wall.html"),
+            headers={"Cache-Control": "no-cache"})),
         Route("/settings",                  lambda r: FileResponse(static_dir / "settings.html", headers={"Cache-Control": "no-cache"})),
         Route("/api/health",                api_health),
         Route("/api/thumb",                 api_thumb),
