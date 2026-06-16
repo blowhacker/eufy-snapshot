@@ -131,14 +131,15 @@ function makeTile(src) {
     _pcs.push(pc);
     vRtc.addEventListener("playing", () => {
       // Reveal WebRTC on its next painted frame (rVFC) so the cut lands on a real
-      // frame, not a black gap. Tear HLS down a beat later — it's hidden behind
-      // the opaque WebRTC by then, so no flicker.
+      // frame, not a black gap — then immediately tear HLS down. The cut is
+      // instant (opaque), so HLS is hidden behind it at once: no flicker, and it
+      // stops polling right away. Also mark live here in case WebRTC wins before
+      // HLS ever played (else the green dot wouldn't light).
       const reveal = () => {
-        tile.classList.add("rtc");
-        setTimeout(() => {
-          hlsP.then((h) => { try { h?.destroy(); } catch {} });
-          try { vHls.pause(); vHls.removeAttribute("src"); vHls.load(); } catch {}
-        }, 1000);
+        tile.classList.remove("offline");
+        tile.classList.add("live", "rtc");
+        hlsP.then((h) => { try { h?.destroy(); } catch {} });
+        try { vHls.pause(); vHls.removeAttribute("src"); vHls.load(); } catch {}
       };
       if (vRtc.requestVideoFrameCallback) vRtc.requestVideoFrameCallback(reveal);
       else reveal();
@@ -172,6 +173,11 @@ async function build() {
   sub.textContent = `${sources.length} camera${sources.length > 1 ? "s" : ""}`;
   sources.forEach(s => grid.append(makeTile(s)));
 }
+
+// Warm the hls.js library early (Chromium only; iOS uses native HLS) so the
+// instant HLS first layer is ready on a cold load instead of waiting for the
+// library to fetch — which would let the WebRTC keyframe wait show through.
+if (!shouldUseNativeHls()) loadHlsJs().catch(() => {});
 
 build();
 
