@@ -4,6 +4,7 @@
 // iOS gets plain HLS and desktop Chrome gets low-latency, same as the viewer.
 
 const NATIVE_DELAY = 3;   // seconds behind the edge for the hls.js path
+const _hls = [];          // live hls.js instances, for teardown on rebuild
 
 // Mirror video2.js shouldUseNativeHls(): Safari + iOS play HLS natively (no MSE).
 function shouldUseNativeHls() {
@@ -53,6 +54,7 @@ async function attachLive(video, srcId, onOffline) {
         liveSyncDuration: NATIVE_DELAY,
         liveMaxLatencyDuration: NATIVE_DELAY + 3,
       });
+      _hls.push(hls);
       hls.loadSource(url);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
@@ -94,7 +96,15 @@ function makeTile(src) {
   return tile;
 }
 
-(async () => {
+function teardown() {
+  while (_hls.length) { try { _hls.pop().destroy(); } catch {} }
+  const grid = document.getElementById("wall");
+  grid.querySelectorAll("video").forEach(v => { try { v.pause(); v.removeAttribute("src"); v.load(); } catch {} });
+  grid.innerHTML = "";
+}
+
+async function build() {
+  teardown();
   const grid = document.getElementById("wall");
   const sub = document.getElementById("wallSub");
   const r = await fetch("/api/sources", { cache: "no-store" }).catch(() => null);
@@ -106,4 +116,11 @@ function makeTile(src) {
   }
   sub.textContent = `${sources.length} camera${sources.length > 1 ? "s" : ""}`;
   sources.forEach(s => grid.append(makeTile(s)));
-})();
+}
+
+build();
+
+// iOS restores this page from the back-forward cache (bfcache) without re-running
+// the script, and tears down media on navigate-away → tiles come back blank.
+// Rebuild from scratch (fresh attach at the current live edge) on bfcache restore.
+window.addEventListener("pageshow", e => { if (e.persisted) build(); });
