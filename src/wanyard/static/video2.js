@@ -3683,7 +3683,10 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   drawBoxList(el.video, []);
   if (updateMode) mode.stopLive();
   if (el.video.dataset.src) el.video.style.display = "block";
-  else el.empty.style.display = "block";
+  // "Choose a source to start" only makes sense with no source selected. With a
+  // source active (e.g. leaving live mid class-filter seek, before the recorded
+  // src is set) it wrongly overlays the video — don't show it then.
+  else if (!st.source || st.source === "all") el.empty.style.display = "block";
   setStatus("REPLAY");
 }
 

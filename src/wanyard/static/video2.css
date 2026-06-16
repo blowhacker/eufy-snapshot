@@ -98,6 +98,7 @@ body {
   color: var(--txt);
   font-size: 14px;
   font-weight: 500;
+  line-height: 1;            /* center glyph against the 22px logo */
   letter-spacing: -0.005em;
   white-space: nowrap;
 }
