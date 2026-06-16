@@ -174,7 +174,7 @@ services:
       - go2rtc-conf:/run/go2rtc
 
   go2rtc:
-    image: alexxit/go2rtc:latest   # TODO pin once the spike confirms the tag
+    image: alexxit/go2rtc:1.9.14
     container_name: wanyard-go2rtc
     restart: unless-stopped
     depends_on:
