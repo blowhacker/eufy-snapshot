@@ -5120,3 +5120,25 @@ async function init() {
 }
 
 init();
+
+// Top-left logo → the live wall (god view).
+{
+  const _logo = document.querySelector(".ab-logo");
+  if (_logo) {
+    _logo.style.cursor = "pointer";
+    _logo.title = "Live wall";
+    _logo.addEventListener("click", () => location.assign("/?view=wall"));
+  }
+}
+
+// iOS restores this page from the back-forward cache without re-running init(),
+// and tears down the media on navigate-away → the live <video> comes back dead.
+// Re-attach on bfcache restore (live → re-follow the edge; recorded → resume).
+window.addEventListener("pageshow", e => {
+  if (!e.persisted) return;
+  if (liveTail.active && liveTail.srcId) {
+    startLiveTail(liveTail.srcId, { force: true });
+  } else if (el.video && el.video.currentSrc && el.video.paused && !el.video.ended) {
+    el.video.play().catch(() => {});
+  }
+});
