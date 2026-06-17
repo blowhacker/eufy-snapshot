@@ -128,6 +128,13 @@ class _StamperWorker:
         # even at 0.85 Mbps).
         self.maxrate = self._src_env("MAXRATE")
         self.bufsize = self._src_env("BUFSIZE")
+        # Runtime encoder fallback. The startup NVENC probe can pass (it grabs a
+        # momentary session) while the real per-camera open later fails — e.g. the
+        # GPU's concurrent-NVENC-session cap is already full. When that happens we
+        # demote this camera's encoder for the rest of the process instead of
+        # looping forever on a codec that can't open.
+        self._codec_override: str | None = None
+        self._active_codec: str | None = None
         self.thread = threading.Thread(
             target=self.run, daemon=True, name=f"stamper-{source_id}")
 
@@ -155,11 +162,29 @@ class _StamperWorker:
                 self._stream()
                 backoff = 1.0
             except Exception as exc:
+                if self._demote_on_encoder_error(exc):
+                    self._wait(1.0)       # retry promptly with the fallback encoder
+                    backoff = 1.0
+                    continue
                 LOG.warning("stamper %s reconnect in %.1fs after %s",
                             self.source_id, backoff, exc)
                 self._wait(backoff)
                 backoff = min(30.0, backoff * 2.0)
         LOG.info("stamper %s stopped", self.source_id)
+
+    def _demote_on_encoder_error(self, exc: Exception) -> bool:
+        """On a failure to OPEN the video encoder (e.g. NVENC session cap hit at
+        runtime), fall back hevc_nvenc → h264_nvenc → libx264 for the rest of the
+        process so the camera stays alive (CPU) instead of looping on a codec that
+        can't open. Non-open errors (network etc.) take the normal reconnect."""
+        demote = {"hevc_nvenc": "h264_nvenc", "h264_nvenc": "libx264"}
+        nxt = demote.get(self._active_codec or "")
+        if nxt and "avcodec_open2" in str(exc):
+            LOG.warning("stamper %s encoder %s failed to open — falling back to %s",
+                        self.source_id, self._active_codec, nxt)
+            self._codec_override = nxt
+            return True
+        return False
 
     def _wait(self, seconds: float) -> None:
         end = time.time() + seconds
@@ -175,6 +200,8 @@ class _StamperWorker:
         enough). A GPU-less box (the default `docker compose up`) lands on
         libx264 — no crash loop.
         """
+        if self._codec_override:
+            return self._codec_override   # runtime fallback after an open failure
         if self.encoder == "libx264":
             return "libx264"
         if self.encoder in ("nvenc", "h264_nvenc"):
@@ -226,6 +253,7 @@ class _StamperWorker:
             out = av.open(self.out_url, "w", format="rtsp",
                           options={"rtsp_transport": "tcp"})
             codec = self._video_codec()
+            self._active_codec = codec
             vout = out.add_stream(codec, rate=vin.average_rate or 15)
             vout.width = vin.codec_context.width
             vout.height = vin.codec_context.height
