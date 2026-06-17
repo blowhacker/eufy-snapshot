@@ -222,9 +222,16 @@ def cmd_gen_go2rtc(args, config: AppConfig) -> int:
     lines.append("  level: error")
     lines.append("webrtc:")
     lines.append(f'  listen: ":{port}"')
-    # No candidates config: go2rtc emits its own (docker-bridge) host candidate on
-    # this port; the app's WHEP proxy rewrites it to the address the browser used
-    # to reach us. So WebRTC works out of the box with no host config.
+    candidate_env = os.environ.get("WANYARD_GO2RTC_WEBRTC_CANDIDATES", "").strip()
+    candidates = [c.strip() for c in candidate_env.split(",") if c.strip()]
+    if not candidates:
+        candidates = [f"stun:{port}"]
+    lines.append("  candidates:")
+    for candidate in candidates:
+        lines.append(f'    - "{candidate}"')
+    # Keep the server-side candidate on the published media port. The app's WHEP
+    # proxy rewrites host candidates to the address the browser used to reach us,
+    # avoiding Docker bridge addresses while still supporting custom candidates.
     # Preload keeps go2rtc connected to each source on startup (warm producer),
     # so the last keyframe is always buffered and new WebRTC viewers paint
     # instantly instead of waiting for the next IDR. video-only (wall is muted).

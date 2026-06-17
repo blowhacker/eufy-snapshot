@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -12,7 +13,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from wanyard.capture import resolve_rtsp_url
-from wanyard.config import SourceConfig
+from wanyard import cli
+from wanyard.config import AppConfig, SourceConfig
 from wanyard.live_detector import _target_relay_paths
 from wanyard import native_hls
 
@@ -74,15 +76,15 @@ class RelayCutoverTests(unittest.TestCase):
             )
             self.assertEqual(
                 native_hls.public_manifest_url("tapo-front"),
-                "/video/native-live/tapo-front-stamped/video1_stream.m3u8",
+                "/video/native-live/tapo-front-stamped/index.m3u8",
             )
             self.assertEqual(
                 native_hls.upstream_url(
                     "tapo-front-stamped",
-                    "video1_stream.m3u8",
+                    "index.m3u8",
                     "_HLS_msn=7&_HLS_part=3",
                 ),
-                "http://mediamtx:8891/tapo-front-stamped/video1_stream.m3u8?_HLS_msn=7&_HLS_part=3",
+                "http://mediamtx:8891/tapo-front-stamped/index.m3u8?_HLS_msn=7&_HLS_part=3",
             )
 
     def test_native_hls_rejects_unsafe_proxy_paths(self) -> None:
@@ -110,6 +112,33 @@ class RelayCutoverTests(unittest.TestCase):
                     clear=True,
                 ):
                     self.assertEqual(native_hls.hls_port(), native_hls.DEFAULT_PORT)
+
+    def test_gen_go2rtc_pins_webrtc_candidate_to_media_port(self) -> None:
+        db = mock.Mock()
+        db.to_source_configs.return_value = [
+            SourceConfig(
+                id="tapo-front",
+                name="Front",
+                url="rtsp://camera/stream1",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "go2rtc.yaml"
+            args = mock.Mock(out=str(out))
+            with mock.patch("wanyard.cli.SourceDB", return_value=db), mock.patch.dict(
+                os.environ,
+                {"WANYARD_GO2RTC_WEBRTC_PORT": "8557"},
+                clear=True,
+            ):
+                self.assertEqual(
+                    cli.cmd_gen_go2rtc(args, AppConfig(db_path=Path("sources.db"))),
+                    0,
+                )
+
+            text = out.read_text(encoding="utf-8")
+            self.assertIn('  listen: ":8557"', text)
+            self.assertIn('    - "stun:8557"', text)
+            self.assertIn("  tapo-front: rtsp://camera/stream1", text)
 
 
 if __name__ == "__main__":
