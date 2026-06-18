@@ -71,6 +71,17 @@ class CaptureWorker:
         return {sid: (t.is_alive() if t else False)
                 for sid, t in self._threads.items()}
 
+    def recorder_status(self) -> dict[str, dict]:
+        workers = list(self.video_workers.items())
+        threads = dict(self._threads)
+        return {
+            sid: {
+                "thread_alive": bool(threads.get(sid) and threads[sid].is_alive()),
+                **vw.status(),
+            }
+            for sid, vw in workers
+        }
+
     def stop(self) -> None:
         self._stop.set()
         for vw in self.video_workers.values():

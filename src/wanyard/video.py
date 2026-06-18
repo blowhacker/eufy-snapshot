@@ -2967,6 +2967,50 @@ class VideoWorker:
         self._seg_start: float       = 0.0
         self._live_dir  = video_dir / "live" / source.id
         self._live_dir.mkdir(parents=True, exist_ok=True)
+        self._status_lock = threading.Lock()
+        self._last_codec: str | None = None
+        self._last_codec_probe_ts: float | None = None
+        self._last_segment_started_ts: float | None = None
+        self._last_segment_completed_ts: float | None = None
+        self._last_failure_ts: float | None = None
+        self._last_failure_kind: str | None = None
+        self._consecutive_failures = 0
+        self._completed_segments = 0
+        self._segment_hvc1 = False
+        self._codec_cache_valid = False
+        self._codec_cache: str | None = None
+
+    def status(self) -> dict:
+        with self._status_lock:
+            return {
+                "codec": self._last_codec,
+                "codec_probe_ts": self._last_codec_probe_ts,
+                "segment_started_ts": self._last_segment_started_ts,
+                "segment_completed_ts": self._last_segment_completed_ts,
+                "last_failure_ts": self._last_failure_ts,
+                "last_failure_kind": self._last_failure_kind,
+                "consecutive_failures": self._consecutive_failures,
+                "completed_segments": self._completed_segments,
+            }
+
+    def _record_failure(self, kind: str) -> None:
+        now = time.time()
+        with self._status_lock:
+            self._last_failure_ts = now
+            self._last_failure_kind = kind
+            self._consecutive_failures += 1
+            consecutive = self._consecutive_failures
+        LOG.warning(
+            "RECORDER-FAILURE src=%s kind=%s consecutive=%d",
+            self.source.id, kind, consecutive,
+        )
+
+    def _record_segment_completed(self, ts: float, *, reset_failures: bool = True) -> None:
+        with self._status_lock:
+            self._last_segment_completed_ts = ts
+            if reset_failures:
+                self._consecutive_failures = 0
+            self._completed_segments += 1
 
     def _live_playlist_segments(self) -> set[str]:
         playlist = self._live_dir / "live.m3u8"
@@ -3007,11 +3051,17 @@ class VideoWorker:
         """Continuous recording loop — call from a daemon thread."""
         LOG.info("continuous recording started: %s", self.source.id)
         backoff = 5.0
+        omit_hvc1_once = False
         while not self._stop.is_set():
             try:
                 ts = time.time()
-                self._start_segment(ts)
+                omit_hvc1 = omit_hvc1_once
+                omit_hvc1_once = False
+                self._start_segment(ts, omit_hvc1=omit_hvc1)
                 if self._proc:
+                    attempted_hvc1 = self._segment_hvc1
+                    early_stderr = ""
+                    returncode = None
                     # Poll every 5s so we detect ffmpeg exit within 5 seconds
                     deadline = time.time() + _MAX_SEGMENT_SECONDS
                     while time.time() < deadline and not self._stop.is_set():
@@ -3021,22 +3071,49 @@ class VideoWorker:
                                 err = self._proc.stderr.read() or b""
                             except Exception:
                                 pass
+                            early_stderr = err.decode("utf-8", "replace")
+                            returncode = self._proc.returncode
                             LOG.warning("ffmpeg exited early for %s (rc=%s): %s",
-                                        self.source.id, self._proc.returncode,
-                                        err.decode("utf-8", "replace")[-1200:])
+                                        self.source.id, returncode,
+                                        early_stderr[-1200:])
                             break
                         if self._seg_id and not getattr(self, "_anchor_set", False):
                             self._observe_marker_anchor()
                         self._stop.wait(5)
                     elapsed = time.time() - ts
-                    self._stop_segment(time.time())
+                    stopped_ts = time.time()
+                    segment_ok = self._stop_segment(stopped_ts)
+                    if returncode is not None:
+                        self._invalidate_stamped_codec()
+                        if segment_ok:
+                            self._record_segment_completed(
+                                stopped_ts, reset_failures=False,
+                            )
+                        if attempted_hvc1 and self._is_hvc1_tag_mismatch(early_stderr):
+                            self._record_failure("codec_tag_mismatch")
+                            if not omit_hvc1:
+                                LOG.warning(
+                                    "retrying %s immediately without hvc1 tag",
+                                    self.source.id,
+                                )
+                                omit_hvc1_once = True
+                                continue
+                        else:
+                            self._record_failure("ffmpeg_early_exit")
+                    elif segment_ok:
+                        self._record_segment_completed(stopped_ts)
+                    else:
+                        self._invalidate_stamped_codec()
+                        self._record_failure("empty_segment")
                     # Reset backoff on successful segment (ran > 30s)
-                    backoff = 5.0 if elapsed > 30 else min(backoff * 2, 300)
-                    if elapsed <= 30:
+                    backoff = 5.0 if elapsed > 30 and segment_ok else min(backoff * 2, 300)
+                    if elapsed <= 30 or not segment_ok:
                         LOG.warning("short segment (%.0fs) for %s — backoff %.0fs",
                                     elapsed, self.source.id, backoff)
                         self._stop.wait(backoff)
                 else:
+                    if omit_hvc1:
+                        omit_hvc1_once = True
                     LOG.warning("ffmpeg failed to start for %s — backoff %.0fs",
                                 self.source.id, backoff)
                     self._stop.wait(backoff)
@@ -3051,15 +3128,26 @@ class VideoWorker:
         if self._seg_id or self._proc:
             self._stop_segment(time.time())
 
-    def _stamped_codec(self, url: str) -> str | None:
-        """Video codec of the stamped stream (hevc/h264/...), probed once.
+    @staticmethod
+    def _is_hvc1_tag_mismatch(stderr: str) -> bool:
+        text = stderr.lower()
+        return "tag hvc1 incompatible with output codec id" in text
 
-        The stamper auto-resolves its encoder per host (hevc_nvenc on GPU,
-        else libx264), so the recorder can't assume HEVC — it must look.
+    def _invalidate_stamped_codec(self) -> None:
+        with self._status_lock:
+            self._codec_cache_valid = False
+            self._codec_cache = None
+
+    def _stamped_codec(self, url: str) -> str | None:
+        """Video codec of the stamped stream (hevc/h264/...).
+
+        Healthy segment rotations reuse the observation to avoid an RTSP probe
+        gap. Any early FFmpeg exit invalidates it because the stamper may have
+        reconnected with a different fallback encoder.
         """
-        cached = getattr(self, "_codec_cache", None)
-        if cached is not None:
-            return cached or None
+        with self._status_lock:
+            if self._codec_cache_valid:
+                return self._codec_cache
         ffprobe = shutil.which("ffprobe")
         codec = None
         if ffprobe:
@@ -3074,16 +3162,22 @@ class VideoWorker:
                 codec = (out.stdout or "").strip().lower() or None
             except Exception:
                 codec = None
-        self._codec_cache = codec or ""   # cache negatives too
+        with self._status_lock:
+            self._last_codec = codec
+            self._last_codec_probe_ts = time.time()
+            self._codec_cache = codec
+            self._codec_cache_valid = codec is not None
         return codec
 
-    def _start_segment(self, ts: float) -> None:
+    def _start_segment(self, ts: float, *, omit_hvc1: bool = False) -> None:
         from .capture import resolve_rtsp_url
         url    = resolve_rtsp_url(self.source)
         ffmpeg = shutil.which("ffmpeg")
         if not url or not ffmpeg:
+            self._record_failure("recorder_unavailable")
             return
         if not self._wait_for_relay_path(url):
+            self._record_failure("relay_unavailable")
             return
         dt       = datetime.fromtimestamp(ts, tz=timezone.utc)
         date_dir = self.video_dir / self.source.id / dt.strftime("%Y/%m/%d")
@@ -3096,7 +3190,9 @@ class VideoWorker:
         # it's incompatible and ffmpeg fails to write the header. The stamper's
         # encoder is auto-resolved (hevc/h264/libx264), so tag only when the
         # actual stream is HEVC. Applies to the .mp4 archive only.
-        mp4_tag = ["-tag:v", "hvc1"] if self._stamped_codec(url) == "hevc" else []
+        codec = self._stamped_codec(url)
+        self._segment_hvc1 = codec == "hevc" and not omit_hvc1
+        mp4_tag = ["-tag:v", "hvc1"] if self._segment_hvc1 else []
         try:
             self._proc = subprocess.Popen(
                 [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
@@ -3127,13 +3223,18 @@ class VideoWorker:
         except Exception:
             LOG.exception("failed to start ffmpeg for %s", self.source.id)
             self._proc = None
+            self._record_failure("ffmpeg_start_failed")
             return
         self._seg_path  = seg_path
         self._seg_start = ts
+        with self._status_lock:
+            self._last_segment_started_ts = ts
         try:
             self._seg_id = self.db.open_segment(self.source.id, rel_path, ts)
         except Exception:
             self._seg_id = None
+            LOG.exception("failed to open segment row for %s", self.source.id)
+            self._record_failure("database_open_failed")
         self._anchor_set = False
         LOG.info("segment started: %s", rel_path)
 
@@ -3173,11 +3274,12 @@ class VideoWorker:
         LOG.info("BITC-ANCHOR-EARLY seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
                  seg_id, self.source.id, media_epoch, media_epoch - seg_start)
 
-    def _stop_segment(self, ts: float) -> None:
+    def _stop_segment(self, ts: float) -> bool:
         proc      = self._proc;     self._proc     = None
         seg_path  = self._seg_path; self._seg_path = None
         seg_id    = self._seg_id
         seg_start = self._seg_start
+        self._segment_hvc1 = False
         if proc and proc.poll() is None:
             try:
                 proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
@@ -3197,7 +3299,13 @@ class VideoWorker:
                         seg_id, self.source.id, seg_path,
                     )
                     self.db.delete_segment(seg_id)
-                    return
+                    try:
+                        seg_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        LOG.exception("failed to remove empty segment: %s", seg_path)
+                    return False
 
                 media_epoch = _decode_bitc_media_epoch(seg_path)
                 if media_epoch is not None:
@@ -3214,6 +3322,8 @@ class VideoWorker:
                     )
                     self.db.mark_scanned(seg_id)
             self.db.close_segment(seg_id, ts, None, None)
+            return True
+        return False
 
     def _wait_for_relay_path(self, url: str) -> bool:
         relay_host = os.environ.get("WANYARD_RELAY_HOST", "").strip()

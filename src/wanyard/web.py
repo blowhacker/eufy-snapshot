@@ -1459,6 +1459,7 @@ def make_app(
                     except Exception:
                         pass
         recording_threads = capture_worker.thread_health() if capture_worker else {}
+        recording_workers = capture_worker.recorder_status() if capture_worker else {}
         return JSONResponse({
             "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
             "video_dir": str(video_dir) if video_dir else None,
@@ -1469,6 +1470,7 @@ def make_app(
             "yolo_connected": yolo_ok,
             "backfill_alive": backfill_alive,
             "recording_threads": recording_threads,
+            "recording_workers": recording_workers,
             "latest_event_ts": latest_event_ts,
         })
 
