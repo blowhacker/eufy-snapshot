@@ -4,6 +4,7 @@ import sys
 import json
 import sqlite3
 import tempfile
+import time
 import types
 import unittest
 from fractions import Fraction
@@ -274,7 +275,7 @@ class VideoBitcAnchorTests(unittest.TestCase):
     def test_live_status_returns_requested_detection_window(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wanyard-live-status-") as tmp:
             db = VideoSegmentDB(Path(tmp) / "video.sqlite")
-            base = 1_781_700_000.0
+            base = time.time() - 10.0
             segment_id = db.open_segment("front", "front/live.mp4", base)
             db.set_segment_media_start(segment_id, base)
             db.insert_live_detections(segment_id, "front", [
@@ -304,7 +305,7 @@ class VideoBitcAnchorTests(unittest.TestCase):
     def test_provisional_event_id_resolves_for_thumbnail_crop(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wanyard-provisional-event-") as tmp:
             db = VideoSegmentDB(Path(tmp) / "video.sqlite")
-            base = 1_781_700_000.0
+            base = time.time() - 10.0
             segment_id = db.open_segment("front", "front/live.mp4", base)
             db.set_segment_media_start(segment_id, base)
             box = {
@@ -341,7 +342,7 @@ class VideoBitcAnchorTests(unittest.TestCase):
         self.assertEqual(resolved["seg_path"], "front/live.mp4")
         self.assertEqual(resolved["seg_media_epoch"], base)
         self.assertEqual(resolved["seg_end_ts"], None)
-        self.assertEqual(round(resolved["abs_ts"], 1), base + 2.0)
+        self.assertEqual(round(resolved["abs_ts"], 1), round(base + 2.0, 1))
         boxes = json.loads(resolved["boxes_json"])
         self.assertEqual(boxes[0]["cls"], "person")
 

@@ -1,0 +1,37 @@
+name: wanyard-recorder-tests
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.3
+    restart: "no"
+    environment:
+      - MTX_LOGLEVEL=warn
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "1"}
+
+  recorder-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.recorder-tests
+    image: wanyard-recorder-tests:latest
+    restart: "no"
+    entrypoint: ["python3"]
+    command:
+      - "-m"
+      - "unittest"
+      - "discover"
+      - "-s"
+      - "tests"
+      - "-p"
+      - "test_recorder_fault_integration.py"
+      - "-v"
+    environment:
+      - WANYARD_RUN_RECORDER_FAULT_TESTS=1
+      - WANYARD_FAULT_RTSP_HOST=mediamtx
+    healthcheck:
+      disable: true
+    depends_on:
+      - mediamtx
+    volumes:
+      - ./tests:/app/tests:ro

@@ -56,6 +56,24 @@ wanyard stamp        # BITC stamper
 wanyard yolo-serve   # YOLO live detection + MP4 backfill
 ```
 
+## Tests
+
+Run the fast unit suite:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Run the isolated recorder fault suite with real FFmpeg and MediaMTX processes:
+
+```bash
+./scripts/test-recorder-faults.sh
+```
+
+The fault suite uses a separate Compose project, synthetic RTSP publishers,
+temporary databases, and temporary video directories. It does not read camera
+configuration or production footage.
+
 ## Web UI
 
 - `http://localhost:8091` — live wall (all cameras); click one for its viewer

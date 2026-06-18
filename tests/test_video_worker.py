@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from wanyard.config import SourceConfig
+from wanyard import video
 from wanyard.video import VideoWorker
 
 
@@ -121,6 +122,17 @@ class VideoWorkerTests(unittest.TestCase):
             db.delete_segment.assert_called_once_with(9)
             db.close_segment.assert_not_called()
 
+    def test_stop_segment_closes_ffmpeg_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = self._worker(Path(tmpdir))
+            proc = mock.Mock()
+            proc.poll.return_value = 1
+            worker._proc = proc
+
+            self.assertFalse(worker._stop_segment(123.0))
+
+            proc.stderr.close.assert_called_once_with()
+
     def test_status_tracks_failures_and_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._worker(Path(tmpdir))
@@ -136,6 +148,16 @@ class VideoWorkerTests(unittest.TestCase):
             self.assertEqual(recovered["consecutive_failures"], 0)
             self.assertEqual(recovered["segment_completed_ts"], 456.0)
             self.assertEqual(recovered["completed_segments"], 1)
+
+    def test_production_retry_defaults_remain_bounded(self) -> None:
+        self.assertEqual(video._RECORD_RETRY_INITIAL_SECONDS, 5.0)
+        self.assertEqual(video._RECORD_RETRY_MAX_SECONDS, 300.0)
+        delay = video._RECORD_RETRY_INITIAL_SECONDS
+        observed = []
+        for _ in range(8):
+            observed.append(delay)
+            delay = min(delay * 2, video._RECORD_RETRY_MAX_SECONDS)
+        self.assertEqual(observed, [5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 300.0, 300.0])
 
 
 if __name__ == "__main__":

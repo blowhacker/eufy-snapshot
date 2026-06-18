@@ -54,6 +54,11 @@ _BITC_ANCHOR_SCAN_FRAMES = 150
 _BITC_ZERO_CONTAINER_PTS = "container_pts"
 _BITC_ZERO_FIRST_FRAME = "first_frame"
 _RECORD_RELAY_WAIT_SECONDS = 180.0
+_RECORD_POLL_SECONDS = 5.0
+_RECORD_RETRY_INITIAL_SECONDS = 5.0
+_RECORD_RETRY_MAX_SECONDS = 300.0
+_RECORD_SUCCESS_SECONDS = 30.0
+_RECORD_EXCEPTION_RETRY_SECONDS = 30.0
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS segments (
@@ -3050,7 +3055,7 @@ class VideoWorker:
     def run(self) -> None:
         """Continuous recording loop — call from a daemon thread."""
         LOG.info("continuous recording started: %s", self.source.id)
-        backoff = 5.0
+        backoff = _RECORD_RETRY_INITIAL_SECONDS
         omit_hvc1_once = False
         while not self._stop.is_set():
             try:
@@ -3079,7 +3084,7 @@ class VideoWorker:
                             break
                         if self._seg_id and not getattr(self, "_anchor_set", False):
                             self._observe_marker_anchor()
-                        self._stop.wait(5)
+                        self._stop.wait(_RECORD_POLL_SECONDS)
                     elapsed = time.time() - ts
                     stopped_ts = time.time()
                     segment_ok = self._stop_segment(stopped_ts)
@@ -3105,9 +3110,13 @@ class VideoWorker:
                     else:
                         self._invalidate_stamped_codec()
                         self._record_failure("empty_segment")
-                    # Reset backoff on successful segment (ran > 30s)
-                    backoff = 5.0 if elapsed > 30 and segment_ok else min(backoff * 2, 300)
-                    if elapsed <= 30 or not segment_ok:
+                    # Reset backoff after a segment ran long enough to be healthy.
+                    backoff = (
+                        _RECORD_RETRY_INITIAL_SECONDS
+                        if elapsed > _RECORD_SUCCESS_SECONDS and segment_ok
+                        else min(backoff * 2, _RECORD_RETRY_MAX_SECONDS)
+                    )
+                    if elapsed <= _RECORD_SUCCESS_SECONDS or not segment_ok:
                         LOG.warning("short segment (%.0fs) for %s — backoff %.0fs",
                                     elapsed, self.source.id, backoff)
                         self._stop.wait(backoff)
@@ -3117,10 +3126,14 @@ class VideoWorker:
                     LOG.warning("ffmpeg failed to start for %s — backoff %.0fs",
                                 self.source.id, backoff)
                     self._stop.wait(backoff)
-                    backoff = min(backoff * 2, 300)
+                    backoff = min(backoff * 2, _RECORD_RETRY_MAX_SECONDS)
             except Exception:
-                LOG.exception("recording error for %s — retry in 30s", self.source.id)
-                self._stop.wait(30)
+                LOG.exception(
+                    "recording error for %s — retry in %.0fs",
+                    self.source.id,
+                    _RECORD_EXCEPTION_RETRY_SECONDS,
+                )
+                self._stop.wait(_RECORD_EXCEPTION_RETRY_SECONDS)
         LOG.info("continuous recording stopped: %s", self.source.id)
 
     def stop(self) -> None:
@@ -3285,6 +3298,15 @@ class VideoWorker:
                 proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
             except Exception:
                 proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+        if proc and proc.stderr:
+            try:
+                proc.stderr.close()
+            except OSError:
+                pass
         self._seg_id = None
         self._seg_start = 0.0
         if seg_id:
