@@ -43,8 +43,13 @@ recovery based on recording progress rather than thread liveness.
 - Extend the isolated recorder fault suite with stalled-but-live workers,
   duplicate-worker prevention, restart-rate limits, and persistent outage
   scenarios.
-- Defer automatic NVENC re-promotion. A source recording successfully on CPU
-  fallback should not be disrupted automatically.
+- Add automatic NVENC re-promotion after a long cooldown. While a source is on
+  CPU fallback, run a non-disruptive open+encode probe (initially after 30
+  minutes). Switch that source back only after the probe succeeds; if the real
+  stream open still fails, roll back immediately to the known-good CPU encoder.
+  Use exponential cooldown and expose the active encoder, last probe result,
+  next retry time, and promotion/rollback count. This belongs to the stamper,
+  not recorder segment rotation.
 
 
 ## Steal ideas

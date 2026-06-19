@@ -148,6 +148,12 @@ services:
       - WANYARD_STAMP_CQ=28
       - WANYARD_STAMP_MAXRATE=2.5M
       - WANYARD_STAMP_BUFSIZE=5M
+      # Garden is 2560x1440 at ~1.6 Mbps native. If NVENC is unavailable and it
+      # falls back to CPU H.264, 2.5M starves each 1s keyframe and causes a
+      # visible quality pulse. Keep HEVC on the storage-efficient global cap,
+      # but give garden H.264 enough VBV headroom to preserve source quality.
+      - WANYARD_STAMP_TAPO_GARDEN_H264_MAXRATE=5M
+      - WANYARD_STAMP_TAPO_GARDEN_H264_BUFSIZE=10M
       # realtime-live experiment: 1s keyframe interval -> 1s HLS segments ->
       # lower live latency (see liveSyncDurationCount + hls_time=1).
       - WANYARD_STAMP_GOP_SECONDS=1

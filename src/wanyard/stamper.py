@@ -235,9 +235,12 @@ class _StamperWorker:
             # detector's 1.0s staleness gate.
             opts.update({"preset": self.preset, "tune": "zerolatency",
                          "crf": self.crf})
-        if self.maxrate:
-            opts["maxrate"] = self.maxrate
-            opts["bufsize"] = self.bufsize or self.maxrate
+        family = "HEVC" if codec == "hevc_nvenc" else "H264"
+        maxrate = self._src_env(f"{family}_MAXRATE", self.maxrate)
+        bufsize = self._src_env(f"{family}_BUFSIZE", self.bufsize)
+        if maxrate:
+            opts["maxrate"] = maxrate
+            opts["bufsize"] = bufsize or maxrate
         return opts
 
     def _stream(self) -> None:
