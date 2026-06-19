@@ -13,7 +13,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/app.css">
-  <link rel="stylesheet" href="/settings.css?v=web-notify-2">
+  <link rel="stylesheet" href="/settings.css?v=media-health-1">
 </head>
 <body>
 
@@ -42,6 +42,10 @@
       <a href="#system" class="s-side-link active">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="1.5" y="1.5" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="8" y="1.5" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="1.5" y="8" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="8" y="8" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/></svg>
         Cameras &amp; system
+      </a>
+      <a href="#media-health" class="s-side-link">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M1.5 9.5h2l1.4-4 2.1 6 1.7-5 1.2 3h2.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Media health
       </a>
       <a href="#notifications" class="s-side-link">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3 4h8M3 7h8M3 10h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="1.8" cy="4" r=".65" fill="currentColor"/><circle cx="1.8" cy="7" r=".65" fill="currentColor"/><circle cx="1.8" cy="10" r=".65" fill="currentColor"/></svg>
@@ -121,6 +125,77 @@
                   <button id="addBtn" class="s-btn s-btn-primary" disabled type="button">Add camera</button>
                 </div>
               </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Media health -->
+      <section class="s-sec" id="media-health">
+        <div class="s-sec-head s-sec-head-row">
+          <div>
+            <h2 class="s-sec-title">Media health</h2>
+            <p class="s-sec-sub">Live ingest, stamping, recording, and recent recovery history.</p>
+          </div>
+          <button id="healthRefreshBtn" class="s-btn-outline" type="button">Refresh</button>
+        </div>
+
+        <div class="s-card s-health-card">
+          <div class="s-health-summary">
+            <div class="s-health-summary-title">Current state</div>
+            <div id="healthUpdated" class="s-health-updated">Collecting</div>
+          </div>
+          <div class="s-health-table-wrap">
+            <table class="s-health-table">
+              <thead>
+                <tr>
+                  <th>Camera</th>
+                  <th>State</th>
+                  <th>Encoder</th>
+                  <th>Raw</th>
+                  <th>Stamped</th>
+                  <th>HLS</th>
+                  <th>Recorder</th>
+                </tr>
+              </thead>
+              <tbody id="healthTable">
+                <tr><td colspan="7" class="s-health-empty">Collecting media health data.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="s-health-history">
+            <div class="s-health-toolbar">
+              <div>
+                <div class="s-health-summary-title">History</div>
+                <div class="s-health-chart-sub">Raw and stamped stream bitrate</div>
+              </div>
+              <div class="s-health-controls">
+                <label class="s-health-source-label" for="healthSource">Camera</label>
+                <select id="healthSource" class="s-health-source"></select>
+                <div class="s-segmented" role="group" aria-label="History range">
+                  <button type="button" data-health-hours="1">1h</button>
+                  <button type="button" data-health-hours="6">6h</button>
+                  <button type="button" data-health-hours="24" class="active">24h</button>
+                  <button type="button" data-health-hours="168">7d</button>
+                </div>
+              </div>
+            </div>
+            <div class="s-health-chart-wrap">
+              <canvas id="healthChart" class="s-health-chart" height="220"></canvas>
+              <div id="healthChartEmpty" class="s-health-chart-empty">Waiting for two samples.</div>
+            </div>
+            <div class="s-health-legend">
+              <span><i class="raw"></i>Raw</span>
+              <span><i class="stamped"></i>Stamped</span>
+              <span><i class="incident"></i>Incident</span>
+            </div>
+          </div>
+
+          <div class="s-health-events">
+            <div class="s-health-summary-title">Recent incidents</div>
+            <div id="healthEvents" class="s-health-event-list">
+              <div class="s-health-empty">No incidents recorded.</div>
             </div>
           </div>
         </div>
@@ -257,6 +332,6 @@
     </main>
   </div>
 
-  <script src="/settings.js?v=web-notify-2"></script>
+  <script src="/settings.js?v=media-health-1"></script>
 </body>
 </html>

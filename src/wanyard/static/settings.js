@@ -1,6 +1,14 @@
 const fmt = {
   bytes: b => b > 1e9 ? (b/1e9).toFixed(1)+'GB' : b > 1e6 ? (b/1e6).toFixed(0)+'MB' : (b/1e3).toFixed(0)+'KB',
   ts:    t => t ? new Date(t*1000).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}) : '--',
+  bitrate: b => b == null ? '--' : b >= 1e6 ? `${(b/1e6).toFixed(2)} Mbps` : `${Math.round(b/1e3)} Kbps`,
+  age: s => {
+    if (s == null || !Number.isFinite(Number(s))) return '--';
+    if (s < 1) return '<1s';
+    if (s < 60) return `${Math.round(s)}s`;
+    if (s < 3600) return `${Math.round(s/60)}m`;
+    return `${(s/3600).toFixed(1)}h`;
+  },
 };
 
 // ── Status (system KPIs + pipeline chip) ─────────────
@@ -9,6 +17,9 @@ let _sources = [];
 let _notificationRules = [];
 let _zonesBySource = {};
 let _editingRuleId = null;
+let _mediaHealth = null;
+let _healthHours = 24;
+let _healthSource = '';
 
 async function loadStatus() {
   const d = await fetch('/api/settings/status',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}));
@@ -85,6 +96,244 @@ async function loadStatus() {
     dot.className = 's-cam-dot' + (alive === true ? ' live' : alive === false ? ' dead' : '');
   });
 }
+
+// ── Media health ─────────────────────────────────────
+function healthSourceName(sourceId) {
+  const source = (_mediaHealth?.sources || _sources).find(s => s.id === sourceId);
+  return source?.name || sourceId || 'System';
+}
+
+function healthState(row) {
+  if (!row?.ts) return { cls:'warn', label:'Collecting' };
+  const stamper = row.stamper || {};
+  const sampleAge = Date.now()/1000 - Number(row.ts || 0);
+  const stamperAge = Date.now()/1000 - Number(stamper.updated_at || 0);
+  const dead = sampleAge > 60
+    || !row.raw_ready || !row.stamped_ready || !row.recorder_thread_alive;
+  if (dead) return { cls:'dead', label:'Offline' };
+  const warn = row.hls_age_seconds == null
+    || Number(row.hls_age_seconds) > 5
+    || Number(row.consecutive_failures) > 0
+    || stamper.status !== 'live'
+    || stamperAge > 45;
+  return warn ? { cls:'warn', label:'Degraded' } : { cls:'ok', label:'Healthy' };
+}
+
+function renderHealthTable() {
+  const body = document.getElementById('healthTable');
+  if (!body) return;
+  const rows = Object.values(_mediaHealth?.current || {});
+  body.innerHTML = '';
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="7" class="s-health-empty">Collecting media health data.</td></tr>';
+    return;
+  }
+  rows.sort((a,b) => healthSourceName(a.source_id).localeCompare(healthSourceName(b.source_id)));
+  rows.forEach(row => {
+    const state = healthState(row);
+    const stamper = row.stamper || {};
+    const maxrate = Number(row.maxrate_bps || 0);
+    const stamped = Number(row.stamped_bitrate_bps || 0);
+    const cap = maxrate && stamped ? Math.round(stamped/maxrate*100) : null;
+    const resolution = stamper.width && stamper.height ? `${stamper.width}×${stamper.height}` : '--';
+    const fps = stamper.fps ? `${Number(stamper.fps).toFixed(0)} fps` : '';
+    const recorderIssue = Number(row.consecutive_failures) > 0
+      ? `${row.consecutive_failures} failures`
+      : row.recorder_thread_alive ? 'running' : 'stopped';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><span class="s-health-camera"></span></td>
+      <td><span class="s-health-state ${state.cls}">${state.label}</span></td>
+      <td><span class="s-health-metric">${stamper.active_encoder || '--'}</span><span class="s-health-detail">${resolution}${fps ? ' · '+fps : ''}</span></td>
+      <td><span class="s-health-metric">${fmt.bitrate(row.raw_bitrate_bps)}</span><span class="s-health-detail">${row.raw_ready ? 'relay ready' : 'relay offline'}</span></td>
+      <td><span class="s-health-metric">${fmt.bitrate(row.stamped_bitrate_bps)}</span><span class="s-health-detail">${cap == null ? (row.stamped_ready ? 'relay ready' : 'relay offline') : `${cap}% of ${fmt.bitrate(maxrate)}`}</span></td>
+      <td><span class="s-health-metric">${fmt.age(row.hls_age_seconds)}</span><span class="s-health-detail">${row.hls_age_seconds != null && Number(row.hls_age_seconds) <= 5 ? 'fresh' : 'stale'}</span></td>
+      <td><span class="s-health-metric">${row.recorder_codec || '--'}</span><span class="s-health-detail">${recorderIssue}</span></td>`;
+    ['Camera','State','Encoder','Raw','Stamped','HLS','Recorder'].forEach((label,index) => {
+      tr.children[index].dataset.label = label;
+    });
+    tr.querySelector('.s-health-camera').textContent = healthSourceName(row.source_id);
+    body.appendChild(tr);
+  });
+}
+
+function populateHealthSources() {
+  const select = document.getElementById('healthSource');
+  if (!select) return;
+  const sources = _mediaHealth?.sources || [];
+  const previous = _healthSource || select.value;
+  select.innerHTML = '';
+  sources.forEach(source => {
+    const option = document.createElement('option');
+    option.value = source.id;
+    option.textContent = source.name || source.id;
+    select.appendChild(option);
+  });
+  _healthSource = sources.some(s => s.id === previous) ? previous : (sources[0]?.id || '');
+  select.value = _healthSource;
+}
+
+function renderHealthEvents() {
+  const list = document.getElementById('healthEvents');
+  if (!list) return;
+  const events = (_mediaHealth?.events || [])
+    .filter(event => !_healthSource || event.source_id === _healthSource)
+    .slice(0, 20);
+  list.innerHTML = '';
+  if (!events.length) {
+    const empty = document.createElement('div');
+    empty.className = 's-health-empty';
+    empty.textContent = 'No incidents recorded in this range.';
+    list.appendChild(empty);
+    return;
+  }
+  events.forEach(event => {
+    const row = document.createElement('div');
+    row.className = `s-health-event ${event.severity || 'info'}`;
+    const dot = document.createElement('span');
+    dot.className = 's-health-event-dot';
+    const main = document.createElement('div');
+    main.className = 's-health-event-main';
+    const source = document.createElement('span');
+    source.className = 's-health-event-source';
+    source.textContent = healthSourceName(event.source_id);
+    const message = document.createElement('span');
+    message.textContent = event.message;
+    main.append(source, message);
+    const when = document.createElement('time');
+    when.className = 's-health-event-time';
+    when.dateTime = new Date(event.ts*1000).toISOString();
+    when.textContent = new Date(event.ts*1000).toLocaleString(undefined, {
+      month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'
+    });
+    row.append(dot, main, when);
+    list.appendChild(row);
+  });
+}
+
+function drawHealthChart() {
+  const canvas = document.getElementById('healthChart');
+  const empty = document.getElementById('healthChartEmpty');
+  if (!canvas || !empty) return;
+  const points = (_mediaHealth?.series || []).filter(p => p.source_id === _healthSource);
+  const usable = points.filter(p => p.raw_bitrate_bps != null || p.stamped_bitrate_bps != null);
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  canvas.width = Math.max(1, Math.round(rect.width*dpr));
+  canvas.height = Math.max(1, Math.round(rect.height*dpr));
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,rect.width,rect.height);
+  if (usable.length < 2) {
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+
+  const styles = getComputedStyle(document.documentElement);
+  const colors = {
+    grid: styles.getPropertyValue('--line-soft').trim() || '#282a31',
+    text: styles.getPropertyValue('--txt-3').trim() || '#7c808b',
+    raw: '#5da9e9',
+    stamped: styles.getPropertyValue('--green').trim() || '#4ec98a',
+    incident: styles.getPropertyValue('--red').trim() || '#e25c4c',
+  };
+  const pad = {left:52,right:12,top:12,bottom:28};
+  const width = rect.width-pad.left-pad.right;
+  const height = rect.height-pad.top-pad.bottom;
+  const now = Number(_mediaHealth.generated_at || Date.now()/1000);
+  const start = now-_healthHours*3600;
+  const values = usable.flatMap(p => [p.raw_bitrate_bps,p.stamped_bitrate_bps]).filter(Number.isFinite);
+  const maxValue = Math.max(1e6, Math.max(...values)*1.15);
+  const x = ts => pad.left + Math.max(0,Math.min(1,(ts-start)/(now-start)))*width;
+  const y = value => pad.top + height - Math.max(0,Math.min(1,value/maxValue))*height;
+
+  ctx.font = '10px "IBM Plex Mono", monospace';
+  ctx.fillStyle = colors.text;
+  ctx.strokeStyle = colors.grid;
+  ctx.lineWidth = 1;
+  for (let i=0;i<=4;i++) {
+    const yy = pad.top + height*i/4;
+    ctx.beginPath(); ctx.moveTo(pad.left,yy); ctx.lineTo(rect.width-pad.right,yy); ctx.stroke();
+    const value = maxValue*(1-i/4);
+    ctx.fillText(value >= 1e6 ? `${(value/1e6).toFixed(1)}M` : `${Math.round(value/1e3)}K`, 4, yy+3);
+  }
+  for (let i=0;i<=4;i++) {
+    const xx = pad.left + width*i/4;
+    const ts = start+(now-start)*i/4;
+    const label = _healthHours >= 168
+      ? new Date(ts*1000).toLocaleDateString(undefined,{weekday:'short'})
+      : new Date(ts*1000).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
+    const measured = ctx.measureText(label).width;
+    ctx.fillText(label, Math.max(pad.left,Math.min(rect.width-pad.right-measured,xx-measured/2)), rect.height-8);
+  }
+
+  const events = (_mediaHealth.events || []).filter(e => e.source_id === _healthSource);
+  ctx.strokeStyle = colors.incident;
+  ctx.globalAlpha = 0.45;
+  events.forEach(event => {
+    const xx = x(event.ts);
+    ctx.beginPath(); ctx.moveTo(xx,pad.top); ctx.lineTo(xx,pad.top+height); ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+
+  function line(field,color) {
+    let drawing = false;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    usable.forEach(point => {
+      const value = Number(point[field]);
+      if (!Number.isFinite(value)) { drawing = false; return; }
+      const px=x(Number(point.ts)), py=y(value);
+      if (!drawing) { ctx.moveTo(px,py); drawing=true; } else ctx.lineTo(px,py);
+    });
+    ctx.stroke();
+  }
+  line('raw_bitrate_bps',colors.raw);
+  line('stamped_bitrate_bps',colors.stamped);
+}
+
+async function loadMediaHealth() {
+  const updated = document.getElementById('healthUpdated');
+  const button = document.getElementById('healthRefreshBtn');
+  if (button) button.disabled = true;
+  const query = new URLSearchParams({hours:String(_healthHours)});
+  const response = await fetch(`/api/settings/media-health?${query}`, {cache:'no-store'}).catch(()=>null);
+  if (!response?.ok) {
+    if (updated) updated.textContent = 'Unavailable';
+    if (button) button.disabled = false;
+    return;
+  }
+  _mediaHealth = await response.json();
+  if (updated) updated.textContent = `Updated ${fmt.age(Date.now()/1000-_mediaHealth.generated_at)} ago`;
+  populateHealthSources();
+  renderHealthTable();
+  renderHealthEvents();
+  drawHealthChart();
+  if (button) button.disabled = false;
+}
+
+document.getElementById('healthRefreshBtn')?.addEventListener('click', loadMediaHealth);
+document.getElementById('healthSource')?.addEventListener('change', event => {
+  _healthSource = event.target.value;
+  renderHealthEvents();
+  drawHealthChart();
+});
+document.querySelectorAll('[data-health-hours]').forEach(button => {
+  button.addEventListener('click', () => {
+    _healthHours = Number(button.dataset.healthHours);
+    document.querySelectorAll('[data-health-hours]').forEach(item => {
+      item.classList.toggle('active', item === button);
+    });
+    loadMediaHealth();
+  });
+});
+let _healthResizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(_healthResizeTimer);
+  _healthResizeTimer = setTimeout(drawHealthChart, 100);
+});
 
 // ── Cameras ───────────────────────────────────────────
 async function loadCameras() {
@@ -505,7 +754,7 @@ document.getElementById('cleanupBtn').addEventListener('click', async () => {
 
 // ── Sidebar scroll-spy ────────────────────────────────
 const sideLinks = document.querySelectorAll('.s-side-link');
-const sections  = ['system','cameras','notifications','storage'].map(id => document.getElementById(id)).filter(Boolean);
+const sections  = ['system','cameras','media-health','notifications','storage'].map(id => document.getElementById(id)).filter(Boolean);
 
 const observer = new IntersectionObserver(entries => {
   entries.forEach(entry => {
@@ -523,4 +772,6 @@ sections.forEach(s => observer.observe(s));
 // ── Init ──────────────────────────────────────────────
 loadStatus();
 loadCameras().then(loadNotificationRules);
+loadMediaHealth();
 loadCleanupConfig();
+setInterval(loadMediaHealth, 30000);

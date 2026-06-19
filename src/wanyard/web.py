@@ -26,6 +26,7 @@ from starlette.staticfiles import StaticFiles
 
 from . import native_hls
 from .config import AppConfig
+from .media_health import MediaHealthCollector, MediaHealthStore, default_db_path
 
 LOG = logging.getLogger(__name__)
 
@@ -373,6 +374,14 @@ def make_app(
 ) -> Starlette:
     import wanyard
     static_dir = Path(wanyard.__file__).parent / "static"
+    health_store = None
+    health_collector = None
+    try:
+        base_dir = Path(video_dir).parent if video_dir else Path(".")
+        health_store = MediaHealthStore(default_db_path(base_dir))
+        health_collector = MediaHealthCollector(health_store)
+    except Exception:
+        LOG.warning("media health database unavailable", exc_info=True)
 
     async def _notification_materialize_loop(interval: float):
         # Generate notifications in the backend, independent of any browser.
@@ -386,11 +395,33 @@ def make_app(
                 LOG.exception("notification materialize loop error")
             await asyncio.sleep(interval)
 
+    async def _media_health_loop(interval: float):
+        while True:
+            try:
+                sources = _sources_list(config, source_db)
+                source_ids = [source["id"] for source in sources]
+                source_statuses = await asyncio.to_thread(_source_statuses)
+                recorder_statuses = (
+                    capture_worker.recorder_status() if capture_worker else {}
+                )
+                await asyncio.to_thread(
+                    health_collector.sample,
+                    source_ids,
+                    source_statuses,
+                    recorder_statuses,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("media health sample failed")
+            await asyncio.sleep(interval)
+
     @asynccontextmanager
     async def lifespan(app: Starlette):
         if capture_worker:
             capture_worker.start()
         notify_task = None
+        health_task = None
         if video_db is not None:
             try:
                 interval = float(os.environ.get("NOTIFICATION_POLL_INTERVAL", "5"))
@@ -398,13 +429,25 @@ def make_app(
                 interval = 5.0
             interval = max(1.0, interval)
             notify_task = asyncio.create_task(_notification_materialize_loop(interval))
+        if health_collector is not None:
+            try:
+                health_interval = float(
+                    os.environ.get("WANYARD_MEDIA_HEALTH_INTERVAL", "15")
+                )
+            except ValueError:
+                health_interval = 15.0
+            health_task = asyncio.create_task(
+                _media_health_loop(max(5.0, health_interval))
+            )
         try:
             yield
         finally:
-            if notify_task is not None:
-                notify_task.cancel()
+            for task in (notify_task, health_task):
+                if task is None:
+                    continue
+                task.cancel()
                 try:
-                    await notify_task
+                    await task
                 except (asyncio.CancelledError, Exception):
                     pass
             if capture_worker:
@@ -1474,6 +1517,30 @@ def make_app(
             "latest_event_ts": latest_event_ts,
         })
 
+    async def api_settings_media_health(request: Request) -> JSONResponse:
+        if health_store is None:
+            return JSONResponse(
+                {"error": "media health database unavailable"}, status_code=503
+            )
+        try:
+            hours = float(request.query_params.get("hours", "24"))
+        except ValueError:
+            return JSONResponse({"error": "hours must be a number"}, status_code=400)
+        hours = min(24 * 14, max(1.0, hours))
+        source_id = request.query_params.get("source") or None
+        source_ids = {source["id"] for source in _sources_list(config, source_db)}
+        if source_id and source_id not in source_ids:
+            return JSONResponse({"error": "source not found"}, status_code=404)
+        data = await asyncio.to_thread(
+            health_store.snapshot,
+            since=time.time() - hours * 3600,
+            source_id=source_id,
+        )
+        data["generated_at"] = time.time()
+        data["hours"] = hours
+        data["sources"] = _sources_list(config, source_db)
+        return JSONResponse(data)
+
     async def api_settings_camera_test(request: Request) -> Response:
         """Grab a single frame from an RTSP URL and return it as JPEG."""
         try:
@@ -1717,6 +1784,7 @@ def make_app(
         Route("/api/sources",                    api_sources,             methods=["GET", "POST"]),
         Route("/api/sources/{source_id}",        api_delete_source,       methods=["DELETE"]),
         Route("/api/settings/status",            api_settings_status),
+        Route("/api/settings/media-health",      api_settings_media_health),
         Route("/api/settings/camera/test",       api_settings_camera_test, methods=["POST"]),
         Route("/api/settings/cleanup-config",    api_settings_cleanup_config, methods=["GET", "POST"]),
         Route("/api/settings/cleanup",           api_settings_cleanup,     methods=["POST"]),

@@ -23,6 +23,7 @@ import numpy as np
 
 from . import bitc
 from .live_detector import _list_relay_paths
+from .media_health import MediaHealthStore, default_db_path
 
 LOG = logging.getLogger("wanyard.stamper")
 
@@ -97,7 +98,8 @@ class _StampAnchor:
 
 class _StamperWorker:
     def __init__(self, relay_host: str, source_id: str,
-                 stop_event: threading.Event, out_host: str | None = None) -> None:
+                 stop_event: threading.Event, out_host: str | None = None,
+                 health_store: MediaHealthStore | None = None) -> None:
         self.relay_host = relay_host
         self.source_id = source_id
         self.stop_event = stop_event
@@ -135,6 +137,12 @@ class _StamperWorker:
         # looping forever on a codec that can't open.
         self._codec_override: str | None = None
         self._active_codec: str | None = None
+        self._health_store = health_store
+        self._reconnect_count = 0
+        self._fallback_count = 0
+        self._reported_encoder: str | None = None
+        self._last_reconnect_event_ts = 0.0
+        self._reported_recovery_count = 0
         self.thread = threading.Thread(
             target=self.run, daemon=True, name=f"stamper-{source_id}")
 
@@ -151,12 +159,14 @@ class _StamperWorker:
 
     def stop(self) -> None:
         self.local_stop.set()
+        self._health_state("stopped")
 
     def stopped(self) -> bool:
         return self.stop_event.is_set() or self.local_stop.is_set()
 
     def run(self) -> None:
         backoff = 1.0
+        self._health_state("starting")
         while not self.stopped():
             try:
                 self._stream()
@@ -166,10 +176,24 @@ class _StamperWorker:
                     self._wait(1.0)       # retry promptly with the fallback encoder
                     backoff = 1.0
                     continue
+                self._reconnect_count += 1
+                self._health_state("reconnecting", last_error=str(exc))
+                now = time.time()
+                if now - self._last_reconnect_event_ts >= 300:
+                    self._health_event(
+                        "warning", "reconnect",
+                        f"stream reconnect in {backoff:.1f}s: {exc}",
+                        {
+                            "backoff_seconds": backoff,
+                            "reconnect_count": self._reconnect_count,
+                        },
+                    )
+                    self._last_reconnect_event_ts = now
                 LOG.warning("stamper %s reconnect in %.1fs after %s",
                             self.source_id, backoff, exc)
                 self._wait(backoff)
                 backoff = min(30.0, backoff * 2.0)
+        self._health_state("stopped")
         LOG.info("stamper %s stopped", self.source_id)
 
     def _demote_on_encoder_error(self, exc: Exception) -> bool:
@@ -182,9 +206,62 @@ class _StamperWorker:
         if nxt and "avcodec_open2" in str(exc):
             LOG.warning("stamper %s encoder %s failed to open — falling back to %s",
                         self.source_id, self._active_codec, nxt)
+            old = self._active_codec
             self._codec_override = nxt
+            self._fallback_count += 1
+            self._health_state("fallback", active_encoder=nxt, last_error=str(exc))
+            self._health_event(
+                "warning", "encoder_fallback",
+                f"encoder {old} failed to open; falling back to {nxt}",
+                {"from": old, "to": nxt, "error": str(exc)},
+            )
             return True
         return False
+
+    def _health_state(
+        self,
+        status: str,
+        *,
+        active_encoder: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        fps: float | None = None,
+        maxrate: str | None = None,
+        bufsize: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        if self._health_store is None:
+            return
+        try:
+            self._health_store.update_stamper_state(
+                self.source_id,
+                status=status,
+                active_encoder=active_encoder or self._active_codec,
+                width=width,
+                height=height,
+                fps=fps,
+                maxrate=maxrate,
+                bufsize=bufsize,
+                reconnect_count=self._reconnect_count,
+                fallback_count=self._fallback_count,
+                last_error=last_error,
+            )
+        except Exception:
+            LOG.warning("stamper %s could not update media health", self.source_id,
+                        exc_info=True)
+
+    def _health_event(
+        self, severity: str, kind: str, message: str, details: dict | None = None
+    ) -> None:
+        if self._health_store is None:
+            return
+        try:
+            self._health_store.event(
+                self.source_id, "stamper", severity, kind, message, details
+            )
+        except Exception:
+            LOG.warning("stamper %s could not record media health event",
+                        self.source_id, exc_info=True)
 
     def _wait(self, seconds: float) -> None:
         end = time.time() + seconds
@@ -247,6 +324,7 @@ class _StamperWorker:
         import av
 
         LOG.info("stamper %s %s -> %s", self.source_id, self.in_url, self.out_url)
+        self._health_state("connecting")
         inp = av.open(self.in_url, options={"rtsp_transport": "tcp"}, timeout=(5.0, 5.0))
         out = None
         try:
@@ -274,7 +352,33 @@ class _StamperWorker:
             # lower-latency live (more I-frames, slightly fatter).
             gop_seconds = float(self._src_env("GOP_SECONDS", "2"))
             gop = max(1, int(round(gop_seconds * float(vin.average_rate or 15))))
-            vout.options = self._video_options(codec, gop)
+            video_options = self._video_options(codec, gop)
+            vout.options = video_options
+            fps = float(vin.average_rate or 15)
+            self._health_state(
+                "connecting",
+                active_encoder=codec,
+                width=vin.codec_context.width,
+                height=vin.codec_context.height,
+                fps=fps,
+                maxrate=video_options.get("maxrate"),
+                bufsize=video_options.get("bufsize"),
+            )
+            if codec != self._reported_encoder:
+                self._health_event(
+                    "info",
+                    "encoder_selected",
+                    f"encoder selected: {codec}",
+                    {
+                        "encoder": codec,
+                        "width": vin.codec_context.width,
+                        "height": vin.codec_context.height,
+                        "fps": fps,
+                        "maxrate": video_options.get("maxrate"),
+                        "bufsize": video_options.get("bufsize"),
+                    },
+                )
+                self._reported_encoder = codec
             aout = None
             if ain is not None:
                 rate = getattr(ain.codec_context, "sample_rate", None) or 8000
@@ -300,6 +404,7 @@ class _StamperWorker:
             anchor = _StampAnchor(self.source_id)
             rtp0: float | None = None
             last_pts = -1
+            last_health_update = 0.0
             for packet in inp.demux():
                 if self.stopped():
                     break
@@ -335,8 +440,28 @@ class _StamperWorker:
                         frame.pts = pts if pts > last_pts else last_pts + 1
                         last_pts = frame.pts
                         frame.time_base = out_tb
-                        for op in vout.encode(frame):
+                        encoded = vout.encode(frame)
+                        for op in encoded:
                             out.mux(op)
+                        if wall - last_health_update >= 15.0:
+                            self._health_state(
+                                "live",
+                                active_encoder=codec,
+                                width=vout.width,
+                                height=vout.height,
+                                fps=fps,
+                                maxrate=video_options.get("maxrate"),
+                                bufsize=video_options.get("bufsize"),
+                            )
+                            if self._reconnect_count > self._reported_recovery_count:
+                                self._health_event(
+                                    "info",
+                                    "stream_recovered",
+                                    f"stream recovered after {self._reconnect_count} reconnects",
+                                    {"reconnect_count": self._reconnect_count},
+                                )
+                                self._reported_recovery_count = self._reconnect_count
+                            last_health_update = wall
                 elif aout is not None and packet.stream is ain:
                     packet.stream = aout
                     try:
@@ -362,6 +487,13 @@ class _StamperSupervisor:
         self.stop_event = stop_event
         self.relay_host = os.environ.get("WANYARD_RELAY_HOST", "mediamtx").strip() or "mediamtx"
         self.workers: dict[str, _StamperWorker] = {}
+        self.health_store: MediaHealthStore | None = None
+        try:
+            # Telemetry is best-effort and runs on the frame thread. Bound any
+            # SQLite writer contention so monitoring cannot stall the stream.
+            self.health_store = MediaHealthStore(default_db_path(), timeout=0.05)
+        except Exception:
+            LOG.warning("stamper media health database unavailable", exc_info=True)
         self.thread = threading.Thread(
             target=self.run, daemon=True, name="stamper-supervisor")
 
@@ -386,7 +518,12 @@ class _StamperSupervisor:
         paths = {p for p in _list_relay_paths(self.relay_host)
                  if not p.endswith(_STAMPED_SUFFIX)}
         for source_id in sorted(paths - set(self.workers)):
-            worker = _StamperWorker(self.relay_host, source_id, self.stop_event)
+            worker = _StamperWorker(
+                self.relay_host,
+                source_id,
+                self.stop_event,
+                health_store=self.health_store,
+            )
             self.workers[source_id] = worker
             worker.start()
             LOG.info("stamper started path=%s", source_id)

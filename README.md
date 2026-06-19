@@ -14,6 +14,8 @@ docker compose up --build -d
 ```
 
 Open `http://localhost:8091/settings` to add cameras. YOLO model downloads automatically on first run.
+Docker installs the exact Python package set in `requirements.lock`; dependency
+updates should change that file deliberately and pass the full test suite.
 
 For GPU acceleration, copy the override file:
 
@@ -78,4 +80,4 @@ configuration or production footage.
 
 - `http://localhost:8091` — live wall (all cameras); click one for its viewer
 - `http://localhost:8091/?source=<id>&live=1` — single-camera timeline viewer + event feed
-- `http://localhost:8091/settings` — add/remove cameras, system status, cleanup config
+- `http://localhost:8091/settings` — cameras, media health history, notifications, and storage

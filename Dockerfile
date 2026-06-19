@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9
 
 WORKDIR /app
 
@@ -8,18 +8,18 @@ RUN apt-get update \
 
 ENV PYTHONUNBUFFERED=1
 
-# Heavy deps — cached unless requirements.txt changes
-COPY requirements.txt ./
+# Exact runtime dependency set. requirements.txt points at the lock so local
+# installs and Docker builds resolve the same versions.
+COPY requirements.txt requirements.lock ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App deps — cached unless pyproject.toml changes
+# Package metadata
 COPY pyproject.toml README.md ./
-RUN python -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]))' > /tmp/deps.txt \
-  && pip install --no-cache-dir -r /tmp/deps.txt
 
 # App code
 COPY src ./src
-RUN pip install --no-cache-dir --no-build-isolation --no-deps .
+RUN pip install --no-cache-dir --no-build-isolation --no-deps . \
+  && pip check
 
 COPY config.yaml ./config.yaml
 COPY healthcheck.sh ./healthcheck.sh
