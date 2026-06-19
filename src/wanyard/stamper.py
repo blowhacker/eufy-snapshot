@@ -36,6 +36,10 @@ _STAMPED_SUFFIX = "-stamped"
 _nvenc_probe: dict[str, bool] = {}
 
 
+class _InputMetadataNotReady(RuntimeError):
+    """The RTSP stream opened before codec dimensions were available."""
+
+
 def _nvenc_available(codec: str = "h264_nvenc") -> bool:
     """True if ``codec`` (h264_nvenc/hevc_nvenc) can actually open + encode here.
 
@@ -143,6 +147,8 @@ class _StamperWorker:
         self._reported_encoder: str | None = None
         self._last_reconnect_event_ts = 0.0
         self._reported_recovery_count = 0
+        self._invalid_metadata_count = 0
+        self._last_invalid_metadata_event_ts = 0.0
         self.thread = threading.Thread(
             target=self.run, daemon=True, name=f"stamper-{source_id}")
 
@@ -320,6 +326,41 @@ class _StamperWorker:
             opts["bufsize"] = bufsize or maxrate
         return opts
 
+    def _video_metadata(self, vin) -> tuple[int, int, float]:
+        width = int(getattr(vin.codec_context, "width", 0) or 0)
+        height = int(getattr(vin.codec_context, "height", 0) or 0)
+        if width <= 0 or height <= 0:
+            self._invalid_metadata_count += 1
+            message = f"input metadata not ready: {width}x{height}"
+            self._health_state(
+                "waiting_for_input_metadata",
+                width=width,
+                height=height,
+                last_error=message,
+            )
+            now = time.time()
+            if now - self._last_invalid_metadata_event_ts >= 300:
+                self._health_event(
+                    "warning",
+                    "input_metadata_invalid",
+                    message,
+                    {
+                        "width": width,
+                        "height": height,
+                        "retry_count": self._invalid_metadata_count,
+                    },
+                )
+                self._last_invalid_metadata_event_ts = now
+            raise _InputMetadataNotReady(message)
+
+        try:
+            fps = float(vin.average_rate or 15)
+        except (TypeError, ValueError, ZeroDivisionError):
+            fps = 15.0
+        if not np.isfinite(fps) or fps <= 0:
+            fps = 15.0
+        return width, height, fps
+
     def _stream(self) -> None:
         import av
 
@@ -330,14 +371,15 @@ class _StamperWorker:
         try:
             vin = next(s for s in inp.streams if s.type == "video")
             ain = next((s for s in inp.streams if s.type == "audio"), None)
+            width, height, fps = self._video_metadata(vin)
 
             out = av.open(self.out_url, "w", format="rtsp",
                           options={"rtsp_transport": "tcp"})
             codec = self._video_codec()
             self._active_codec = codec
             vout = out.add_stream(codec, rate=vin.average_rate or 15)
-            vout.width = vin.codec_context.width
-            vout.height = vin.codec_context.height
+            vout.width = width
+            vout.height = height
             vout.pix_fmt = "yuv420p"
             # Fixed 90kHz output timebase; assign pts from the input's RTP
             # (session-relative, monotonic, real-rate) so playback timing mirrors
@@ -351,15 +393,14 @@ class _StamperWorker:
             # Default 2s (seekable records); set WANYARD_STAMP_GOP_SECONDS=1 for
             # lower-latency live (more I-frames, slightly fatter).
             gop_seconds = float(self._src_env("GOP_SECONDS", "2"))
-            gop = max(1, int(round(gop_seconds * float(vin.average_rate or 15))))
+            gop = max(1, int(round(gop_seconds * fps)))
             video_options = self._video_options(codec, gop)
             vout.options = video_options
-            fps = float(vin.average_rate or 15)
             self._health_state(
                 "connecting",
                 active_encoder=codec,
-                width=vin.codec_context.width,
-                height=vin.codec_context.height,
+                width=width,
+                height=height,
                 fps=fps,
                 maxrate=video_options.get("maxrate"),
                 bufsize=video_options.get("bufsize"),
@@ -371,8 +412,8 @@ class _StamperWorker:
                     f"encoder selected: {codec}",
                     {
                         "encoder": codec,
-                        "width": vin.codec_context.width,
-                        "height": vin.codec_context.height,
+                        "width": width,
+                        "height": height,
                         "fps": fps,
                         "maxrate": video_options.get("maxrate"),
                         "bufsize": video_options.get("bufsize"),
