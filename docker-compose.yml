@@ -203,9 +203,10 @@ services:
       - "${WANYARD_GO2RTC_WEBRTC_PORT:-8555}:${WANYARD_GO2RTC_WEBRTC_PORT:-8555}/udp"
       - "${WANYARD_GO2RTC_WEBRTC_PORT:-8555}:${WANYARD_GO2RTC_WEBRTC_PORT:-8555}/tcp"
     # The image auto-loads /config/go2rtc.yaml (no command needed). go2rtc-conf
-    # wrote it into this shared volume.
+    # writes the boot config into this shared volume; keep it writable so the
+    # internal API can persist cameras added at runtime.
     volumes:
-      - go2rtc-conf:/config:ro
+      - go2rtc-conf:/config
 
 volumes:
   yolo-run:

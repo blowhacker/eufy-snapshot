@@ -7,7 +7,7 @@ import re
 import socket
 import urllib.error
 import urllib.request
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 LOG = logging.getLogger("wanyard.native_hls")
 
@@ -40,6 +40,7 @@ def rewrite_host_candidates(sdp: str, address: str) -> str:
 MANIFEST_NAME = "index.m3u8"
 DEFAULT_PORT = 8888
 CONTROL_API_PORT = 9997
+GO2RTC_API_PORT = 1984
 
 
 def hls_port() -> int:
@@ -187,18 +188,20 @@ def fetch_asset(
         )
 
 
-# ── mediamtx runtime path registration ───────────────────────────────────
-# gen-mediamtx only writes paths at boot, so a camera added at runtime is
-# invisible to the relay (the stamper discovers cameras from mediamtx's path
-# list, /v3/paths/list). Register the same two paths gen-mediamtx would have
-# written, live, via the mediamtx control API — then the stamper picks the
-# camera up within its 30s refresh and <id><suffix> appears. A restart still
-# regenerates from the DB, so the two stay consistent. Best-effort: failures
-# (no relay, mediamtx down) never block the source add.
+# ── runtime camera registration ────────────────────────────────────────────
+# go2rtc and mediamtx generate their static configuration at container boot.
+# Keep a camera added through the UI usable immediately by registering the same
+# stream and relay paths through their control APIs. A restart regenerates both
+# from the source DB, so runtime and persisted configuration converge.
 
 def _control_api_base() -> str | None:
     host = os.environ.get("WANYARD_RELAY_HOST", "").strip()
     return f"http://{host}:{CONTROL_API_PORT}" if host else None
+
+
+def _go2rtc_api_base() -> str:
+    host = os.environ.get("WANYARD_GO2RTC_HOST", "").strip() or "go2rtc"
+    return f"http://{host}:{GO2RTC_API_PORT}"
 
 
 def _relay_suffix() -> str:
@@ -230,10 +233,35 @@ def _path_api_call(method: str, name: str, body: dict | None = None) -> bool:
         return False
 
 
-def register_source_paths(source_id: str, rtsp_url: str, transport: str = "tcp") -> None:
-    """Add a camera's ingest + stamped relay paths to mediamtx (live)."""
+def _go2rtc_api_call(method: str, path: str, params: dict[str, str]) -> bool:
+    url = f"{_go2rtc_api_base()}{path}?{urlencode(params)}"
+    req = urllib.request.Request(url, data=b"" if method == "PUT" else None, method=method)
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except urllib.error.HTTPError as exc:
+        LOG.info("go2rtc %s %s -> HTTP %s", method, params.get("name") or params.get("src"), exc.code)
+        return False
+    except Exception as exc:
+        LOG.info(
+            "go2rtc %s %s failed: %s",
+            method,
+            params.get("name") or params.get("src"),
+            exc,
+        )
+        return False
+
+
+def register_source_runtime(
+    source_id: str, rtsp_url: str, transport: str = "tcp"
+) -> None:
+    """Register a camera with go2rtc and mediamtx without restarting."""
+    _go2rtc_api_call("PUT", "/api/streams", {"name": source_id, "src": rtsp_url})
+    _go2rtc_api_call("PUT", "/api/preload", {"src": source_id, "video": "all"})
+
+    go2rtc_host = os.environ.get("WANYARD_GO2RTC_HOST", "").strip() or "go2rtc"
     _path_api_call("POST", source_id, {
-        "source": rtsp_url,
+        "source": f"rtsp://{go2rtc_host}:8554/{source_id}",
         "sourceOnDemand": True,
         "sourceProtocol": transport if transport in ("tcp", "udp") else "tcp",
     })
@@ -242,9 +270,11 @@ def register_source_paths(source_id: str, rtsp_url: str, transport: str = "tcp")
         _path_api_call("POST", f"{source_id}{suffix}", {})
 
 
-def unregister_source_paths(source_id: str) -> None:
-    """Remove a camera's relay paths from mediamtx (on source delete)."""
+def unregister_source_runtime(source_id: str) -> None:
+    """Remove a camera from go2rtc and mediamtx."""
     _path_api_call("DELETE", source_id)
     suffix = _relay_suffix()
     if suffix:
         _path_api_call("DELETE", f"{source_id}{suffix}")
+    _go2rtc_api_call("DELETE", "/api/preload", {"src": source_id})
+    _go2rtc_api_call("DELETE", "/api/streams", {"src": source_id})

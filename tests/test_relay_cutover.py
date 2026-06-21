@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +140,63 @@ class RelayCutoverTests(unittest.TestCase):
             self.assertIn('  listen: ":8557"', text)
             self.assertIn('    - "stun:8557"', text)
             self.assertIn("  tapo-front: rtsp://camera/stream1", text)
+
+    def test_runtime_registration_adds_go2rtc_before_mediamtx(self) -> None:
+        requests = []
+
+        def open_request(request, timeout):
+            requests.append(request)
+            return mock.MagicMock()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WANYARD_GO2RTC_HOST": "go2rtc",
+                "WANYARD_RELAY_HOST": "mediamtx",
+                "WANYARD_RELAY_PATH_SUFFIX": "-stamped",
+            },
+            clear=True,
+        ), mock.patch("wanyard.native_hls.urllib.request.urlopen", side_effect=open_request):
+            native_hls.register_source_runtime(
+                "desk", "rtsp://camera.example/stream", "tcp"
+            )
+
+        self.assertEqual([request.method for request in requests], ["PUT", "PUT", "POST", "POST"])
+        stream_query = parse_qs(urlsplit(requests[0].full_url).query)
+        self.assertEqual(stream_query["name"], ["desk"])
+        self.assertEqual(stream_query["src"], ["rtsp://camera.example/stream"])
+        preload_query = parse_qs(urlsplit(requests[1].full_url).query)
+        self.assertEqual(preload_query, {"src": ["desk"], "video": ["all"]})
+        self.assertIn("/v3/config/paths/add/desk", requests[2].full_url)
+        self.assertIn(b"rtsp://go2rtc:8554/desk", requests[2].data)
+        self.assertIn("/v3/config/paths/add/desk-stamped", requests[3].full_url)
+
+    def test_runtime_unregister_removes_relay_and_go2rtc(self) -> None:
+        requests = []
+
+        def open_request(request, timeout):
+            requests.append(request)
+            return mock.MagicMock()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WANYARD_GO2RTC_HOST": "go2rtc",
+                "WANYARD_RELAY_HOST": "mediamtx",
+                "WANYARD_RELAY_PATH_SUFFIX": "-stamped",
+            },
+            clear=True,
+        ), mock.patch("wanyard.native_hls.urllib.request.urlopen", side_effect=open_request):
+            native_hls.unregister_source_runtime("desk")
+
+        self.assertEqual(
+            [request.method for request in requests],
+            ["DELETE", "DELETE", "DELETE", "DELETE"],
+        )
+        self.assertIn("/v3/config/paths/delete/desk", requests[0].full_url)
+        self.assertIn("/v3/config/paths/delete/desk-stamped", requests[1].full_url)
+        self.assertEqual(parse_qs(urlsplit(requests[2].full_url).query), {"src": ["desk"]})
+        self.assertEqual(parse_qs(urlsplit(requests[3].full_url).query), {"src": ["desk"]})
 
 
 if __name__ == "__main__":

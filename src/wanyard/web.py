@@ -494,10 +494,10 @@ def make_app(
             output_subdir=source_id,
         )
         source_db.insert(row)
-        # Register the relay paths live so the stamper picks the camera up
-        # without a restart (gen-mediamtx only runs at boot).
+        # Register go2rtc ingest/WebRTC and relay paths live. Both static configs
+        # are generated at boot, but adding a camera must not require a restart.
         await asyncio.to_thread(
-            native_hls.register_source_paths, source_id, url, transport)
+            native_hls.register_source_runtime, source_id, url, transport)
         updated = source_db.to_source_configs()
         new = next(s for s in updated if s.id == source_id)
         return JSONResponse({
@@ -515,7 +515,7 @@ def make_app(
             return JSONResponse({"error": "db_path not configured"}, status_code=501)
         if not source_db.delete(source_id):
             return JSONResponse({"error": "source not found"}, status_code=404)
-        await asyncio.to_thread(native_hls.unregister_source_paths, source_id)
+        await asyncio.to_thread(native_hls.unregister_source_runtime, source_id)
         return JSONResponse({"ok": True})
 
     async def api_thumb(request: Request) -> Response:
