@@ -3088,13 +3088,23 @@ class VideoWorker:
                     elapsed = time.time() - ts
                     stopped_ts = time.time()
                     segment_ok = self._stop_segment(stopped_ts)
+                    clean_epoch_end = returncode == 0 and segment_ok
                     if returncode is not None:
                         self._invalidate_stamped_codec()
-                        if segment_ok:
+                        if clean_epoch_end:
+                            LOG.info(
+                                "recording epoch ended cleanly for %s; "
+                                "starting the next available epoch",
+                                self.source.id,
+                            )
+                            self._record_segment_completed(stopped_ts)
+                        elif segment_ok:
                             self._record_segment_completed(
                                 stopped_ts, reset_failures=False,
                             )
-                        if attempted_hvc1 and self._is_hvc1_tag_mismatch(early_stderr):
+                        if clean_epoch_end:
+                            pass
+                        elif attempted_hvc1 and self._is_hvc1_tag_mismatch(early_stderr):
                             self._record_failure("codec_tag_mismatch")
                             if not omit_hvc1:
                                 LOG.warning(
@@ -3113,10 +3123,13 @@ class VideoWorker:
                     # Reset backoff after a segment ran long enough to be healthy.
                     backoff = (
                         _RECORD_RETRY_INITIAL_SECONDS
-                        if elapsed > _RECORD_SUCCESS_SECONDS and segment_ok
+                        if clean_epoch_end
+                        or (elapsed > _RECORD_SUCCESS_SECONDS and segment_ok)
                         else min(backoff * 2, _RECORD_RETRY_MAX_SECONDS)
                     )
-                    if elapsed <= _RECORD_SUCCESS_SECONDS or not segment_ok:
+                    if not clean_epoch_end and (
+                        elapsed <= _RECORD_SUCCESS_SECONDS or not segment_ok
+                    ):
                         LOG.warning("short segment (%.0fs) for %s — backoff %.0fs",
                                     elapsed, self.source.id, backoff)
                         self._stop.wait(backoff)

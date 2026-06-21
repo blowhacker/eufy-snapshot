@@ -88,6 +88,35 @@ class VideoWorkerTests(unittest.TestCase):
 
             self.assertEqual(attempts, [False, True])
 
+    def test_clean_early_exit_completes_epoch_without_failure_or_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = self._worker(Path(tmpdir))
+            proc = mock.Mock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            proc.stderr = io.BytesIO(b"input stream ended")
+
+            def start(_ts: float, *, omit_hvc1: bool = False) -> None:
+                worker._segment_hvc1 = not omit_hvc1
+                worker._proc = proc
+
+            def completed(_ts: float, *, reset_failures: bool = True) -> None:
+                self.assertTrue(reset_failures)
+                worker._stop.set()
+
+            with mock.patch.object(worker, "_start_segment", side_effect=start), \
+                 mock.patch.object(worker, "_stop_segment", return_value=True), \
+                 mock.patch.object(
+                     worker, "_record_segment_completed", side_effect=completed
+                 ) as record_completed, \
+                 mock.patch.object(worker, "_record_failure") as record_failure, \
+                 mock.patch.object(worker._stop, "wait") as wait:
+                worker.run()
+
+            record_completed.assert_called_once()
+            record_failure.assert_not_called()
+            wait.assert_not_called()
+
     def test_start_segment_can_omit_hvc1_for_corrective_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = mock.Mock()
