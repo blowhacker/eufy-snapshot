@@ -13,7 +13,80 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from wanyard.stamper import _InputMetadataNotReady, _StamperWorker
+from wanyard.stamper import (
+    _BitcEpochDiscontinuity,
+    _BitcMediaTimeline,
+    _InputMetadataNotReady,
+    _StampAnchor,
+    _StamperWorker,
+)
+
+
+class StamperBitcTimelineTests(unittest.TestCase):
+    def test_media_pts_are_derived_from_bitc(self) -> None:
+        timeline = _BitcMediaTimeline(max_gap_seconds=2.0)
+
+        self.assertEqual(timeline.pts(1_000.0), 0)
+        self.assertEqual(timeline.pts(1_000.1), 9_000)
+        self.assertEqual(timeline.pts(1_000.25), 22_500)
+
+    def test_rtp_jump_reanchors_without_corrupting_media_cadence(self) -> None:
+        anchor = _StampAnchor("garden")
+        timeline = _BitcMediaTimeline(max_gap_seconds=2.0)
+
+        first = anchor.observe(100.0, 1_000.0)
+        second = anchor.observe(100.1, 1_000.1)
+        after_forward_jump = anchor.observe(113.5, 1_000.2)
+        after_backward_jump = anchor.observe(87.0, 1_000.3)
+
+        self.assertEqual(timeline.pts(first), 0)
+        self.assertEqual(timeline.pts(second), 9_000)
+        self.assertEqual(timeline.pts(after_forward_jump), 18_000)
+        self.assertEqual(timeline.pts(after_backward_jump), 27_000)
+
+    def test_non_increasing_bitc_frame_is_discarded(self) -> None:
+        timeline = _BitcMediaTimeline(max_gap_seconds=2.0)
+
+        self.assertEqual(timeline.pts(1_000.0), 0)
+        self.assertIsNone(timeline.pts(999.9))
+        self.assertEqual(timeline.pts(1_000.1), 9_000)
+
+    def test_real_bitc_gap_requires_a_new_media_epoch(self) -> None:
+        timeline = _BitcMediaTimeline(max_gap_seconds=2.0)
+
+        self.assertEqual(timeline.pts(1_000.0), 0)
+        with self.assertRaises(_BitcEpochDiscontinuity) as raised:
+            timeline.pts(1_183.0)
+
+        self.assertEqual(raised.exception.gap_seconds, 183.0)
+
+    def test_gap_uses_epoch_rollover_without_reconnect_backoff(self) -> None:
+        store = mock.Mock()
+        worker = _StamperWorker(
+            "mediamtx", "tapo-garden", threading.Event(), health_store=store
+        )
+        calls = 0
+
+        def stream() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _BitcEpochDiscontinuity(183.0)
+            worker.local_stop.set()
+
+        with (
+            mock.patch.object(worker, "_stream", side_effect=stream),
+            mock.patch.object(worker, "_wait") as wait,
+        ):
+            worker.run()
+
+        wait.assert_called_once_with(0.25)
+        self.assertEqual(worker._reconnect_count, 0)
+        self.assertEqual(worker._fallback_count, 0)
+        gap_events = [
+            call for call in store.event.call_args_list if call.args[3] == "bitc_gap"
+        ]
+        self.assertEqual(len(gap_events), 1)
 
 
 class StamperRateControlTests(unittest.TestCase):

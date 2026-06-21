@@ -40,6 +40,54 @@ class _InputMetadataNotReady(RuntimeError):
     """The RTSP stream opened before codec dimensions were available."""
 
 
+class _BitcEpochDiscontinuity(RuntimeError):
+    """Trusted BITC advanced too far to remain in one media timeline."""
+
+    def __init__(self, gap_seconds: float) -> None:
+        self.gap_seconds = float(gap_seconds)
+        super().__init__(f"trusted clock gap of {self.gap_seconds:.3f}s")
+
+
+class _BitcMediaTimeline:
+    """Map authoritative BITC time onto one monotonic media epoch.
+
+    BITC is the clock. Camera RTP is only an input to the BITC estimator and
+    must not independently shape playback time. Non-increasing BITC samples are
+    stale and are discarded. A real gap closes this epoch so downstream media
+    represents missing camera coverage as a gap between assets.
+    """
+
+    def __init__(self, *, max_gap_seconds: float, ticks_per_second: int = 90000) -> None:
+        self.max_gap_seconds = float(max_gap_seconds)
+        self.ticks_per_second = int(ticks_per_second)
+        self.epoch: float | None = None
+        self.last_bitc: float | None = None
+        self.last_pts = -1
+
+    def pts(self, bitc_ts: float) -> int | None:
+        if not np.isfinite(bitc_ts):
+            return None
+        if self.epoch is None:
+            self.epoch = bitc_ts
+            self.last_bitc = bitc_ts
+            self.last_pts = 0
+            return 0
+
+        assert self.last_bitc is not None
+        step = bitc_ts - self.last_bitc
+        if step <= 0:
+            return None
+        if step > self.max_gap_seconds:
+            raise _BitcEpochDiscontinuity(step)
+
+        pts = int(round((bitc_ts - self.epoch) * self.ticks_per_second))
+        if pts <= self.last_pts:
+            return None
+        self.last_bitc = bitc_ts
+        self.last_pts = pts
+        return pts
+
+
 def _nvenc_available(codec: str = "h264_nvenc") -> bool:
     """True if ``codec`` (h264_nvenc/hevc_nvenc) can actually open + encode here.
 
@@ -149,6 +197,14 @@ class _StamperWorker:
         self._reported_recovery_count = 0
         self._invalid_metadata_count = 0
         self._last_invalid_metadata_event_ts = 0.0
+        try:
+            self.epoch_gap_seconds = float(
+                self._src_env("EPOCH_GAP_SECONDS", "2.0") or "2.0"
+            )
+        except ValueError:
+            self.epoch_gap_seconds = 2.0
+        if not np.isfinite(self.epoch_gap_seconds) or self.epoch_gap_seconds <= 0:
+            self.epoch_gap_seconds = 2.0
         self.thread = threading.Thread(
             target=self.run, daemon=True, name=f"stamper-{source_id}")
 
@@ -176,6 +232,24 @@ class _StamperWorker:
         while not self.stopped():
             try:
                 self._stream()
+                backoff = 1.0
+            except _BitcEpochDiscontinuity as exc:
+                self._health_state("restarting_after_clock_gap", last_error=str(exc))
+                self._health_event(
+                    "warning",
+                    "bitc_gap",
+                    (
+                        f"trusted clock gap of {exc.gap_seconds:.3f}s; "
+                        "starting a new recording epoch"
+                    ),
+                    {"gap_seconds": exc.gap_seconds},
+                )
+                LOG.warning(
+                    "stamper %s trusted clock gap %.3fs; starting new media epoch",
+                    self.source_id,
+                    exc.gap_seconds,
+                )
+                self._wait(0.25)
                 backoff = 1.0
             except Exception as exc:
                 if self._demote_on_encoder_error(exc):
@@ -381,11 +455,9 @@ class _StamperWorker:
             vout.width = width
             vout.height = height
             vout.pix_fmt = "yuv420p"
-            # Fixed 90kHz output timebase; assign pts from the input's RTP
-            # (session-relative, monotonic, real-rate) so playback timing mirrors
-            # the camera exactly and the RTSP muxer always gets clean monotonic
-            # pts (carrying input frame.pts through a mismatched encoder rate
-            # EINVALs for VFR streams, e.g. avg 15 != base 20).
+            # Fixed 90kHz output timebase. PTS is derived below from the exact
+            # BITC value burned into each frame, so visible time and playback
+            # time have one authoritative clock.
             out_tb = Fraction(1, 90000)
             vout.codec_context.time_base = out_tb
             # Keyframe interval. HLS segments can only break on keyframes, so the
@@ -443,8 +515,7 @@ class _StamperWorker:
                                 self.source_id)
 
             anchor = _StampAnchor(self.source_id)
-            rtp0: float | None = None
-            last_pts = -1
+            timeline = _BitcMediaTimeline(max_gap_seconds=self.epoch_gap_seconds)
             last_health_update = 0.0
             for packet in inp.demux():
                 if self.stopped():
@@ -452,13 +523,24 @@ class _StamperWorker:
                 if packet.dts is None:
                     continue
                 if packet.stream is vin:
-                    rtp = (float(packet.pts * vin.time_base)
-                           if packet.pts is not None else time.time())
                     for frame in packet.decode():
                         wall = time.time()
+                        frame_pts = frame.pts if frame.pts is not None else packet.pts
+                        frame_tb = frame.time_base or vin.time_base
+                        rtp = (
+                            float(frame_pts * frame_tb)
+                            if frame_pts is not None and frame_tb is not None
+                            else wall
+                        )
                         abs_ts = anchor.observe(rtp, wall)
-                        if rtp0 is None:
-                            rtp0 = rtp
+                        pts = timeline.pts(abs_ts)
+                        if pts is None:
+                            LOG.debug(
+                                "stamper %s dropped stale BITC frame %.6f",
+                                self.source_id,
+                                abs_ts,
+                            )
+                            continue
                         # Stamp directly into the decoded yuv420p planes: the
                         # marker is pure luma, so write the Y cells and
                         # neutralise chroma in place. Avoids the bgr24
@@ -477,9 +559,7 @@ class _StamperWorker:
                             u = np.frombuffer(ub, np.uint8).reshape(-1, ub.line_size)
                             vp = np.frombuffer(vb, np.uint8).reshape(-1, vb.line_size)
                             bitc.render_yuv420(y, u, vp, value)
-                        pts = int(round((rtp - rtp0) * 90000))
-                        frame.pts = pts if pts > last_pts else last_pts + 1
-                        last_pts = frame.pts
+                        frame.pts = pts
                         frame.time_base = out_tb
                         encoded = vout.encode(frame)
                         for op in encoded:
