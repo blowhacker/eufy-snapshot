@@ -397,6 +397,18 @@ function qualitySummary(id) {
   return qualityPreset(id)?.summary || '';
 }
 
+function parseQualityRate(value) {
+  const match = String(value || '').trim().match(/^([0-9]+(?:\.[0-9]+)?)([kKmMgG]?)$/);
+  if (!match) return null;
+  const scale = { '': 1, k: 1e3, m: 1e6, g: 1e9 }[match[2].toLowerCase()];
+  return Number(match[1]) * scale;
+}
+
+function qualityRateText(value) {
+  const parsed = parseQualityRate(value);
+  return parsed == null ? String(value || '--') : fmt.bitrate(parsed);
+}
+
 function qualityElementByDataset(attr, value) {
   return [...document.querySelectorAll(`[data-${attr}]`)]
     .find(el => el.dataset[attr.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] === value);
@@ -412,6 +424,27 @@ function currentQualityForSource(sourceId) {
   return value === 'global' ? global : value;
 }
 
+function qualityCapText(sourceId, qualityId) {
+  const preset = qualityPreset(qualityId);
+  if (!preset) return '--';
+  const current = _mediaHealth?.current?.[sourceId] || {};
+  const encoder = String(current.stamper?.active_encoder || current.recorder_codec || '').toLowerCase();
+  if (encoder.includes('hevc') || encoder.includes('h265')) {
+    return `HEVC ${qualityRateText(preset.hevc_maxrate)}`;
+  } else if (encoder.includes('264') || encoder.includes('x264')) {
+    return `H.264 ${qualityRateText(preset.h264_maxrate)}`;
+  }
+  return `HEVC ${qualityRateText(preset.hevc_maxrate)} / H.264 ${qualityRateText(preset.h264_maxrate)}`;
+}
+
+function qualityMeasuredText(sourceId) {
+  const current = _mediaHealth?.current?.[sourceId] || {};
+  const measured = current.stamped_bitrate_bps == null
+    ? ''
+    : ` · now ${fmt.bitrate(current.stamped_bitrate_bps)}`;
+  return measured;
+}
+
 function updateQualityPreview() {
   if (!_recordingQuality) return;
   const global = document.getElementById('qualityGlobal')?.value
@@ -424,8 +457,19 @@ function updateQualityPreview() {
     if (option) option.textContent = `Use global (${qualityLabel(global)})`;
     const sourceId = select.dataset.qualitySource;
     const effective = currentQualityForSource(sourceId);
+    const current = _recordingQuality.effective?.[sourceId]
+      || _recordingQuality.global_quality
+      || _recordingQuality.default_quality
+      || 'balanced';
     const target = qualityElementByDataset('quality-effective', sourceId);
-    if (target) target.textContent = qualityLabel(effective);
+    const detail = qualityElementByDataset('quality-detail', sourceId);
+    if (effective === current) {
+      if (target) target.textContent = qualityLabel(current);
+      if (detail) detail.textContent = `Current cap ${qualityCapText(sourceId, current)}${qualityMeasuredText(sourceId)}`;
+    } else {
+      if (target) target.textContent = `Current: ${qualityLabel(current)} (${qualityCapText(sourceId, current)})`;
+      if (detail) detail.textContent = `New: ${qualityLabel(effective)} (${qualityCapText(sourceId, effective)})${qualityMeasuredText(sourceId)}`;
+    }
   });
 }
 
@@ -492,12 +536,8 @@ function renderRecordingQuality() {
     effectiveName.dataset.qualityEffective = sourceId;
     const detail = document.createElement('span');
     detail.className = 's-quality-detail';
-    const current = _mediaHealth?.current?.[sourceId] || {};
-    const stamper = current.stamper || {};
-    const bits = [];
-    if (stamper.active_encoder) bits.push(stamper.active_encoder);
-    if (current.stamped_bitrate_bps != null) bits.push(fmt.bitrate(current.stamped_bitrate_bps));
-    detail.textContent = bits.length ? bits.join(' · ') : 'Awaiting stream';
+    detail.dataset.qualityDetail = sourceId;
+    detail.textContent = 'Current cap --';
     effective.append(effectiveName, detail);
 
     row.append(camera, quality, effective);

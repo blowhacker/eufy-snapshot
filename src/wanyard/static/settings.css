@@ -741,6 +741,10 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.s-quality-table td:last-child .s-quality-camera,
+.s-quality-table td:last-child .s-quality-detail {
+  white-space: normal;
+}
 .s-quality-select {
   width: 100%;
   min-width: 0;
