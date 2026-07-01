@@ -18,6 +18,19 @@ _PATH_REFRESH_SECONDS = 60.0
 _MAX_LIVE_LAG_SECONDS = 1.0
 _STAMPED_SUFFIX = "-stamped"
 _MARKER_FAIL_LOG_SECONDS = 30.0
+_DEFAULT_RECONNECT_COVERAGE_GRACE_SECONDS = 15.0
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        LOG.warning("invalid %s=%r", name, raw)
+        return default
+    return max(0.0, value)
 
 
 @dataclass
@@ -50,6 +63,11 @@ class _SourceWorker:
         self.last_stale_log_wall = 0.0
         self.last_marker_fail_log_wall = 0.0
         self.marker_active_since: float | None = None
+        self.last_marker_wall: float | None = None
+        self.reconnect_coverage_grace_seconds = _float_env(
+            "WANYARD_LIVE_RECONNECT_COVERAGE_GRACE_SECONDS",
+            _DEFAULT_RECONNECT_COVERAGE_GRACE_SECONDS,
+        )
         self.thread = threading.Thread(
             target=self.run,
             daemon=True,
@@ -69,7 +87,7 @@ class _SourceWorker:
         backoff = 1.0
         while not self.stopped():
             try:
-                self.marker_active_since = None
+                self._reset_coverage_if_stale(time.time())
                 self._stream()
                 backoff = 1.0
             except Exception as exc:
@@ -82,6 +100,20 @@ class _SourceWorker:
                 self._wait(backoff)
                 backoff = min(30.0, backoff * 2.0)
         LOG.info("live detector %s stopped", self.source_id)
+
+    def _reset_coverage_if_stale(self, now: float) -> None:
+        if self.marker_active_since is None or self.last_marker_wall is None:
+            return
+        gap = now - self.last_marker_wall
+        if gap <= self.reconnect_coverage_grace_seconds:
+            return
+        LOG.info(
+            "live detector %s reset marker coverage after %.3fs reconnect gap",
+            self.source_id,
+            gap,
+        )
+        self.marker_active_since = None
+        self.last_marker_wall = None
 
     def _wait(self, seconds: float) -> None:
         deadline = time.time() + seconds
@@ -175,6 +207,7 @@ class _SourceWorker:
             self.marker_active_since = abs_ts
             LOG.info("live detector %s MARKER_ACTIVE marker_since=%.3f",
                      self.source_id, abs_ts)
+        self.last_marker_wall = wall
 
         lag = wall - abs_ts
         if lag > _MAX_LIVE_LAG_SECONDS:

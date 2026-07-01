@@ -94,6 +94,7 @@ class LiveDetectorMarkerTests(unittest.TestCase):
         self.assertEqual(source_id, "tapo-front")
         self.assertEqual(round(rows[0]["abs_ts"] * 100), bitc.encode_value(unix_seconds))
         self.assertEqual(worker.marker_active_since, rows[0]["abs_ts"])
+        self.assertEqual(worker.last_marker_wall, unix_seconds + 0.1)
 
     def test_crc_failure_skips_prediction_and_storage(self) -> None:
         unix_seconds = 1_781_400_000.12
@@ -108,6 +109,7 @@ class LiveDetectorMarkerTests(unittest.TestCase):
         self.assertEqual(model.frames, [])
         self.assertEqual(video_db.inserted, [])
         self.assertIsNone(worker.marker_active_since)
+        self.assertIsNone(worker.last_marker_wall)
 
     def test_rotation_claim_uses_marker_coverage(self) -> None:
         model = _FakeModel()
@@ -122,6 +124,42 @@ class LiveDetectorMarkerTests(unittest.TestCase):
 
         self.assertEqual(video_db.marked, [1])
         self.assertEqual(worker.open_segment_id, 2)
+
+    def test_short_reconnect_keeps_marker_coverage(self) -> None:
+        model = _FakeModel()
+        video_db = _FakeVideoDB({"id": 2, "media_epoch": 1001.0})
+        video_db.closed[1] = {"id": 1, "media_epoch": 1000.0, "end_ts": 1010.0}
+        worker = _worker(model, video_db)
+        worker.open_segment_id = 1
+        worker.marker_active_since = 999.9
+        worker.last_marker_wall = 50.0
+        worker.reconnect_coverage_grace_seconds = 15.0
+
+        worker._reset_coverage_if_stale(61.0)
+        with mock.patch("wanyard.video.extract_events", return_value=0):
+            worker._handle_rotation(video_db.segment)
+
+        self.assertEqual(worker.marker_active_since, 999.9)
+        self.assertEqual(worker.last_marker_wall, 50.0)
+        self.assertEqual(video_db.marked, [1])
+
+    def test_long_reconnect_resets_marker_coverage(self) -> None:
+        model = _FakeModel()
+        video_db = _FakeVideoDB({"id": 2, "media_epoch": 1001.0})
+        video_db.closed[1] = {"id": 1, "media_epoch": 1000.0, "end_ts": 1010.0}
+        worker = _worker(model, video_db)
+        worker.open_segment_id = 1
+        worker.marker_active_since = 999.9
+        worker.last_marker_wall = 50.0
+        worker.reconnect_coverage_grace_seconds = 15.0
+
+        worker._reset_coverage_if_stale(66.0)
+        with mock.patch("wanyard.video.extract_events", return_value=0):
+            worker._handle_rotation(video_db.segment)
+
+        self.assertIsNone(worker.marker_active_since)
+        self.assertIsNone(worker.last_marker_wall)
+        self.assertEqual(video_db.marked, [])
 
 
 if __name__ == "__main__":
