@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_gen_go2rtc(args, config)
     if args.command == "stamp":
         from . import stamper
-        return stamper.run()
+        return stamper.run(config)
     parser.print_help()
     return 2
 

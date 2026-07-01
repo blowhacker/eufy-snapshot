@@ -13,7 +13,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/app.css">
-  <link rel="stylesheet" href="/settings.css?v=media-health-1">
+  <link rel="stylesheet" href="/settings.css?v=recording-quality-1">
 </head>
 <body>
 
@@ -277,6 +277,37 @@
 
         <div class="s-card">
           <div class="s-card-section">
+            <div class="s-card-section-head">Recording quality</div>
+            <div class="s-auto-grid">
+              <div class="s-field-row">
+                <label for="qualityGlobal">Global default</label>
+                <select id="qualityGlobal"></select>
+                <span id="qualityPresetSummary" class="s-field-hint"></span>
+              </div>
+              <div class="s-quality-table-wrap">
+                <table class="s-quality-table">
+                  <thead>
+                    <tr>
+                      <th>Camera</th>
+                      <th>Quality</th>
+                      <th>Effective</th>
+                    </tr>
+                  </thead>
+                  <tbody id="qualityTable">
+                    <tr><td colspan="3" class="s-quality-empty">Loading cameras.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="s-card-footer">
+              <button id="qualitySaveBtn" class="s-btn s-btn-primary" type="button">Save and apply</button>
+              <span id="qualityMsg" class="s-save-msg"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="s-card">
+          <div class="s-card-section">
             <div class="s-card-section-head">Auto-cleanup</div>
             <div class="s-auto-grid">
               <div class="s-field-row">
@@ -332,6 +363,6 @@
     </main>
   </div>
 
-  <script src="/settings.js?v=media-health-1"></script>
+  <script src="/settings.js?v=recording-quality-1"></script>
 </body>
 </html>

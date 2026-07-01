@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -18,7 +19,14 @@ from wanyard.stamper import (
     _BitcMediaTimeline,
     _InputMetadataNotReady,
     _StampAnchor,
+    _StamperSupervisor,
     _StamperWorker,
+)
+from wanyard.db import SourceDB
+from wanyard.recording_quality import (
+    GLOBAL_QUALITY_KEY,
+    source_quality_key,
+    write_stamper_reload_request,
 )
 
 
@@ -119,6 +127,67 @@ class StamperRateControlTests(unittest.TestCase):
 
         self.assertEqual(options["maxrate"], "2.5M")
         self.assertEqual(options["bufsize"], "5M")
+
+    def test_saved_quality_preset_overrides_env_limits(self) -> None:
+        env = {
+            "WANYARD_STAMP_CQ": "28",
+            "WANYARD_STAMP_CRF": "23",
+            "WANYARD_STAMP_MAXRATE": "2.5M",
+            "WANYARD_STAMP_BUFSIZE": "5M",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_db = SourceDB(Path(tmpdir) / "sources.db")
+            source_db.set_setting(GLOBAL_QUALITY_KEY, "high")
+            with mock.patch.dict(os.environ, env, clear=True):
+                worker = _StamperWorker(
+                    "mediamtx",
+                    "tapo-garden",
+                    threading.Event(),
+                    source_db_path=source_db.path,
+                )
+                hevc = worker._video_options("hevc_nvenc", 15)
+                h264 = worker._video_options("libx264", 15)
+
+        self.assertEqual(hevc["cq"], "24")
+        self.assertEqual(hevc["maxrate"], "5M")
+        self.assertEqual(hevc["bufsize"], "10M")
+        self.assertEqual(h264["crf"], "20")
+        self.assertEqual(h264["maxrate"], "8M")
+        self.assertEqual(h264["bufsize"], "16M")
+
+    def test_source_quality_override_wins_over_global(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_db = SourceDB(Path(tmpdir) / "sources.db")
+            source_db.set_setting(GLOBAL_QUALITY_KEY, "storage_saver")
+            source_db.set_setting(source_quality_key("tapo-garden"), "maximum")
+            worker = _StamperWorker(
+                "mediamtx",
+                "tapo-garden",
+                threading.Event(),
+                source_db_path=source_db.path,
+            )
+            options = worker._video_options("hevc_nvenc", 15)
+
+        self.assertEqual(options["cq"], "20")
+        self.assertEqual(options["maxrate"], "10M")
+        self.assertEqual(options["bufsize"], "20M")
+
+
+class StamperReloadTests(unittest.TestCase):
+    def test_reload_request_restarts_requested_workers_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_db_path = Path(tmpdir) / "sources.db"
+            SourceDB(source_db_path)
+            with mock.patch("wanyard.stamper.MediaHealthStore", return_value=None):
+                supervisor = _StamperSupervisor(
+                    threading.Event(), source_db_path=source_db_path
+                )
+            supervisor.workers = {"garden": mock.Mock(), "front": mock.Mock()}
+            write_stamper_reload_request(source_db_path, ["garden"])
+            with mock.patch.object(supervisor, "_restart_worker") as restart:
+                supervisor._handle_reload_request()
+
+        restart.assert_called_once_with("garden")
 
 
 class StamperReconnectMetadataTests(unittest.TestCase):

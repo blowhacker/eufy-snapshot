@@ -27,6 +27,15 @@ from starlette.staticfiles import StaticFiles
 from . import native_hls
 from .config import AppConfig
 from .media_health import MediaHealthCollector, MediaHealthStore, default_db_path
+from .recording_quality import (
+    GLOBAL_QUALITY_KEY,
+    configured_quality_id,
+    effective_quality_id,
+    quality_settings_payload,
+    source_quality_key,
+    validate_quality_id,
+    write_stamper_reload_request,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -1571,6 +1580,83 @@ def make_app(
         finally:
             out.unlink(missing_ok=True)
 
+    async def api_settings_recording_quality(request: Request) -> JSONResponse:
+        if source_db is None:
+            return JSONResponse({"error": "db_path not configured"}, status_code=501)
+        sources = _sources_list(config, source_db)
+        source_ids = {source["id"] for source in sources}
+        if request.method == "GET":
+            return JSONResponse(quality_settings_payload(source_db, sources))
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"}, status_code=400
+            )
+
+        old_quality = {
+            source_id: (
+                configured_quality_id(source_db, source_id),
+                effective_quality_id(source_db, source_id),
+            )
+            for source_id in source_ids
+        }
+        if "global_quality" in body:
+            try:
+                source_db.set_setting(
+                    GLOBAL_QUALITY_KEY,
+                    validate_quality_id(body["global_quality"]),
+                )
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+
+        overrides = body.get("overrides", {})
+        if overrides is None:
+            overrides = {}
+        if not isinstance(overrides, dict):
+            return JSONResponse({"error": "overrides must be an object"}, status_code=400)
+        unknown = sorted(set(overrides) - source_ids)
+        if unknown:
+            return JSONResponse(
+                {"error": f"unknown camera: {unknown[0]}"}, status_code=400
+            )
+
+        for source_id, value in overrides.items():
+            if value in (None, "", "global"):
+                source_db.delete_setting(source_quality_key(source_id))
+                continue
+            try:
+                quality_id = validate_quality_id(value)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            source_db.set_setting(source_quality_key(source_id), quality_id)
+
+        new_quality = {
+            source_id: (
+                configured_quality_id(source_db, source_id),
+                effective_quality_id(source_db, source_id),
+            )
+            for source_id in source_ids
+        }
+        changed = sorted(
+            source_id
+            for source_id in source_ids
+            if old_quality.get(source_id) != new_quality.get(source_id)
+        )
+        reload_request = None
+        if body.get("apply", True) and changed:
+            reload_request = write_stamper_reload_request(
+                getattr(source_db, "path", config.db_path), changed
+            )
+
+        payload = quality_settings_payload(source_db, sources)
+        payload["applied_source_ids"] = changed if reload_request else []
+        payload["reload_requested"] = bool(reload_request)
+        return JSONResponse(payload)
+
     async def api_settings_cleanup_config(request: Request) -> JSONResponse:
         """Get or update auto-cleanup thresholds (stored in DB, read by yolo-serve)."""
         if not video_db:
@@ -1786,6 +1872,7 @@ def make_app(
         Route("/api/settings/status",            api_settings_status),
         Route("/api/settings/media-health",      api_settings_media_health),
         Route("/api/settings/camera/test",       api_settings_camera_test, methods=["POST"]),
+        Route("/api/settings/recording-quality", api_settings_recording_quality, methods=["GET", "POST"]),
         Route("/api/settings/cleanup-config",    api_settings_cleanup_config, methods=["GET", "POST"]),
         Route("/api/settings/cleanup",           api_settings_cleanup,     methods=["POST"]),
         Mount("/", StaticFiles(directory=static_dir, html=True)),

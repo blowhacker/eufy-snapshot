@@ -18,12 +18,18 @@ import re
 import threading
 import time
 from fractions import Fraction
+from pathlib import Path
 
 import numpy as np
 
 from . import bitc
 from .live_detector import _list_relay_paths
 from .media_health import MediaHealthStore, default_db_path
+from .recording_quality import (
+    configured_quality_id,
+    encoder_options_for_quality,
+    read_stamper_reload_request,
+)
 
 LOG = logging.getLogger("wanyard.stamper")
 
@@ -31,6 +37,7 @@ _ROLLING_SECONDS = 90.0
 _DISC_BACKWARD = -1.0      # rtp step below this (s) = discontinuity → reanchor
 _DISC_FORWARD = 5.0        # rtp step above this (s) = discontinuity → reanchor
 _PATH_REFRESH_SECONDS = 30.0
+_SUPERVISOR_POLL_SECONDS = 1.0
 _STAMPED_SUFFIX = "-stamped"
 
 _nvenc_probe: dict[str, bool] = {}
@@ -151,7 +158,8 @@ class _StampAnchor:
 class _StamperWorker:
     def __init__(self, relay_host: str, source_id: str,
                  stop_event: threading.Event, out_host: str | None = None,
-                 health_store: MediaHealthStore | None = None) -> None:
+                 health_store: MediaHealthStore | None = None,
+                 source_db_path: str | os.PathLike | None = None) -> None:
         self.relay_host = relay_host
         self.source_id = source_id
         self.stop_event = stop_event
@@ -197,6 +205,8 @@ class _StamperWorker:
         self._reported_recovery_count = 0
         self._invalid_metadata_count = 0
         self._last_invalid_metadata_event_ts = 0.0
+        self._source_db_path = source_db_path
+        self._quality_settings_error_reported = False
         try:
             self.epoch_gap_seconds = float(
                 self._src_env("EPOCH_GAP_SECONDS", "2.0") or "2.0"
@@ -376,6 +386,10 @@ class _StamperWorker:
 
     def _video_options(self, codec: str, gop: int) -> dict[str, str]:
         opts = {"g": str(gop), "keyint_min": str(gop)}
+        quality_id = self._configured_quality_id()
+        quality_options = (
+            encoder_options_for_quality(quality_id, codec) if quality_id else {}
+        )
         if codec.endswith("_nvenc"):
             # Low-latency tuning is mandatory, not optional: the live detector
             # drops frames whose age exceeds 1.0s (_MAX_LIVE_LAG_SECONDS), and
@@ -385,20 +399,42 @@ class _StamperWorker:
             # Quality comes from cq + bitrate, not from B-frames, so the look is
             # unaffected.
             opts.update({"preset": self.nvenc_preset, "tune": "ll", "rc": "vbr",
-                         "cq": self.cq, "bf": "0", "rc-lookahead": "0",
+                         "cq": quality_options.get("cq", self.cq),
+                         "bf": "0", "rc-lookahead": "0",
                          "delay": "0"})
         else:
             # zerolatency: same reason — keep the re-encode within the live
             # detector's 1.0s staleness gate.
             opts.update({"preset": self.preset, "tune": "zerolatency",
-                         "crf": self.crf})
+                         "crf": quality_options.get("crf", self.crf)})
         family = "HEVC" if codec == "hevc_nvenc" else "H264"
-        maxrate = self._src_env(f"{family}_MAXRATE", self.maxrate)
-        bufsize = self._src_env(f"{family}_BUFSIZE", self.bufsize)
+        maxrate = quality_options.get("maxrate")
+        bufsize = quality_options.get("bufsize")
+        if not maxrate:
+            maxrate = self._src_env(f"{family}_MAXRATE", self.maxrate)
+            bufsize = self._src_env(f"{family}_BUFSIZE", self.bufsize)
         if maxrate:
             opts["maxrate"] = maxrate
             opts["bufsize"] = bufsize or maxrate
         return opts
+
+    def _configured_quality_id(self) -> str | None:
+        if self._source_db_path is None:
+            return None
+        try:
+            from .db import SourceDB
+
+            settings = SourceDB(Path(self._source_db_path))
+            return configured_quality_id(settings, self.source_id)
+        except Exception:
+            if not self._quality_settings_error_reported:
+                LOG.warning(
+                    "stamper %s could not read recording quality settings",
+                    self.source_id,
+                    exc_info=True,
+                )
+                self._quality_settings_error_reported = True
+            return None
 
     def _video_metadata(self, vin) -> tuple[int, int, float]:
         width = int(getattr(vin.codec_context, "width", 0) or 0)
@@ -604,10 +640,18 @@ class _StamperWorker:
 
 
 class _StamperSupervisor:
-    def __init__(self, stop_event: threading.Event) -> None:
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        *,
+        source_db_path: str | os.PathLike | None = None,
+    ) -> None:
         self.stop_event = stop_event
         self.relay_host = os.environ.get("WANYARD_RELAY_HOST", "mediamtx").strip() or "mediamtx"
         self.workers: dict[str, _StamperWorker] = {}
+        self.source_db_path = source_db_path
+        initial_reload = read_stamper_reload_request(source_db_path)
+        self._last_reload_token = initial_reload["token"] if initial_reload else None
         self.health_store: MediaHealthStore | None = None
         try:
             # Telemetry is best-effort and runs on the frame thread. Bound any
@@ -624,27 +668,36 @@ class _StamperSupervisor:
         return self.thread
 
     def run(self) -> None:
+        next_path_refresh = 0.0
         while not self.stop_event.is_set():
-            try:
-                self._sync_paths()
-            except Exception:
-                LOG.exception("stamper path discovery failed")
-            self.stop_event.wait(_PATH_REFRESH_SECONDS)
+            now = time.time()
+            if now >= next_path_refresh:
+                try:
+                    self._sync_paths()
+                except Exception:
+                    LOG.exception("stamper path discovery failed")
+                next_path_refresh = now + _PATH_REFRESH_SECONDS
+            self._handle_reload_request()
+            self.stop_event.wait(_SUPERVISOR_POLL_SECONDS)
         for worker in self.workers.values():
             worker.stop()
         LOG.info("stamper supervisor stopped")
+
+    def _make_worker(self, source_id: str) -> _StamperWorker:
+        return _StamperWorker(
+            self.relay_host,
+            source_id,
+            self.stop_event,
+            health_store=self.health_store,
+            source_db_path=self.source_db_path,
+        )
 
     def _sync_paths(self) -> None:
         # Source paths only — never stamp our own output (would loop).
         paths = {p for p in _list_relay_paths(self.relay_host)
                  if not p.endswith(_STAMPED_SUFFIX)}
         for source_id in sorted(paths - set(self.workers)):
-            worker = _StamperWorker(
-                self.relay_host,
-                source_id,
-                self.stop_event,
-                health_store=self.health_store,
-            )
+            worker = self._make_worker(source_id)
             self.workers[source_id] = worker
             worker.start()
             LOG.info("stamper started path=%s", source_id)
@@ -653,8 +706,46 @@ class _StamperSupervisor:
             del self.workers[source_id]
             LOG.info("stamper stopped removed path=%s", source_id)
 
+    def _handle_reload_request(self) -> None:
+        request = read_stamper_reload_request(self.source_db_path)
+        if not request or request["token"] == self._last_reload_token:
+            return
+        self._last_reload_token = request["token"]
+        requested = set(request["source_ids"])
+        source_ids = set(self.workers) if not requested or "*" in requested else requested
+        for source_id in sorted(source_ids):
+            if source_id in self.workers:
+                self._restart_worker(source_id)
 
-def run() -> int:
+    def _restart_worker(self, source_id: str) -> None:
+        old = self.workers.get(source_id)
+        if old is None:
+            return
+        old.stop()
+        old.thread.join(timeout=10.0)
+        if old.thread.is_alive():
+            LOG.warning(
+                "stamper %s did not stop cleanly before quality reload",
+                source_id,
+            )
+        worker = self._make_worker(source_id)
+        self.workers[source_id] = worker
+        worker.start()
+        LOG.info("stamper restarted path=%s reason=recording_quality", source_id)
+        if self.health_store is not None:
+            try:
+                self.health_store.event(
+                    source_id,
+                    "stamper",
+                    "info",
+                    "recording_quality_reload",
+                    "recording quality changed; restarted stream",
+                )
+            except Exception:
+                LOG.warning("could not record stamper reload event", exc_info=True)
+
+
+def run(config=None) -> int:
     import signal
 
     logging.basicConfig(level=logging.INFO,
@@ -667,7 +758,8 @@ def run() -> int:
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
-    sup = _StamperSupervisor(stop_event)
+    source_db_path = getattr(config, "db_path", None)
+    sup = _StamperSupervisor(stop_event, source_db_path=source_db_path)
     sup.start()
     while not stop_event.is_set():
         time.sleep(1.0)

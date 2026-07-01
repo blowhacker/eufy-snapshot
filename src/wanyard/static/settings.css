@@ -168,6 +168,7 @@
   border-radius: var(--r-lg);
   overflow: hidden;
 }
+.s-sec .s-card + .s-card { margin-top: 16px; }
 .s-card-danger { border-color: rgba(226, 92, 76, 0.2); }
 
 /* KPIs */
@@ -685,6 +686,78 @@
 .s-save-msg.ok  { color: var(--green); }
 .s-save-msg.err { color: var(--red); }
 
+/* Recording quality */
+.s-quality-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r);
+}
+.s-quality-table {
+  width: 100%;
+  min-width: 560px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.s-quality-table th {
+  padding: 9px 12px;
+  color: var(--txt-3);
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0.05em;
+  text-align: left;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--line-soft);
+}
+.s-quality-table td {
+  height: 50px;
+  padding: 9px 12px;
+  color: var(--txt-2);
+  font-size: 12px;
+  vertical-align: middle;
+  border-bottom: 1px solid var(--line-soft);
+}
+.s-quality-table tr:last-child td { border-bottom: none; }
+.s-quality-table th:first-child,
+.s-quality-table td:first-child { width: 32%; }
+.s-quality-table th:nth-child(2),
+.s-quality-table td:nth-child(2) { width: 34%; }
+.s-quality-table th:last-child,
+.s-quality-table td:last-child { width: 34%; }
+.s-quality-camera {
+  display: block;
+  color: var(--txt);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.s-quality-camera-id,
+.s-quality-detail {
+  display: block;
+  margin-top: 2px;
+  color: var(--txt-3);
+  font: 400 10.5px var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.s-quality-select {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 28px 0 10px;
+  color: var(--txt);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  font-size: 12.5px;
+}
+.s-quality-empty {
+  padding: 18px !important;
+  color: var(--txt-3) !important;
+  text-align: center;
+}
+
 /* Buttons — !important needed to beat app.css button { width:32px } */
 .s-btn {
   height: 32px !important;
@@ -726,6 +799,34 @@
     flex-wrap: wrap;
   }
   .s-health-chart-wrap { margin: 0 12px; }
+  .s-quality-table { min-width: 0; table-layout: auto; }
+  .s-quality-table thead { display: none; }
+  .s-quality-table tbody,
+  .s-quality-table tr { display: block; }
+  .s-quality-table tr {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .s-quality-table tr:last-child { border-bottom: 0; }
+  .s-quality-table td,
+  .s-quality-table td:first-child,
+  .s-quality-table td:nth-child(2),
+  .s-quality-table td:last-child {
+    display: block;
+    width: auto;
+    height: auto;
+    padding: 7px 0;
+    border: 0;
+  }
+  .s-quality-table td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 4px;
+    color: var(--txt-3);
+    font: 500 9px var(--font-mono);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
 }
 
 @media (max-width: 600px) {

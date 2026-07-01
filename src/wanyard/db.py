@@ -18,7 +18,12 @@ CREATE TABLE IF NOT EXISTS rtsp_sources (
     rtsp_transport TEXT NOT NULL DEFAULT 'tcp',
     timeout_seconds REAL NOT NULL DEFAULT 20,
     output_subdir TEXT
-)
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -39,7 +44,11 @@ class SourceDB:
         self._path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
-            conn.execute(_DDL)
+            conn.executescript(_DDL)
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     @contextmanager
     def _connect(self):
@@ -88,6 +97,24 @@ class SourceDB:
         with self._connect() as conn:
             rows = conn.execute("SELECT id FROM rtsp_sources").fetchall()
         return {r["id"] for r in rows}
+
+    def get_setting(self, key: str, default=None):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM app_settings WHERE key=?", (key,)
+            ).fetchone()
+        return row["value"] if row is not None else default
+
+    def set_setting(self, key: str, value) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings(key,value) VALUES(?,?)",
+                (key, str(value)),
+            )
+
+    def delete_setting(self, key: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM app_settings WHERE key=?", (key,))
 
     def to_source_configs(self) -> tuple[SourceConfig, ...]:
         return tuple(
