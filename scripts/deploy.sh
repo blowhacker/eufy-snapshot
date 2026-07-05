@@ -78,9 +78,12 @@ done
 
 # yolo can have the device but still run on CPU if torch can't see CUDA. Retry:
 # the container needs a few seconds after (re)create before python is up.
+# </dev/null is load-bearing: this whole script arrives on bash's stdin (bash -s
+# heredoc), and docker compose exec inherits that stdin — without the redirect
+# it EATS the remainder of the script, silently skipping every check below.
 cuda_ok=0
 for _ in 1 2 3 4 5 6; do
-  if docker compose exec -T yolo python3 -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' 2>/dev/null; then
+  if docker compose exec -T yolo python3 -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' </dev/null 2>/dev/null; then
     cuda_ok=1; break
   fi
   sleep 5
