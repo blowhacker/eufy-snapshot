@@ -820,6 +820,14 @@ class V2Timeline {
     return null;
   }
 
+  playheadHit(x, y) {
+    if (this.#head == null) return false;
+    const W = this.#c.clientWidth, H = this.#c.clientHeight;
+    if (x < this.labelWidth || x > W || y < 0 || y > H - 18) return false;
+    const HANDLE = window.matchMedia?.("(pointer: coarse)").matches ? 16 : 9;
+    return Math.abs(x - this.#tsToX(this.#head)) <= HANDLE;
+  }
+
   // ── Pure decode — returns null or {ts, srcId, snapEvent} ─
   decode(x, y) {
     const W = this.#c.clientWidth, H = this.#c.clientHeight;
@@ -3221,6 +3229,7 @@ function downloadSelectedClip() {
 let _drag = null, _wasDrag = false;
 let _clipSuppressClick = false;
 let _timelinePointerId = null;
+let _playheadDrag = null;
 
 function timelineLocalPoint(e) {
   const rect = el.tlCanvas.getBoundingClientRect();
@@ -3237,10 +3246,48 @@ function releaseTimelinePointer(e) {
   try { el.tlCanvas.releasePointerCapture?.(e.pointerId); } catch {}
 }
 
+function clipConstrainedTs(ts) {
+  let next = Math.min(Number(ts), Date.now() / 1000);
+  if (st.clip.active && st.clip.start != null && st.clip.end != null) {
+    const low = Math.min(st.clip.start, st.clip.end);
+    const high = Math.max(st.clip.start, st.clip.end);
+    next = Math.max(low, Math.min(high, next));
+  }
+  return next;
+}
+
+function updatePlayheadDrag(x) {
+  if (!_playheadDrag) return;
+  const ts = clipConstrainedTs(timeline.xToTs(x));
+  _playheadDrag.ts = ts;
+  timeline.setPlayhead(ts);
+  setTimestampChip(ts, _playheadDrag.sourceId, false);
+}
+
 function beginTimelineDrag(e) {
   if (e.button != null && e.button !== 0) return;
   st.timelineAutoFollow = false;
   const pt = timelineLocalPoint(e);
+  if (timeline.playheadHit(pt.x, pt.y)) {
+    const decoded = timeline.decode(pt.x, pt.y);
+    const sourceId = st.clip.sourceId
+      ?? liveTail.srcId
+      ?? player.currentSeg?.source_id
+      ?? decoded?.srcId;
+    if (sourceId) {
+      if (liveTail.active) stopLiveTail(false);
+      stopClipPreview({ pause: true });
+      player.pause();
+      _playheadDrag = { sourceId, ts: clipConstrainedTs(timeline.xToTs(pt.x)) };
+      _clipSuppressClick = true;
+      _timelinePointerId = e.pointerId ?? null;
+      el.tlCanvas.style.cursor = "ew-resize";
+      captureTimelinePointer(e);
+      updatePlayheadDrag(pt.x);
+      e.preventDefault();
+      return;
+    }
+  }
   if (st.clip.active) {
     const hit = timeline.clipHit(pt.x, pt.y);
     if (hit) {
@@ -3250,9 +3297,11 @@ function beginTimelineDrag(e) {
         start: st.clip.start,
         end: st.clip.end,
         ts: hit.ts ?? timeline.xToTs(pt.x),
+        startX: pt.x,
+        moved: false,
       };
       el.tlCanvas.style.cursor = hit.part === "move" ? "grabbing" : "ew-resize";
-      _clipSuppressClick = true;
+      _clipSuppressClick = false;
       _timelinePointerId = e.pointerId ?? null;
       captureTimelinePointer(e);
       e.preventDefault();
@@ -3268,8 +3317,16 @@ function beginTimelineDrag(e) {
 
 function moveTimelineDrag(e) {
   if (_timelinePointerId != null && e.pointerId != null && e.pointerId !== _timelinePointerId) return;
+  if (_playheadDrag) {
+    updatePlayheadDrag(timelineLocalPoint(e).x);
+    e.preventDefault();
+    return;
+  }
   if (st.clip.drag) {
     const pt = timelineLocalPoint(e);
+    if (!st.clip.drag.moved && Math.abs(pt.x - st.clip.drag.startX) <= 4) return;
+    st.clip.drag.moved = true;
+    _clipSuppressClick = true;
     const ts = timeline.xToTs(pt.x);
     const part = st.clip.drag.part;
     if (part === "start") {
@@ -3305,8 +3362,17 @@ function endTimelineDrag(e) {
   if (_timelinePointerId != null && e.pointerId != null && e.pointerId !== _timelinePointerId) return;
   releaseTimelinePointer(e);
   _timelinePointerId = null;
+  if (_playheadDrag) {
+    const drag = _playheadDrag;
+    _playheadDrag = null;
+    el.tlCanvas.style.cursor = "";
+    seekToTimestamp(drag.sourceId, drag.ts, { scroll: false });
+    return;
+  }
   if (st.clip.drag) {
+    const moved = st.clip.drag.moved;
     st.clip.drag = null;
+    if (!moved) _clipSuppressClick = false;
     el.tlCanvas.style.cursor = "";
     return;
   }
@@ -3472,8 +3538,12 @@ el.tlCanvas.addEventListener("dblclick", e => {
 let hoverTimer = null;
 el.tlCanvas.addEventListener("mousemove", e => {
   const rect = el.tlCanvas.getBoundingClientRect();
-  if (st.clip.active && !st.clip.drag && !_drag) {
-    const clipHit = timeline.clipHit(e.clientX - rect.left, e.clientY - rect.top);
+  const localX = e.clientX - rect.left;
+  const localY = e.clientY - rect.top;
+  if (!_playheadDrag && timeline.playheadHit(localX, localY)) {
+    el.tlCanvas.style.cursor = "ew-resize";
+  } else if (st.clip.active && !st.clip.drag && !_drag && !_playheadDrag) {
+    const clipHit = timeline.clipHit(localX, localY);
     if (clipHit) el.tlCanvas.style.cursor = clipHit.part === "move" ? "grab" : "ew-resize";
     else el.tlCanvas.style.cursor = "";
   }
