@@ -456,6 +456,18 @@ body {
   cursor: pointer;
   background: var(--bg-stage);
 }
+/* Freeze frame shown while a scrub preview swaps src across segments —
+   without it the <video> paints black during load+seek and a drag across
+   files strobes (perceived as fades). Sits above the videos, below the box
+   canvas, inside the zoom layer so it transforms with the frame. */
+#v2ScrubFreeze {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: none;
+  pointer-events: none;
+}
+
 #v2BoxCanvas {
   position: absolute;
   inset: 0;

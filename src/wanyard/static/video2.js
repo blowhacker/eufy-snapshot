@@ -1260,6 +1260,7 @@ const el = {
   liveBtn: $("v2LiveBtn"),
   stage:   document.querySelector(".v2-stage"),
   stageZoomLayer: $("v2StageZoom"),
+  scrubFreeze: $("v2ScrubFreeze"),
   stageZoomReset: $("v2StageZoomReset"),
   ruler:   $("v2Ruler"),
 };
@@ -3343,10 +3344,14 @@ async function _runPlayheadScrub() {
   state.timer = null;
   const { sourceId, ts } = state;
   const videoVisible = el.video.style.display !== "none";
-  if (videoVisible && player.scrubTo(sourceId, ts)) return;
+  if (videoVisible && player.scrubTo(sourceId, ts)) {
+    unfreezeStageFrame();   // a real frame is presenting again
+    return;
+  }
   state.busy = true;
+  freezeStageFrame();       // cover the black while the src swaps
   try {
-    await seekToTimestamp(sourceId, ts, {
+    const landed = await seekToTimestamp(sourceId, ts, {
       autoplay: false,
       updateHistory: false,
       scroll: false,
@@ -3355,6 +3360,10 @@ async function _runPlayheadScrub() {
       frameClock: "lazy",
       quiet: true,
     });
+    if (landed) unfreezeStageFrame();
+    // on failure (gap under the cursor) keep the frozen frame — better a
+    // stale image than a black hole mid-drag; release or the next
+    // successful preview clears it
   } finally {
     state.busy = false;
     // converge on the latest position if the drag moved during the seek
@@ -3363,6 +3372,32 @@ async function _runPlayheadScrub() {
       _playheadScrub.timer = setTimeout(_runPlayheadScrub, 60);
     }
   }
+}
+
+// Freeze the last painted frame over the stage while a preview seek swaps
+// files: the <video> paints black during load+seek, and a drag across
+// several segments strobes black otherwise (perceived as repeated fades).
+// The canvas mirrors object-fit:contain letterboxing and lives inside the
+// zoom layer, so it transforms with the frame.
+function freezeStageFrame() {
+  const c = el.scrubFreeze, v = el.video;
+  if (!c || !v.videoWidth || v.style.display === "none") return;
+  c.width = v.clientWidth;
+  c.height = v.clientHeight;
+  const scale = Math.min(c.width / v.videoWidth, c.height / v.videoHeight);
+  const rw = v.videoWidth * scale, rh = v.videoHeight * scale;
+  const ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, c.width, c.height);
+  try {
+    ctx.drawImage(v, (c.width - rw) / 2, (c.height - rh) / 2, rw, rh);
+  } catch {
+    return;   // nothing decodable to freeze — leave hidden
+  }
+  c.style.display = "block";
+}
+
+function unfreezeStageFrame() {
+  if (el.scrubFreeze) el.scrubFreeze.style.display = "none";
 }
 
 function cancelPlayheadScrub() {
@@ -3482,7 +3517,8 @@ function endTimelineDrag(e) {
     _playheadDrag = null;
     cancelPlayheadScrub();   // no trailing preview seek after the final one
     el.tlCanvas.style.cursor = "";
-    seekToTimestamp(drag.sourceId, drag.ts, { scroll: false, frameClock: "lazy" });
+    seekToTimestamp(drag.sourceId, drag.ts, { scroll: false, frameClock: "lazy" })
+      .finally(() => unfreezeStageFrame());
     return;
   }
   if (st.clip.drag) {
