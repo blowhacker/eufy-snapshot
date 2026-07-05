@@ -2726,6 +2726,11 @@ function renderSrcCtrl() {
   // watchable on the realtime wall only. Badge the pill and, when selected,
   // explain instead of presenting a dead player.
   const selected = rtsp.find(s => s.id === st.source);
+  el.empty?.classList.remove("live-only");
+  if (el.emptyCta) {           // restore defaults the live-only state overrides
+    el.emptyCta.textContent = "Add your first camera →";
+    el.emptyCta.href = "/settings";
+  }
   if (selected?.record_mode === "live_only") {
     if (el.emptyText) el.emptyText.textContent =
       `${selected.name || selected.id} is live-only — no recordings. Watch it on the realtime wall.`;
@@ -2734,7 +2739,10 @@ function renderSrcCtrl() {
       el.emptyCta.href = "/?view=wall";
       el.emptyCta.hidden = false;
     }
-    if (el.empty) el.empty.style.display = "block";
+    if (el.empty) {
+      el.empty.classList.add("live-only");
+      el.empty.style.display = "flex";   // .empty centers via flex, not block
+    }
   }
 
   const items = rtsp.length > 1 ? [{ id:"all", name:"All" }, ...rtsp] : rtsp;
@@ -3708,7 +3716,7 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   // "Choose a source to start" only makes sense with no source selected. With a
   // source active (e.g. leaving live mid class-filter seek, before the recorded
   // src is set) it wrongly overlays the video — don't show it then.
-  else if (!st.source || st.source === "all") el.empty.style.display = "block";
+  else if (!st.source || st.source === "all") el.empty.style.display = "flex";
   setStatus("REPLAY");
 }
 

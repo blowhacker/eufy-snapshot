@@ -471,6 +471,11 @@ body {
   font: 400 13px var(--font-ui);
   letter-spacing: 0;
 }
+.empty span {
+  text-align: center;
+  max-width: min(70%, 480px);
+  line-height: 1.5;
+}
 .empty-cta {
   margin-top: 4px;
   color: var(--green);
@@ -479,6 +484,10 @@ body {
   opacity: 0.85;
 }
 .empty-cta:hover { opacity: 1; text-decoration: underline; }
+/* Live-only camera: the overlay is the whole page content — make it read
+   like a message, not a footnote. */
+.empty.live-only { font: 500 16px var(--font-ui); color: var(--txt-2); gap: 12px; }
+.empty.live-only .empty-cta { font: 500 15px var(--font-ui); }
 .stage-overlay {
   position: absolute;
   left: 24px;
