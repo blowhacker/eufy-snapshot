@@ -253,6 +253,43 @@ class VideoBitcAnchorTests(unittest.TestCase):
         self.assertGreater(abs(window["start_ts"] - 1_577_836_800.0), 1_000_000.0)
         self.assertTrue(container.closed)
 
+    def test_live_hls_window_uses_sei_before_pixel_fallback(self) -> None:
+        marker_ts = 1_781_700_010.12
+        blank = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
+        container = _FakeContainer([
+            _FakeFrame(blank, pts=100, time_base=Fraction(1, 1000)),
+            _FakeFrame(blank, pts=600, time_base=Fraction(1, 1000)),
+        ])
+
+        with tempfile.TemporaryDirectory(prefix="wanyard-live-window-sei-") as tmp:
+            live_dir = Path(tmp) / "live" / "front"
+            live_dir.mkdir(parents=True)
+            (live_dir / "seg.ts").write_bytes(b"sei")
+            (live_dir / "live.m3u8").write_text(
+                "#EXTM3U\n"
+                "#EXT-X-TARGETDURATION:4\n"
+                "#EXTINF:4.0,\n"
+                "seg.ts\n",
+                encoding="utf-8",
+            )
+
+            fake_av = types.SimpleNamespace(open=lambda _path: container)
+            with (
+                mock.patch.dict(sys.modules, {"av": fake_av}),
+                mock.patch(
+                    "wanyard.sei.decode_frame",
+                    side_effect=[(None, False), (marker_ts, True)],
+                ) as decode_sei,
+                mock.patch("wanyard.bitc.decode", return_value=(None, False)) as decode_pixel,
+            ):
+                window = media_time.live_window(Path(tmp), "front")
+
+        assert window is not None
+        self.assertEqual(decode_sei.call_count, 2)
+        self.assertEqual(decode_pixel.call_count, 1)
+        self.assertAlmostEqual(window["start_ts"], marker_ts - 0.5, places=2)
+        self.assertTrue(container.closed)
+
     def test_hls_frame_read_matches_nearest_decoded_bitc(self) -> None:
         target = 1_781_700_100.0
         early = np.full((64, bitc.WIDTH + 16, 3), 50, dtype=np.uint8)

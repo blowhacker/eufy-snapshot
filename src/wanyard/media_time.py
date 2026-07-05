@@ -261,7 +261,7 @@ def _stream_rate(stream) -> float | None:
 
 def _decode_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
     """Decode one BITC marker and its media offset within an HLS fragment."""
-    from . import bitc
+    from . import bitc, sei
     import av
 
     container = None
@@ -286,8 +286,13 @@ def _decode_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
                     rel = 0.0
                 frame_index += 1
 
-                frame_bgr = frame.to_ndarray(format="bgr24")
-                marker, crc_ok = bitc.decode(frame_bgr)
+                # SEI-copy streams carry the clock in frame side data and do
+                # not have a rendered pixel marker. Re-encoded streams and
+                # existing archives still use the pixel marker fallback.
+                marker, crc_ok = sei.decode_frame(frame)
+                if not crc_ok:
+                    frame_bgr = frame.to_ndarray(format="bgr24")
+                    marker, crc_ok = bitc.decode(frame_bgr)
                 if crc_ok and marker is not None:
                     return _LiveBitcProbe(float(marker), float(rel))
     except Exception:
