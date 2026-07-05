@@ -400,32 +400,42 @@ class VideoBitcAnchorTests(unittest.TestCase):
             self.assertEqual(segment["media_epoch"], 1_781_600_002.0)
 
     def test_yolo_tag_video_stores_decoded_bitc_time(self) -> None:
+        """Pixel-marked segment: backfill reads the marker from the frame,
+        stores its exact time, and masks the strip from YOLO's input.
+        (Reads via PyAV now — cv2 discarded SEI side data — and the clock must
+        sit inside the segment's own span, so the fake epoch matches.)"""
+        import av
+
         unix_seconds = 1_781_600_100.12
-        frame = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
-        bitc.render(frame, bitc.encode_value(unix_seconds))
-        capture = _FakeCapture([frame], [42.0], 1.0)
         model = _FakeModel()
-        db = _FakeVideoDB(media_epoch=1_000.0)
-        fake_cv2 = types.SimpleNamespace(
-            CAP_PROP_POS_MSEC=0,
-            CAP_PROP_FPS=5,
-            VideoCapture=lambda _path: capture,
-        )
+        db = _FakeVideoDB(media_epoch=unix_seconds - 0.5)
+        with tempfile.TemporaryDirectory(prefix="wanyard-yolo-tag-") as tmp:
+            path = Path(tmp) / "segment.mp4"
+            out = av.open(str(path), "w", format="mp4")
+            vs = out.add_stream("libx264", rate=5)
+            vs.width, vs.height, vs.pix_fmt = 640, 360, "yuv420p"
+            vs.options = {"bf": "0", "g": "5", "crf": "18"}
+            img = np.full((360, 640, 3), 180, dtype=np.uint8)
+            bitc.render(img, bitc.encode_value(unix_seconds))
+            for _ in range(3):
+                for p in vs.encode(av.VideoFrame.from_ndarray(img, format="bgr24")):
+                    out.mux(p)
+            for p in vs.encode(None):
+                out.mux(p)
+            out.close()
 
-        with (
-            mock.patch.dict(sys.modules, {"cv2": fake_cv2}),
-            mock.patch("wanyard.video._parse_results", return_value=(False, 0.0, [])),
-        ):
-            stored = _yolo_tag_video(model, Path("segment.mp4"), 7, db)
+            with mock.patch("wanyard.video._parse_results",
+                            return_value=(False, 0.0, [])):
+                stored = _yolo_tag_video(model, path, 7, db)
 
-        self.assertEqual(stored, 1)
+        self.assertEqual(stored, 1)   # 3 frames at 5fps = one 1s sample window
         self.assertEqual(db.scanned, [7])
         assert db.detections is not None
-        self.assertEqual(round(db.detections[0]["abs_ts"] * 100), bitc.encode_value(unix_seconds))
+        self.assertEqual(round(db.detections[0]["abs_ts"] * 100),
+                         bitc.encode_value(unix_seconds))
         self.assertEqual(len(model.frames), 1)
         x0, y0, width, height = bitc.geometry(model.frames[0])
         self.assertTrue(np.all(model.frames[0][y0 : y0 + height, x0 : x0 + width, :] == 0))
-        self.assertTrue(capture.released)
 
 
 class BitcRoundTripInvariantTests(unittest.TestCase):

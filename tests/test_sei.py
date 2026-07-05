@@ -298,5 +298,123 @@ class EndToEndTests(unittest.TestCase):
             self.assertAlmostEqual(abs_ts, values[0] / 100.0, delta=1e-9)
 
 
+class _NoBoxModel:
+    """model.predict stand-in: no detections, records call count."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def predict(self, frame, **kwargs):  # noqa: ARG002
+        self.calls += 1
+        return []
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
+class YoloTagTests(EndToEndTests):
+    """Backfill (_yolo_tag_video) must time frames from the frame itself:
+    SEI first, pixel fallback, and never store an implausible clock."""
+
+    def _db_with_segment(self, tmpdir: Path, mp4_path: Path,
+                         media_epoch: float, duration: float):
+        from wanyard.video import VideoSegmentDB
+
+        db = VideoSegmentDB(tmpdir / "video.db")
+        rel = mp4_path.relative_to(tmpdir).as_posix()
+        seg_id = db.open_segment("cam", rel, media_epoch)
+        db.set_segment_media_start(seg_id, media_epoch)
+        db.close_segment(seg_id, media_epoch + duration, None, None)
+        return db, seg_id
+
+    def _stored_ts(self, db, seg_id: int) -> list[float]:
+        with db._connect() as conn:
+            return [r[0] for r in conn.execute(
+                "SELECT abs_ts FROM video_detections WHERE segment_id=?"
+                " ORDER BY abs_ts", (seg_id,)).fetchall()]
+
+    def _build_pixel_mp4(self, tmpdir: Path, marker_epoch: float) -> Path:
+        """Segment with the legacy burned pixel marker and no SEI."""
+        import av
+        import numpy as np
+
+        from wanyard import bitc
+
+        path = tmpdir / "pixel.mp4"
+        out = av.open(str(path), "w", format="mp4")
+        vs = out.add_stream("libx264", rate=self.FPS)
+        vs.width, vs.height, vs.pix_fmt = 640, 360, "yuv420p"
+        vs.options = {"bf": "0", "g": "5", "crf": "18"}
+        for i in range(12):
+            img = np.full((360, 640, 3), 128, dtype=np.uint8)
+            bitc.render_time(img, marker_epoch + i / self.FPS)
+            frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+            for p in vs.encode(frame):
+                out.mux(p)
+        for p in vs.encode(None):
+            out.mux(p)
+        out.close()
+        return path
+
+    def test_sei_segment_is_timed_from_sei(self) -> None:
+        from wanyard.video import _yolo_tag_video
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            mp4_path, values = self._build_mp4(tmpdir)
+            db, seg_id = self._db_with_segment(
+                tmpdir, mp4_path, self.EPOCH, 1.2)
+
+            model = _NoBoxModel()
+            n = _yolo_tag_video(model, mp4_path, seg_id, db)
+
+            stored = self._stored_ts(db, seg_id)
+            self.assertEqual(n, len(stored))
+            self.assertGreaterEqual(len(stored), 1)
+            # every stored timestamp is an exact SEI value from the file
+            sei_times = {v / 100.0 for v in values}
+            for ts in stored:
+                self.assertIn(round(ts, 2), {round(t, 2) for t in sei_times})
+            self.assertEqual(model.calls, len(stored))
+
+    def test_pixel_fallback_still_works_within_span(self) -> None:
+        from wanyard.video import _yolo_tag_video
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            mp4_path = self._build_pixel_mp4(tmpdir, self.EPOCH)
+            db, seg_id = self._db_with_segment(
+                tmpdir, mp4_path, self.EPOCH, 1.2)
+
+            n = _yolo_tag_video(_NoBoxModel(), mp4_path, seg_id, db)
+
+            stored = self._stored_ts(db, seg_id)
+            self.assertEqual(n, len(stored))
+            self.assertGreaterEqual(len(stored), 1)
+            for ts in stored:
+                self.assertGreaterEqual(ts, self.EPOCH - 0.01)
+                self.assertLessEqual(ts, self.EPOCH + 1.3)
+
+    def test_implausible_clock_is_rejected(self) -> None:
+        """A decoded time far outside the segment span (e.g. a CRC-8 false
+        accept on scene pixels) must never be stored."""
+        from wanyard.video import _yolo_tag_video
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            # marker carries a time 6 days away from the segment's epoch
+            mp4_path = self._build_pixel_mp4(tmpdir, self.EPOCH + 500_000)
+            db, seg_id = self._db_with_segment(
+                tmpdir, mp4_path, self.EPOCH, 1.2)
+
+            n = _yolo_tag_video(_NoBoxModel(), mp4_path, seg_id, db)
+
+            self.assertEqual(n, 0)
+            self.assertEqual(self._stored_ts(db, seg_id), [])
+            with db._connect() as conn:
+                row = conn.execute(
+                    "SELECT scanned_at FROM segments WHERE id=?",
+                    (seg_id,)).fetchone()
+            self.assertIsNotNone(row[0])   # still marked scanned — no respin
+
+
 if __name__ == "__main__":
     unittest.main()

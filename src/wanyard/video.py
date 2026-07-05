@@ -1882,49 +1882,86 @@ def _yolo_tag_video(
     db: VideoSegmentDB,
     predict_lock=None,
 ) -> int:
-    """Read video file at 1fps, run YOLO, store detections in BITC time."""
-    import cv2
+    """Read video file at ~1fps, run YOLO, store detections in BITC time.
 
-    media_epoch = _seg_media_start(db.get_segment(seg_id) or {})
+    Frame time comes from the frame itself: SEI side data first, pixel marker
+    as fallback (re-encode segments and legacy archives). This reads via PyAV
+    because cv2 discards side data — it was structurally blind to the clock on
+    sei_copy segments even though the archive carries it on every frame, and
+    its pixel decoder then ran on real scene content (where the strip used to
+    live), whose occasional CRC-8 false accepts stored detections at garbage
+    timestamps. A plausibility clamp on the segment's own span keeps any
+    surviving false decode from ever writing an out-of-sync row.
+    """
+    import av
+
+    seg_row = db.get_segment(seg_id) or {}
+    media_epoch = _seg_media_start(seg_row)
     if media_epoch is None:
         return 0   # unanchored segment: cannot place frames in BITC time
 
-    cap = cv2.VideoCapture(str(seg_path))
-    if not cap.isOpened():
-        # Sealed MP4 that won't decode (corrupt/zero-frame) won't improve on
+    duration = seg_row.get("duration_sec")
+    if not isinstance(duration, (int, float)) or duration <= 0:
+        duration = _MAX_SEGMENT_SECONDS
+    ts_lo = media_epoch - 5.0
+    ts_hi = media_epoch + float(duration) + 5.0
+
+    try:
+        container = av.open(str(seg_path))
+        video_stream = next(
+            (s for s in container.streams if s.type == "video"), None)
+        if video_stream is None:
+            raise ValueError("no video stream")
+    except Exception:
+        # Sealed MP4 that won't open (corrupt/zero-frame) won't improve on
         # retry — mark it scanned so backfill doesn't re-pick it every loop
         # forever (it kept scanned_at NULL → tight spin). media_epoch-None
         # bails above stay unmarked: those may anchor later.
+        LOG.warning("yolo tag cannot open %s — marking scanned", seg_path.name)
         db.mark_scanned(seg_id)
         return 0
 
-    fps        = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    step       = max(1, int(round(fps)))  # read every Nth frame = 1fps
-    frame_num  = 0
     detections: list[dict] = []
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_num % step == 0:
-            ts_ms  = cap.get(cv2.CAP_PROP_POS_MSEC)
-            ts_off = ts_ms / 1000.0
-            abs_ts, crc_ok = bitc.decode(frame)
-            if not crc_ok or abs_ts is None:
-                frame_num += 1
+    next_sample_pts: float | None = None
+    try:
+        for frame in container.decode(video_stream):
+            fpts = _frame_pts_seconds(frame)
+            if fpts is None:
                 continue
-            bitc.mask(frame)
+            if next_sample_pts is not None and fpts < next_sample_pts:
+                continue
+            next_sample_pts = fpts + 1.0   # ~1fps on the container timeline
+
+            abs_ts, crc_ok = sei.decode_frame(frame)
+            sei_timed = crc_ok
+            frame_bgr = None
+            if not crc_ok:
+                frame_bgr = frame.to_ndarray(format="bgr24")
+                abs_ts, crc_ok = bitc.decode(frame_bgr)
+            if not crc_ok or abs_ts is None:
+                continue
+            if not (ts_lo <= abs_ts <= ts_hi):
+                LOG.warning(
+                    "yolo tag rejected implausible clock %.3f at pts %.1fs "
+                    "in %s (segment spans %.3f..%.3f)",
+                    abs_ts, fpts, seg_path.name, ts_lo, ts_hi,
+                )
+                continue
+            if frame_bgr is None:
+                frame_bgr = frame.to_ndarray(format="bgr24")
+            if not sei_timed:
+                # Only pixel-marked streams have a strip to hide from YOLO.
+                bitc.mask(frame_bgr)
             try:
                 if predict_lock is None:
                     results = model.predict(
-                        frame, classes=_CCTV_CLASS_IDS,
+                        frame_bgr, classes=_CCTV_CLASS_IDS,
                         conf=_CONF_THRESHOLD, verbose=False,
                     )
                 else:
                     with predict_lock:
                         results = model.predict(
-                            frame, classes=_CCTV_CLASS_IDS,
+                            frame_bgr, classes=_CCTV_CLASS_IDS,
                             conf=_CONF_THRESHOLD, verbose=False,
                         )
                 has_human, conf, boxes = _parse_results(results)
@@ -1937,10 +1974,17 @@ def _yolo_tag_video(
                     "classes": classes,
                 })
             except Exception:
-                LOG.exception("yolo tag failed at %.1fs in %s", ts_off, seg_path.name)
-        frame_num += 1
+                LOG.exception("yolo tag failed at %.1fs in %s", fpts, seg_path.name)
+    except Exception:
+        # Decode error mid-file (e.g. truncated tail of a salvaged crash):
+        # keep what decoded cleanly, same spirit as the salvage path.
+        LOG.warning("yolo tag stopped early in %s", seg_path.name, exc_info=True)
+    finally:
+        try:
+            container.close()
+        except Exception:
+            pass
 
-    cap.release()
     db.replace_detections(seg_id, detections)
     db.mark_scanned(seg_id)
     return len(detections)
