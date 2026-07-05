@@ -7,7 +7,12 @@ const {
   resetState,
   zoomAt,
   pinchFactor,
+  ElementZoom,
 } = require("../src/wanyard/static/stage-zoom.js");
+
+test("exports the shared DOM controller used by viewer and wall", () => {
+  assert.equal(typeof ElementZoom, "function");
+});
 
 test("clampState keeps transformed content covering the stage", () => {
   let seed = 0x51f15e;

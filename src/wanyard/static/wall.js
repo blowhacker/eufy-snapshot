@@ -5,6 +5,8 @@
 
 const _hls = [];          // live hls.js instances, for teardown on rebuild
 const _pcs = [];          // live WebRTC peer connections, for teardown
+const _tileZooms = [];    // per-tile zoom controllers + pending navigation cleanup
+let _activeTileZoom = null;
 
 // Mirror video2.js shouldUseNativeHls(): Safari + iOS play HLS natively (no MSE).
 function shouldUseNativeHls() {
@@ -104,23 +106,73 @@ function mkVideo(cls) {
 }
 
 function makeTile(src) {
-  const tile = document.createElement("a");
+  const tile = document.createElement("div");
   tile.className = "tile";
-  // Click-through to the full viewer for this camera (live, person filter).
-  tile.href = `/?source=${encodeURIComponent(src.id)}&live=1&cls=person&zone=none`;
+  const link = document.createElement("a");
+  link.className = "tile-link";
+  link.href = `/?source=${encodeURIComponent(src.id)}&live=1&cls=person&zone=none`;
+  link.setAttribute("aria-label", `Open ${src.name || src.id} live viewer`);
 
   // Two layers: HLS paints instantly (~200ms, the "cache layer"); WebRTC
   // connects behind it and, on its first frame, swaps in for near-zero latency
   // — then HLS is torn down. HLS also stays as the fallback if WebRTC fails.
   const vHls = mkVideo("tile-hls");
   const vRtc = mkVideo("tile-rtc");
+  const zoomLayer = document.createElement("div");
+  zoomLayer.className = "tile-zoom";
+  zoomLayer.append(vHls, vRtc);
 
   const bar = document.createElement("div");
   bar.className = "tile-bar";
   bar.innerHTML = `<span class="dot"></span><span class="name"></span>`;
   bar.querySelector(".name").textContent = src.name || src.id;
 
-  tile.append(vHls, vRtc, bar);
+  const zoomReset = document.createElement("button");
+  zoomReset.type = "button";
+  zoomReset.className = "tile-zoom-reset";
+  zoomReset.title = "Reset zoom";
+  zoomReset.setAttribute("aria-label", `Reset ${src.name || src.id} zoom`);
+  zoomReset.hidden = true;
+
+  tile.append(zoomLayer, link, bar, zoomReset);
+
+  const zoom = new window.WanyardStageZoom.ElementZoom(
+    tile,
+    zoomLayer,
+    zoomReset,
+    () => true,
+    { ignoreSelector: ".tile-zoom-reset" }
+  );
+  let clickTimer = null;
+  const cancelNavigation = () => {
+    clearTimeout(clickTimer);
+    clickTimer = null;
+  };
+  _tileZooms.push({ zoom, cancelNavigation });
+
+  const activateZoom = () => { _activeTileZoom = zoom; };
+  tile.addEventListener("pointerenter", activateZoom);
+  tile.addEventListener("pointerdown", activateZoom);
+  tile.addEventListener("wheel", activateZoom);
+  link.addEventListener("focus", activateZoom);
+
+  // A normal click still opens the viewer. Delay only unmodified left-clicks
+  // long enough to distinguish them from the double-click zoom gesture.
+  link.addEventListener("click", e => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.detail === 0) return;
+    e.preventDefault();
+    if (zoom.consumeJustPanned()) {
+      cancelNavigation();
+      return;
+    }
+    if (e.detail > 1) {
+      cancelNavigation();
+      return;
+    }
+    cancelNavigation();
+    clickTimer = setTimeout(() => location.assign(link.href), 300);
+  });
+  tile.addEventListener("dblclick", cancelNavigation);
 
   const offline = () => { if (!tile.classList.contains("rtc")) tile.classList.add("offline"); };
   // HLS painting = first frame, but NOT green. Green means WebRTC (low latency).
@@ -144,6 +196,12 @@ function makeTile(src) {
 }
 
 function teardown() {
+  while (_tileZooms.length) {
+    const item = _tileZooms.pop();
+    item.cancelNavigation();
+    item.zoom.destroy();
+  }
+  _activeTileZoom = null;
   while (_hls.length) { try { _hls.pop().destroy(); } catch {} }
   while (_pcs.length) { try { _pcs.pop().close(); } catch {} }
   const grid = document.getElementById("wall");
@@ -303,3 +361,18 @@ function notifySetOpen(open) {
   notifyRefresh();
   setInterval(notifyRefresh, NOTIFY_POLL_MS);
 })();
+
+document.addEventListener("keydown", e => {
+  if (!_activeTileZoom || ["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName)) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "+" || e.key === "=") {
+    e.preventDefault();
+    _activeTileZoom.zoomBy(1.4);
+  } else if (e.key === "-") {
+    e.preventDefault();
+    _activeTileZoom.zoomBy(1 / 1.4);
+  } else if (e.key === "0" || (e.key === "Escape" && !_notify.open)) {
+    e.preventDefault();
+    _activeTileZoom.reset();
+  }
+});

@@ -128,6 +128,25 @@ body {
   transition: border-color 120ms;
 }
 .tile:hover { border-color: var(--amber-ring); }
+.tile-zoom {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+.tile-link {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: block;
+  cursor: pointer;
+}
+.tile-zoom.zoomed ~ .tile-link {
+  cursor: grab;
+  touch-action: none;
+}
+.tile-zoom.panning ~ .tile-link { cursor: grabbing; }
 /* Two stacked layers: HLS (instant first paint) and WebRTC (low-latency,
    swaps in on its first frame). Both fill the tile; WebRTC fades over HLS
    once .rtc is set, then HLS is hidden + torn down. */
@@ -150,7 +169,7 @@ body {
 .tile-bar {
   position: absolute;
   left: 0; right: 0; bottom: 0;
-  z-index: 2;
+  z-index: 3;
   padding: 16px 10px 7px;
   display: flex; align-items: center; gap: 7px;
   background: linear-gradient(transparent, var(--bg-stage) 88%);
@@ -167,10 +186,31 @@ body {
 .tile.offline .dot { background: var(--red); }
 .tile-bar .name { font-size: 12px; font-weight: 500; }
 
+.tile-zoom-reset {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 4;
+  min-width: 56px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--r);
+  background: rgba(8, 10, 14, 0.74);
+  color: var(--txt-2);
+  font: 600 11px var(--font-mono);
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+}
+.tile-zoom-reset:hover { color: var(--txt); }
+.tile-zoom-reset[hidden] { display: none; }
+
 .tile.offline::after {
   content: "offline";
   position: absolute; inset: 0;
   display: grid; place-items: center;
+  z-index: 3;
+  pointer-events: none;
   color: var(--txt-3); font-size: 12px;
   background: rgba(6, 8, 11, .55);
 }
