@@ -67,3 +67,14 @@ test("deduplicates fragment events and bounds its live cache", () => {
   assert.equal(clock.timestampForMediaTime(0), null);
   assert.equal(clock.timestampForMediaTime(5.95), 1005.95);
 });
+
+test("loads a finalized MP4 frame-clock sidecar", () => {
+  const clock = new LiveSeiClock();
+  assert.equal(clock.ingestFrameClock([
+    [0.1, 178325558770],
+    [0.15, 178325558775],
+    ["bad", 1],
+  ]), 2);
+  assert.equal(clock.timestampForMediaTime(0.1), 1783255587.7);
+  assert.equal(clock.timestampForMediaTime(0.15), 1783255587.75);
+});

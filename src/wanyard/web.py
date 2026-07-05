@@ -1456,12 +1456,20 @@ def make_app(
         if ".." in rel:
             return Response(status_code=403)
         path = (video_dir / rel).resolve()
+        if not path.is_file() and path.name.endswith(".mp4.clock.json"):
+            media_path = path.with_name(path.name[:-len(".clock.json")])
+            if media_path.is_file() and media_path.suffix.lower() == ".mp4":
+                from .video import _write_mp4_frame_clock
+                await asyncio.to_thread(_write_mp4_frame_clock, media_path)
         if not path.is_file():
             return Response(status_code=404)
         suffix = path.suffix.lower()
-        media = {"mp4": "video/mp4", "jpg": "image/jpeg", "vtt": "text/vtt"}.get(suffix[1:])
+        media = {
+            "mp4": "video/mp4", "jpg": "image/jpeg", "vtt": "text/vtt",
+            "json": "application/json",
+        }.get(suffix[1:])
         headers = {"Accept-Ranges": "bytes"}
-        if suffix == ".mp4":
+        if suffix in {".mp4", ".json"}:
             headers["Cache-Control"] = "no-cache"
         return FileResponse(path, media_type=media, headers=headers)
 
@@ -1797,6 +1805,11 @@ def make_app(
                 if p.exists():
                     deleted_bytes += p.stat().st_size
                     p.unlink()
+                    deleted_files += 1
+                clock = p.with_name(p.name + ".clock.json")
+                if clock.exists():
+                    deleted_bytes += clock.stat().st_size
+                    clock.unlink()
                     deleted_files += 1
                 # Remove spritesheet dir
                 sprite_dir = p.with_suffix("")

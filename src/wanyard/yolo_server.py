@@ -460,6 +460,7 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
     set yet (settings can appear at runtime).
     """
     from .retention import normalize_days, source_cleanup_days
+    from .video import _frame_clock_path
 
     def _get_thresholds():
         # DB overrides env vars
@@ -544,6 +545,10 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
                     if p.exists():
                         freed += p.stat().st_size
                         p.unlink()
+                    clock = _frame_clock_path(p)
+                    if clock.exists():
+                        freed += clock.stat().st_size
+                        clock.unlink()
                     sprite = p.with_suffix("")
                     if sprite.is_dir():
                         import shutil as _sh; _sh.rmtree(sprite, ignore_errors=True)

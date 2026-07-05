@@ -56,6 +56,7 @@ _BITC_ANCHOR_SCAN_SECONDS = 5.0
 _BITC_ANCHOR_SCAN_FRAMES = 150
 _BITC_ZERO_CONTAINER_PTS = "container_pts"
 _BITC_ZERO_FIRST_FRAME = "first_frame"
+_FRAME_CLOCK_VERSION = 1
 _RECORD_RELAY_WAIT_SECONDS = 180.0
 _RECORD_POLL_SECONDS = 5.0
 _RECORD_RETRY_INITIAL_SECONDS = 5.0
@@ -3101,6 +3102,7 @@ class VideoWorker:
                 media_epoch = _decode_bitc_media_epoch(path)
                 if media_epoch is not None:
                     self.db.set_segment_media_start(row["id"], media_epoch)
+                    _write_mp4_frame_clock(path)
                 else:
                     # No readable clock: close the row but keep backfill away,
                     # mirroring the unreadable-marker close path.
@@ -3426,6 +3428,7 @@ class VideoWorker:
                 media_epoch = _decode_bitc_media_epoch(seg_path)
                 if media_epoch is not None:
                     self.db.set_segment_media_start(seg_id, media_epoch)
+                    _write_mp4_frame_clock(seg_path)
                     LOG.info(
                         "BITC-ANCHOR seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
                         seg_id, self.source.id, media_epoch, media_epoch - seg_start,
@@ -3525,6 +3528,72 @@ def _finalize_segment_file(path: Path, *, timeout: float = 300.0) -> bool:
         except OSError:
             pass
         return False
+
+
+def _frame_clock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".clock.json")
+
+
+def _write_mp4_frame_clock(path: Path) -> Path | None:
+    """Persist finalized-MP4 presentation PTS -> SEI BITC mappings.
+
+    Packet scanning is compressed-domain work: no video decode or re-encode.
+    The browser matches requestVideoFrameCallback.mediaTime against these exact
+    PTS values, recovering the SEI belonging to the frame it actually painted.
+    """
+    sidecar = _frame_clock_path(path)
+    try:
+        media_stat = path.stat()
+        if sidecar.is_file() and sidecar.stat().st_mtime_ns >= media_stat.st_mtime_ns:
+            return sidecar
+    except OSError:
+        return None
+
+    container = None
+    try:
+        import av
+
+        container = av.open(str(path))
+        stream = next((s for s in container.streams if s.type == "video"), None)
+        if stream is None:
+            return None
+        by_pts: dict[int, tuple[float, int]] = {}
+        for packet in container.demux(stream):
+            if packet.pts is None or packet.time_base is None or not packet.size:
+                continue
+            value = sei.extract(bytes(packet))
+            if value is None:
+                continue
+            pts = float(packet.pts * packet.time_base)
+            if not math.isfinite(pts):
+                continue
+            by_pts[round(pts * 1_000_000)] = (pts, value)
+        frames = [[round(pts, 9), value] for pts, value in sorted(by_pts.values())]
+        if not frames:
+            sidecar.unlink(missing_ok=True)
+            return None
+
+        payload = {
+            "version": _FRAME_CLOCK_VERSION,
+            "frames": frames,
+        }
+        tmp = sidecar.with_name(f".{sidecar.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            tmp.replace(sidecar)
+        finally:
+            tmp.unlink(missing_ok=True)
+        LOG.info("MP4-FRAME-CLOCK path=%s frames=%d", path, len(frames))
+        return sidecar
+    except Exception:
+        LOG.warning("failed to build MP4 frame clock for %s", path, exc_info=True)
+        return None
+    finally:
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
 
 
 def _decode_bitc_media_epoch(

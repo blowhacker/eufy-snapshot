@@ -90,6 +90,7 @@ class InjectTests(unittest.TestCase):
         out = sei.inject(_annexb_au(with_prefix_nals=False), value)
         self.assertIsNotNone(out)
         self.assertEqual(out[4] & 0x1F, 6)
+        self.assertEqual(sei.extract(out), value)
 
     def test_avcc(self) -> None:
         value = encode_value(1_760_000_000.0)
@@ -102,6 +103,7 @@ class InjectTests(unittest.TestCase):
         # original slice follows intact
         rest = out[4 + first_len:]
         self.assertEqual(rest, au)
+        self.assertEqual(sei.extract(out), value)
 
     def test_no_slice_returns_none(self) -> None:
         value = encode_value(1_760_000_000.0)
@@ -110,6 +112,13 @@ class InjectTests(unittest.TestCase):
 
     def test_garbage_returns_none(self) -> None:
         self.assertIsNone(sei.inject(b"\x12\x34\x56\x78" * 4, 0))
+        self.assertIsNone(sei.extract(b"\x12\x34\x56\x78" * 4))
+
+    def test_extract_ignores_foreign_or_corrupt_sei(self) -> None:
+        value = encode_value(1_760_000_000.0)
+        packet = bytearray(sei.inject(_annexb_au(with_prefix_nals=False), value))
+        packet[4 + 1 + 2] ^= 0xFF
+        self.assertIsNone(sei.extract(bytes(packet)))
 
 
 class StampModeTests(unittest.TestCase):
@@ -246,6 +255,19 @@ class EndToEndTests(unittest.TestCase):
             with av.open(str(mp4_path)) as container:
                 for frame in container.decode(video=0):
                     got.append(sei.decode_value_frame(frame))
+            self.assertEqual(got, values)
+
+    def test_values_are_extractable_from_final_mp4_packets(self) -> None:
+        import av
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mp4_path, values = self._build_mp4(Path(tmpdir))
+            got = []
+            with av.open(str(mp4_path)) as container:
+                stream = container.streams.video[0]
+                for packet in container.demux(stream):
+                    if packet.size:
+                        got.append(sei.extract(bytes(packet)))
             self.assertEqual(got, values)
 
     def test_recorder_anchor_reads_sei(self) -> None:

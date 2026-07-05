@@ -75,6 +75,27 @@
       return added;
     }
 
+    ingestFrameClock(frames) {
+      let added = 0;
+      for (const item of frames || []) {
+        if (!Array.isArray(item) || item.length < 2) continue;
+        const pts = Number(item[0]);
+        const value = Number(item[1]);
+        if (!Number.isFinite(pts) || !Number.isSafeInteger(value) || value < 0) continue;
+        const frame = { pts, value, timestamp: value / 100 };
+        const key = Math.round(pts * 1000000);
+        if (!this.byPts.has(key)) added++;
+        this.byPts.set(key, frame);
+      }
+      if (!added) return 0;
+      this.frames = [...this.byPts.values()].sort((a, b) => a.pts - b.pts);
+      if (this.frames.length > this.maxFrames) {
+        this.frames = this.frames.slice(this.frames.length - this.maxFrames);
+        this.byPts = new Map(this.frames.map(frame => [Math.round(frame.pts * 1000000), frame]));
+      }
+      return added;
+    }
+
     match(mediaTime) {
       const target = Number(mediaTime);
       const frames = this.frames;

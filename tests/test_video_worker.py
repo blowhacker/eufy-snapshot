@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from fractions import Fraction
 from pathlib import Path
 from unittest import mock
 
@@ -14,7 +17,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from wanyard.config import SourceConfig
-from wanyard import video
+from wanyard import sei, video
+from wanyard.bitc import encode_value
 from wanyard.video import VideoWorker
 
 
@@ -29,6 +33,41 @@ class VideoWorkerTests(unittest.TestCase):
             db = mock.Mock()
             db.open_segment_rows.return_value = []   # crash salvage scan
         return VideoWorker(source, video_dir, db)
+
+    def test_mp4_frame_clock_scans_sei_without_decoding(self) -> None:
+        class Packet:
+            def __init__(self, pts: int, value: int) -> None:
+                nal = sei.sei_nal(value)
+                self._data = len(nal).to_bytes(4, "big") + nal
+                self.pts = pts
+                self.time_base = Fraction(1, 1000)
+                self.size = len(self._data)
+
+            def __bytes__(self) -> bytes:
+                return self._data
+
+        values = [encode_value(1_783_000_000.0 + i * 0.05) for i in range(3)]
+        packets = [Packet(100 + i * 50, value) for i, value in enumerate(values)]
+        container = mock.Mock()
+        container.streams = [types.SimpleNamespace(type="video")]
+        container.demux.return_value = packets
+        fake_av = types.SimpleNamespace(open=lambda _path: container)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "segment.mp4"
+            path.write_bytes(b"mp4")
+            with mock.patch.dict(sys.modules, {"av": fake_av}):
+                sidecar = video._write_mp4_frame_clock(path)
+            assert sidecar is not None
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["frames"], [
+            [0.1, values[0]],
+            [0.15, values[1]],
+            [0.2, values[2]],
+        ])
+        container.close.assert_called_once()
 
     def test_stamped_codec_is_reprobed_after_early_exit_invalidation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

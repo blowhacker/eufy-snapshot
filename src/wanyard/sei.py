@@ -99,6 +99,23 @@ def _rbsp_escape(raw: bytes) -> bytes:
     return bytes(out)
 
 
+def _rbsp_unescape(raw: bytes) -> bytes:
+    """Remove H.264 emulation-prevention bytes from an RBSP."""
+    out = bytearray()
+    zeros = 0
+    i = 0
+    while i < len(raw):
+        b = raw[i]
+        if zeros >= 2 and b == 3 and i + 1 < len(raw) and raw[i + 1] <= 3:
+            zeros = 0
+            i += 1
+            continue
+        out.append(b)
+        zeros = zeros + 1 if b == 0 else 0
+        i += 1
+    return bytes(out)
+
+
 def sei_nal(value: int) -> bytes:
     """Raw SEI NAL (no start code / length prefix): header + escaped RBSP."""
     body = build_payload(value)
@@ -159,6 +176,72 @@ def inject(packet_bytes: bytes, value: int) -> bytes | None:
     return None
 
 
+def _value_from_sei_nal(nal: bytes) -> int | None:
+    if not nal or (nal[0] & 0x1F) != _SEI_NAL_TYPE:
+        return None
+    rbsp = _rbsp_unescape(nal[1:])
+    i = 0
+    while i < len(rbsp):
+        payload_type = 0
+        while i < len(rbsp):
+            b = rbsp[i]
+            i += 1
+            payload_type += b
+            if b != 0xFF:
+                break
+        else:
+            return None
+
+        payload_size = 0
+        while i < len(rbsp):
+            b = rbsp[i]
+            i += 1
+            payload_size += b
+            if b != 0xFF:
+                break
+        else:
+            return None
+
+        if payload_size > len(rbsp) - i:
+            return None
+        payload = rbsp[i:i + payload_size]
+        i += payload_size
+        if payload_type == _SEI_TYPE_USER_DATA_UNREGISTERED:
+            value = parse_payload(payload)
+            if value is not None:
+                return value
+    return None
+
+
+def extract(packet_bytes: bytes) -> int | None:
+    """Read our exact centisecond value from one H.264 access unit.
+
+    Accepts the same Annex-B and four-byte AVCC framing as :func:`inject`.
+    This is packet-level and does not decode video, so it is suitable for
+    building a browser frame clock from a finalized MP4.
+    """
+    buf = packet_bytes
+    if buf.startswith(_ANNEXB_PREFIXES[0]) or buf.startswith(_ANNEXB_PREFIXES[1]):
+        offsets = _annexb_nal_offsets(buf)
+        for index, (_start, header) in enumerate(offsets):
+            end = offsets[index + 1][0] if index + 1 < len(offsets) else len(buf)
+            value = _value_from_sei_nal(buf[header:end])
+            if value is not None:
+                return value
+        return None
+
+    i, n = 0, len(buf)
+    while i + 4 <= n:
+        length = int.from_bytes(buf[i:i + 4], "big")
+        if length <= 0 or i + 4 + length > n:
+            return None
+        value = _value_from_sei_nal(buf[i + 4:i + 4 + length])
+        if value is not None:
+            return value
+        i += 4 + length
+    return None
+
+
 # ── Decode side ──────────────────────────────────────────────────────────────
 
 def decode_value_frame(frame) -> int | None:
@@ -201,6 +284,7 @@ __all__ = [
     "parse_payload",
     "sei_nal",
     "inject",
+    "extract",
     "decode_frame",
     "decode_value_frame",
     "encode_value",

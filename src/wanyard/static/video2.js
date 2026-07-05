@@ -15,10 +15,16 @@ class V2Player {
   #bitcEpoch = null;       // recorded clock re-anchored to the burned marker (ground truth)
   #bitcEpochSeg = null;    // seg id the #bitcEpoch was learned for (reset on seg change)
   #lastBitcMs = 0;         // throttle for the per-frame marker decode
+  #frameClock = null;      // finalized MP4 PTS -> exact SEI timestamp
+  #frameClockUrl = null;
+  #clockSource = null;
   #listeners = { timeupdate: new Set(), frame: new Set(), play: new Set(), pause: new Set(), ended: new Set() };
 
   constructor(videoEl) {
     this.#v = videoEl;
+    this.#frameClock = window.WanyardLiveSeiClock
+      ? new window.WanyardLiveSeiClock.LiveSeiClock()
+      : null;
     this.#v.addEventListener("timeupdate", () => this.#emit("timeupdate"));
     this.#v.addEventListener("play",       () => this.#emit("play"));
     this.#v.addEventListener("pause",      () => this.#emit("pause"));
@@ -51,6 +57,7 @@ class V2Player {
     const maxOff = seg.end_ts ? Math.max(0, seg.end_ts - seg.start_ts - 0.5) : Infinity;
     const offset = Math.max(0, Math.min(unix_ts - seg.start_ts, maxOff));
     const url    = `/video/files/${seg.path}`;
+    const frameClockPromise = this.#loadFrameClock(url, signal);
     const actualTs = seg.start_ts + offset;
     const landing = {
       requestedTs: unix_ts,
@@ -77,6 +84,8 @@ class V2Player {
         this.#applyRate();
       }
 
+      if (signal.aborted) return null;
+      await frameClockPromise;
       if (signal.aborted) return null;
 
       this.#activeSeg = seg;
@@ -115,6 +124,7 @@ class V2Player {
     if (!url || !Number.isFinite(mediaEpoch)) return null;
     const maxOff = Number.isFinite(duration) ? Math.max(0, duration - 0.25) : Infinity;
     const startPosition = Math.max(0, Math.min(maxOff, Number(opts.startPosition) || 0));
+    const frameClockPromise = this.#loadFrameClock(url, signal);
 
     const actualTs = mediaEpoch + startPosition;
     const seg = {
@@ -149,6 +159,8 @@ class V2Player {
         this.#applyRate();
       }
 
+      if (signal.aborted) return null;
+      await frameClockPromise;
       if (signal.aborted) return null;
       this.#activeSeg = seg;
       if (Math.abs((this.#v.currentTime || 0) - startPosition) > 0.05) {
@@ -208,10 +220,26 @@ class V2Player {
   get currentTs() {
     const mediaTime = this.#currentMediaTime();
     if (!this.#activeSeg || mediaTime == null) return null;
+    const frameTs = this.#frameClock?.timestampForMediaTime(mediaTime);
+    if (frameTs != null) {
+      this.#clockSource = "sei";
+      return frameTs;
+    }
     // Prefer the marker-anchored epoch (ground truth) over the cached media_epoch
     // (seg start_ts); PDT still wins for live HLS.
+    this.#clockSource = this.#bitcEpoch != null ? "pixel" : "mapped";
     return this.#programDateTimeForMediaTime(mediaTime)
       ?? ((this.#bitcEpoch ?? this.#activeSeg.start_ts) + mediaTime);
+  }
+
+  get frameClockStatus() {
+    return {
+      source: this.#clockSource,
+      url: this.#frameClockUrl,
+      frames: this.#frameClock?.frames.length || 0,
+      mediaTime: this.#currentMediaTime(),
+      timestamp: this.currentTs,
+    };
   }
 
   get currentSeg() {
@@ -253,6 +281,7 @@ class V2Player {
   #syncBitcEpoch(mediaTime, nowMs) {
     const seg = this.#activeSeg;
     if (!seg || !Number.isFinite(seg.start_ts)) return;
+    if (this.#frameClock?.timestampForMediaTime(mediaTime) != null) return;
     if (seg.id !== this.#bitcEpochSeg) {       // new segment → relearn from scratch
       this.#bitcEpoch = null; this.#bitcEpochSeg = seg.id; this.#lastBitcMs = 0;
     }
@@ -295,6 +324,30 @@ class V2Player {
     if (Number.isFinite(n)) return n > 1e11 ? n / 1000 : n;
     const parsed = Date.parse(String(value));
     return Number.isFinite(parsed) ? parsed / 1000 : null;
+  }
+
+  async #loadFrameClock(url, signal) {
+    if (!this.#frameClock) return false;
+    if (this.#frameClockUrl !== url) {
+      this.#frameClock.reset();
+      this.#frameClockUrl = url;
+      this.#clockSource = null;
+    } else if (this.#frameClock.frames.length) {
+      return true;
+    }
+    try {
+      const response = await fetch(`${url}.clock.json`, {
+        cache: "no-store",
+        signal,
+      });
+      if (!response.ok) return false;
+      const payload = await response.json();
+      if (signal.aborted || this.#frameClockUrl !== url || payload?.version !== 1) return false;
+      return this.#frameClock.ingestFrameClock(payload.frames || []) > 0;
+    } catch (error) {
+      if (error?.name !== "AbortError") console.warn("MP4 frame clock unavailable:", url, error);
+      return false;
+    }
   }
 
   #applyRate() {
@@ -1161,6 +1214,7 @@ const el = {
 const player   = new V2Player(el.video);
 const timeline = new V2Timeline(el.tlCanvas);
 const mode     = new AppMode(player);
+window.wanyardRecordedClockStatus = () => player.frameClockStatus;
 mode.onModeChange = next => {
   if (next !== "playlist" && st?.clip?.previewing) {
     setClipPreviewing(false);
