@@ -25,7 +25,10 @@ class VideoWorkerTests(unittest.TestCase):
             name="Camera",
             url="rtsp://camera/stream",
         )
-        return VideoWorker(source, video_dir, db or mock.Mock())
+        if db is None:
+            db = mock.Mock()
+            db.open_segment_rows.return_value = []   # crash salvage scan
+        return VideoWorker(source, video_dir, db)
 
     def test_stamped_codec_is_reprobed_after_early_exit_invalidation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

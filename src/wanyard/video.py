@@ -23,6 +23,9 @@ from . import bitc, sei
 LOG = logging.getLogger(__name__)
 
 _MAX_SEGMENT_SECONDS = 600
+# Open rows younger than this are skipped by crash salvage: the file may
+# still be owned by a live ffmpeg after a watchdog thread restart.
+_SALVAGE_MIN_IDLE_SECONDS = 30.0
 # 1s live segments (was 2): halves the per-segment component of live latency.
 # hls.js rides N segments back from the edge, so smaller segments = closer.
 _LIVE_HLS_SEGMENT_SECONDS = 1
@@ -408,6 +411,16 @@ class VideoSegmentDB:
     def delete_segment(self, segment_id: int) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM segments WHERE id=?", (segment_id,))
+
+    def open_segment_rows(self, source_id: str) -> list[dict]:
+        """All open (end_ts IS NULL) segment rows for a source, oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM segments"
+                " WHERE source_id=? AND end_ts IS NULL ORDER BY start_ts",
+                (source_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def open_live_segment(self, source_id: str) -> dict | None:
         with self._connect() as conn:
@@ -3052,9 +3065,60 @@ class VideoWorker:
                 except OSError:
                     pass
 
+    def _salvage_orphan_segments(self) -> None:
+        """Close out segments a previous crashed run left open.
+
+        Fragmented recording means the file is valid up to its last complete
+        fragment, so a crash costs at most one GOP: finalize the file, anchor
+        it, close the row on the file's mtime (the last moment it was
+        written). Rows touched within the last few seconds are skipped — that
+        file may still be owned by a live ffmpeg (watchdog thread restart);
+        they get salvaged on a later startup instead.
+        """
+        try:
+            rows = self.db.open_segment_rows(self.source.id)
+        except Exception:
+            LOG.exception("salvage scan failed for %s", self.source.id)
+            return
+        for row in rows:
+            path = self.video_dir / row["path"]
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                LOG.warning(
+                    "salvage %s: open segment %s has no file — deleting row",
+                    self.source.id, row["path"],
+                )
+                try:
+                    self.db.delete_segment(row["id"])
+                except Exception:
+                    LOG.exception("salvage row delete failed: %s", row["path"])
+                continue
+            if time.time() - mtime < _SALVAGE_MIN_IDLE_SECONDS:
+                continue
+            try:
+                finalized = _finalize_segment_file(path)
+                media_epoch = _decode_bitc_media_epoch(path)
+                if media_epoch is not None:
+                    self.db.set_segment_media_start(row["id"], media_epoch)
+                else:
+                    # No readable clock: close the row but keep backfill away,
+                    # mirroring the unreadable-marker close path.
+                    self.db.mark_scanned(row["id"])
+                self.db.close_segment(row["id"], mtime, None, None)
+                LOG.warning(
+                    "salvaged crashed segment seg=%d src=%s path=%s "
+                    "finalized=%s anchored=%s",
+                    row["id"], self.source.id, row["path"],
+                    finalized, media_epoch is not None,
+                )
+            except Exception:
+                LOG.exception("salvage failed for %s", row["path"])
+
     def run(self) -> None:
         """Continuous recording loop — call from a daemon thread."""
         LOG.info("continuous recording started: %s", self.source.id)
+        self._salvage_orphan_segments()
         backoff = _RECORD_RETRY_INITIAL_SECONDS
         omit_hvc1_once = False
         while not self._stop.is_set():
@@ -3230,9 +3294,20 @@ class VideoWorker:
                  # monotonic pts that track the markers.
                  "-rtsp_transport", self.source.rtsp_transport,
                  "-i", url,
-                 # Archive: MP4 with faststart
+                 # Archive: fragmented MP4 while recording — moov up front,
+                 # one self-contained fragment per keyframe. The open file is
+                 # readable/probe-able at any instant and a crash loses at
+                 # most one GOP instead of the whole segment (faststart wrote
+                 # the index only at finalize, so a killed writer left an
+                 # unreadable blob). Sealed segments are remuxed to classic
+                 # faststart in _stop_segment for byte-range seeking.
+                 # flush_packets: fragments hit the disk as they complete
+                 # instead of sitting in the 32KB avio buffer — without it a
+                 # crash can still eat several seconds at low bitrates.
                  "-c:v", "copy", *mp4_tag, "-c:a", "aac", "-b:a", "64k",
-                 "-movflags", "+faststart", str(seg_path),
+                 "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                 "-flush_packets", "1",
+                 str(seg_path),
                  # Live: rolling HLS. ffmpeg deletes the active window; startup
                  # pruning clears unreferenced files from older ffmpeg writers.
                  "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
@@ -3265,30 +3340,35 @@ class VideoWorker:
         LOG.info("segment started: %s", rel_path)
 
     def _observe_marker_anchor(self) -> None:
-        """Early open-segment anchor: decode the marker from the first live HLS
-        fragment and set media_epoch provisionally, so the detector stops
-        queueing rows for the whole open segment. This is a BITC-derived
-        temporary player anchor; the close-time decode from the sealed MP4 later
-        overwrites it with the authoritative MP4 player anchor.
+        """Early open-segment anchor: set media_epoch provisionally so the
+        detector stops queueing rows for the whole open segment. The recording
+        is fragmented MP4, readable while open, so decode the segment file
+        itself on the same container-pts basis as the authoritative close-time
+        anchor (which still overwrites this after the faststart remux). Live
+        HLS fragments remain as fallback for a not-yet-readable file.
         """
         seg_id = self._seg_id
         seg_start = self._seg_start
         if not seg_id or not seg_start:
             return
-        try:
-            fragments = sorted(
-                (p for p in self._live_dir.glob("seg_*.ts")
-                 if p.stat().st_mtime >= seg_start - 1.0),
-                key=lambda p: p.stat().st_mtime,
+        media_epoch = None
+        if self._seg_path is not None:
+            media_epoch = _decode_bitc_media_epoch(self._seg_path)
+        if media_epoch is None:
+            try:
+                fragments = sorted(
+                    (p for p in self._live_dir.glob("seg_*.ts")
+                     if p.stat().st_mtime >= seg_start - 1.0),
+                    key=lambda p: p.stat().st_mtime,
+                )
+            except OSError:
+                return
+            if not fragments:
+                return
+            media_epoch = _decode_bitc_media_epoch(
+                fragments[0],
+                playback_zero=_BITC_ZERO_FIRST_FRAME,
             )
-        except OSError:
-            return
-        if not fragments:
-            return
-        media_epoch = _decode_bitc_media_epoch(
-            fragments[0],
-            playback_zero=_BITC_ZERO_FIRST_FRAME,
-        )
         if media_epoch is None:
             return
         try:
@@ -3342,6 +3422,7 @@ class VideoWorker:
                         LOG.exception("failed to remove empty segment: %s", seg_path)
                     return False
 
+                _finalize_segment_file(seg_path)
                 media_epoch = _decode_bitc_media_epoch(seg_path)
                 if media_epoch is not None:
                     self.db.set_segment_media_start(seg_id, media_epoch)
@@ -3399,6 +3480,50 @@ class VideoWorker:
                 )
                 return False
             self._stop.wait(min(1.0, remaining))
+        return False
+
+
+def _finalize_segment_file(path: Path, *, timeout: float = 300.0) -> bool:
+    """Remux a fragmented recording into a classic faststart MP4, atomically.
+
+    Recording writes fragmented MP4 (crash-safe, readable while open), but
+    browsers seek unindexed fragmented files poorly over HTTP ranges — they
+    fetch sequentially hunting for the target. Sealed archives therefore get
+    the moov-up-front layout this recorder always produced. Stream copy, all
+    streams mapped, timestamps preserved; the close-time anchor is computed
+    AFTER this remux, on the exact file browsers will play.
+
+    On any failure the fragmented original stays in place — playable, worse
+    seeking. Footage is never sacrificed to a failed polish step.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    tmp = path.with_name(path.name + ".faststart.tmp")
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+             "-i", str(path), "-map", "0", "-c", "copy",
+             "-movflags", "+faststart", "-f", "mp4", str(tmp)],
+            capture_output=True, timeout=timeout,
+        )
+        if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            LOG.warning(
+                "faststart remux failed for %s (rc=%s): %s — keeping "
+                "fragmented file", path, proc.returncode,
+                proc.stderr.decode("utf-8", "replace")[-500:],
+            )
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(path)
+        return True
+    except Exception:
+        LOG.exception("faststart remux failed for %s — keeping fragmented file",
+                      path)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return False
 
 
