@@ -246,6 +246,43 @@ class V2Player {
     return this.#activeSeg;
   }
 
+  // ── Scrub (drag preview) ──────────────────────────────
+  // Cheap intra-file seek for playhead dragging: no resolve round-trip, no
+  // src swap — just currentTime on the loaded file. Frame-exact inverse of
+  // currentTs via the SEI frame clock when loaded, else the same epoch
+  // mapping currentTs falls back to. Returns false when the target lies
+  // outside the loaded file (caller does a full seek).
+  scrubTo(sourceId, unixTs) {
+    const seg = this.#activeSeg;
+    const ts = Number(unixTs);
+    if (!seg || !Number.isFinite(ts)) return false;
+    if (sourceId && seg.source_id && seg.source_id !== sourceId) return false;
+    let mediaTime = null;
+    const frames = this.#frameClock?.frames || [];
+    if (frames.length) {
+      // frames sorted by pts, timestamps nondecreasing — nearest by time
+      let lo = 0, hi = frames.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (frames[mid].timestamp < ts) lo = mid + 1; else hi = mid;
+      }
+      const cand = [frames[lo], frames[lo - 1]].filter(Boolean).sort(
+        (a, b) => Math.abs(a.timestamp - ts) - Math.abs(b.timestamp - ts))[0];
+      if (cand && Math.abs(cand.timestamp - ts) <= 2.0) mediaTime = cand.pts;
+    }
+    if (mediaTime == null) {
+      mediaTime = ts - (this.#bitcEpoch ?? seg.start_ts);
+    }
+    if (!Number.isFinite(mediaTime)) return false;
+    const dur = Number.isFinite(this.#v.duration) ? this.#v.duration : null;
+    if (mediaTime < -0.5 || (dur != null && mediaTime > dur + 0.5)) return false;
+    const clamped = Math.max(0, dur != null
+      ? Math.min(mediaTime, Math.max(0, dur - 0.05)) : mediaTime);
+    this.#v.currentTime = clamped;
+    this.#presentedMediaTime = clamped;
+    return true;
+  }
+
   // ── Clip playlist — returns PlaylistHandle ────────────
   playClips(clips, startIdx = 0) {
     const handle = new PlaylistHandle(this, clips, startIdx);
@@ -2467,7 +2504,10 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
       }
     }
 
-    const liveOk = await seekLiveTimestamp(srcId, lookupTs, desiredTs);
+    // liveFallback:false = recorded-only (playhead drag preview must never
+    // start the live tail mid-drag).
+    const liveOk = options.liveFallback !== false
+      && await seekLiveTimestamp(srcId, lookupTs, desiredTs);
     if (seq !== absoluteSeekSeq) return false;
     if (liveOk) {
       if (options.scroll) scrollTimelineToTs(scrollTs);
@@ -3272,12 +3312,59 @@ function clipConstrainedTs(ts) {
   return next;
 }
 
+// Scrub while dragging: show the frame under the playhead as it moves.
+// Cheap path (player.scrubTo, plain currentTime on the loaded file) runs
+// per tick; leaving the loaded file falls back to a throttled full seek
+// (paused, recorded-only, no history). Trailing re-run: only one full seek
+// in flight, always converging on the LATEST dragged position.
+let _playheadScrub = null;   // { timer, busy, ts, sourceId }
+
+function schedulePlayheadScrub(sourceId, ts) {
+  if (!_playheadScrub) _playheadScrub = { timer: null, busy: false };
+  _playheadScrub.ts = ts;
+  _playheadScrub.sourceId = sourceId;
+  if (_playheadScrub.timer || _playheadScrub.busy) return;
+  _playheadScrub.timer = setTimeout(_runPlayheadScrub, 90);
+}
+
+async function _runPlayheadScrub() {
+  const state = _playheadScrub;
+  if (!state) return;
+  state.timer = null;
+  const { sourceId, ts } = state;
+  const videoVisible = el.video.style.display !== "none";
+  if (videoVisible && player.scrubTo(sourceId, ts)) return;
+  state.busy = true;
+  try {
+    await seekToTimestamp(sourceId, ts, {
+      autoplay: false,
+      updateHistory: false,
+      scroll: false,
+      retries: 0,
+      liveFallback: false,
+    });
+  } finally {
+    state.busy = false;
+    // converge on the latest position if the drag moved during the seek
+    if (_playheadDrag && _playheadScrub && _playheadScrub.ts !== ts
+        && !_playheadScrub.timer) {
+      _playheadScrub.timer = setTimeout(_runPlayheadScrub, 60);
+    }
+  }
+}
+
+function cancelPlayheadScrub() {
+  if (_playheadScrub?.timer) clearTimeout(_playheadScrub.timer);
+  _playheadScrub = null;
+}
+
 function updatePlayheadDrag(x) {
   if (!_playheadDrag) return;
   const ts = clipConstrainedTs(timeline.xToTs(x));
   _playheadDrag.ts = ts;
   timeline.setPlayhead(ts);
   setTimestampChip(ts, _playheadDrag.sourceId, false);
+  schedulePlayheadScrub(_playheadDrag.sourceId, ts);
 }
 
 function beginTimelineDrag(e) {
@@ -3381,6 +3468,7 @@ function endTimelineDrag(e) {
   if (_playheadDrag) {
     const drag = _playheadDrag;
     _playheadDrag = null;
+    cancelPlayheadScrub();   // no trailing preview seek after the final one
     el.tlCanvas.style.cursor = "";
     seekToTimestamp(drag.sourceId, drag.ts, { scroll: false });
     return;
