@@ -383,6 +383,49 @@ class VideoBitcAnchorTests(unittest.TestCase):
         boxes = json.loads(resolved["boxes_json"])
         self.assertEqual(boxes[0]["cls"], "person")
 
+    def test_dead_notification_ref_re_resolves_to_nearest_detection(self) -> None:
+        """Backfill's replace_detections churns detection ids; a notification's
+        d:<id> ref must re-resolve via (source, time) to an equivalent row."""
+        base = 1_781_600_000.0
+        with tempfile.TemporaryDirectory(prefix="wanyard-video-db-") as tmp:
+            db = VideoSegmentDB(Path(tmp) / "video.sqlite")
+            seg_id = db.open_segment("front", "front/seg.mp4", base)
+            db.set_segment_media_start(seg_id, base)
+            db.close_segment(seg_id, base + 60, None, None)
+            # the replacement detection: same instant, new id
+            db.insert_live_detections(seg_id, "front", [{
+                "abs_ts": base + 10.4, "has_human": True, "confidence": 0.9,
+                "boxes": [{"x1": 0.1, "y1": 0.1, "x2": 0.4, "y2": 0.6,
+                           "conf": 0.9, "cls": "person"}],
+                "classes": ["person"],
+            }])
+            with db._connect() as conn:
+                rule_id = conn.execute(
+                    "INSERT INTO notification_rules(name, source_id)"
+                    " VALUES('r','front')").lastrowid
+                conn.execute(
+                    "INSERT INTO notification_events"
+                    " (rule_id, rule_name, source_id, zone_ref, event_ref,"
+                    "  event_ts, class, title, body)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
+                    (rule_id, "r", "front", "whole_frame", "d:999999",
+                     base + 10.0, "person", "t", "b"),
+                )
+
+            # the referenced id 999999 does not exist — re-resolution kicks in
+            self.assertIsNone(db.get_event_with_segment("d:999999"))
+            evt = db.event_like_for_notification_ref("d:999999")
+            self.assertIsNotNone(evt)
+            self.assertEqual(evt["seg_path"], "front/seg.mp4")
+            self.assertAlmostEqual(evt["abs_ts"], base + 10.4, delta=1e-6)
+            self.assertEqual(evt["seg_media_epoch"], base)
+
+            # outside tolerance -> no stand-in
+            self.assertIsNone(
+                db.event_like_for_notification_ref("d:999999", tolerance=0.2))
+            # unknown ref -> None
+            self.assertIsNone(db.event_like_for_notification_ref("d:1"))
+
     def test_segment_media_start_is_exact_assignment(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wanyard-video-db-") as tmp:
             db = VideoSegmentDB(Path(tmp) / "video.sqlite")

@@ -307,12 +307,18 @@ def _live_thumb_cache_put(key: tuple, data: bytes | None) -> None:
 
 def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
                         box: dict, max_drift: float = 0.5) -> bytes | None:
-    """Find the live HLS .ts fragment frame whose BITC marker is closest to
-    ``ts`` and crop ``box`` from it. Returns JPEG bytes or None if no suitable
-    frame is found."""
-    import cv2
+    """Find the live HLS fragment frame whose clock is closest to ``ts`` and
+    crop ``box`` from it. Returns JPEG bytes or None.
 
-    from . import bitc, media_time
+    The frame clock is read SEI-first (sei_copy streams have no pixel marker;
+    cv2 discarded side data, which left this returning None for every frame),
+    pixel marker as fallback for re-encode streams. Every returned frame is
+    verified against its own clock, so a false pixel CRC outside ``max_drift``
+    can never produce a wrong-moment thumb.
+    """
+    import av
+
+    from . import bitc, media_time, sei
     from .yolo_server import _crop_thumb
 
     live_dir = (video_dir / "live" / source_id).resolve()
@@ -330,9 +336,9 @@ def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
             if segment["start_ts"] - 0.5 <= ts <= segment["end_ts"] + 0.5:
                 candidates.append(live_dir / segment["uri"])
     if not candidates:
-        # Fallback for pre-BITC or temporarily undecodable playlists. Fragment
-        # mtimes are only an operational hint; every returned frame is still
-        # verified against the burned marker below.
+        # Fallback for temporarily undecodable playlists. Fragment mtimes are
+        # only an operational hint; every returned frame is still verified
+        # against its own clock below.
         all_frags = sorted(live_dir.glob("seg_*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
         candidates = [
             p for p in all_frags
@@ -341,36 +347,48 @@ def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
     if not candidates:
         return None
 
-    best_frame = None
+    best_frame = None       # bgr ndarray
+    best_sei_timed = True
     best_diff = max_drift
     for p in candidates[:4]:
-        cap = cv2.VideoCapture(str(p))
-        if not cap.isOpened():
-            cap.release()
+        try:
+            container = av.open(str(p))
+        except Exception:
             continue
         try:
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                marker, crc_ok = bitc.decode(frame)
+            for frame in container.decode(video=0):
+                marker, crc_ok = sei.decode_frame(frame)
+                sei_timed = crc_ok
+                frame_bgr = None
+                if not crc_ok:
+                    frame_bgr = frame.to_ndarray(format="bgr24")
+                    marker, crc_ok = bitc.decode(frame_bgr)
                 if not crc_ok or marker is None:
                     continue
                 diff = abs(marker - ts)
                 if diff < best_diff:
                     best_diff = diff
-                    best_frame = frame
+                    best_frame = (frame_bgr if frame_bgr is not None
+                                  else frame.to_ndarray(format="bgr24"))
+                    best_sei_timed = sei_timed
                     if diff < 0.02:
                         break
+        except Exception:
+            LOG.debug("live thumb decode failed for %s", p, exc_info=True)
         finally:
-            cap.release()
+            try:
+                container.close()
+            except Exception:
+                pass
         if best_frame is not None and best_diff < 0.02:
             break
 
     if best_frame is None:
         return None
 
-    bitc.mask(best_frame)
+    if not best_sei_timed:
+        # Only pixel-marked streams have a strip to hide from the crop.
+        bitc.mask(best_frame)
     cls = str(box.get("cls") or "")
     return _crop_thumb(best_frame, [box], cls)
 
@@ -559,6 +577,12 @@ def make_app(
         if not video_dir or not video_db:
             return Response(status_code=404)
         evt = await asyncio.to_thread(video_db.get_event_with_segment, event_id_raw)
+        if not evt:
+            # Backfill re-inserts detection rows under new ids, orphaning a
+            # notification's d:<id> ref. Re-resolve by the notification's own
+            # (source, time) — an equivalent detection usually exists.
+            evt = await asyncio.to_thread(
+                video_db.event_like_for_notification_ref, event_id_raw)
         if not evt:
             return Response(status_code=404)
 

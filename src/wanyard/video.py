@@ -1388,6 +1388,42 @@ class VideoSegmentDB:
         rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
         return rows[:limit]
 
+    def event_like_for_notification_ref(self, event_ref: str,
+                                        tolerance: float = 2.0) -> dict | None:
+        """Best current stand-in for a notification's dead event ref.
+
+        Backfill's replace_detections re-inserts a segment's rows under new
+        ids, so a notification's ``d:<id>`` ref can stop resolving while an
+        equivalent detection (same source, same instant, fresh id) exists.
+        Re-resolve by the notification's own (source_id, event_ts): nearest
+        detection within ``tolerance`` seconds, shaped like
+        :meth:`get_event_with_segment`.
+        """
+        with self._connect() as conn:
+            notif = conn.execute(
+                "SELECT source_id, event_ts FROM notification_events"
+                " WHERE event_ref=? ORDER BY id DESC LIMIT 1",
+                (event_ref,),
+            ).fetchone()
+            if notif is None:
+                return None
+            row = conn.execute(
+                "SELECT vd.boxes_json AS boxes_json, vd.confidence AS confidence,"
+                " vd.abs_ts AS abs_ts,"
+                " s.path AS seg_path,"
+                " s.media_epoch AS seg_media_epoch,"
+                " s.end_ts AS seg_end_ts,"
+                " NULL AS class"
+                " FROM video_detections vd JOIN segments s ON s.id=vd.segment_id"
+                " WHERE vd.source_id=? AND vd.abs_ts BETWEEN ? AND ?"
+                " ORDER BY ABS(vd.abs_ts - ?) LIMIT 1",
+                (notif["source_id"],
+                 float(notif["event_ts"]) - tolerance,
+                 float(notif["event_ts"]) + tolerance,
+                 float(notif["event_ts"])),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_event_with_segment(self, event_id) -> dict | None:
         raw_id = str(event_id)
         if raw_id.startswith("d:"):
