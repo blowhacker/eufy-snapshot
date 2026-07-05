@@ -450,8 +450,16 @@ def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event
 # ── Auto-cleanup loop ──────────────────────────────────────────────────────────
 
 def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
-    """Periodically delete old footage based on CLEANUP_DAYS / CLEANUP_MAX_GB."""
-    import shutil as _shutil
+    """Periodically delete old footage based on CLEANUP_DAYS / CLEANUP_MAX_GB.
+
+    ``cleanup_days`` is the global max age; per-camera overrides
+    (``cleanup_days_source:<id>``) win over it, and a camera with neither is
+    never age-pruned. ``cleanup_max_gb`` stays global — disk pressure is a
+    host property — deleting oldest-overall regardless of source. Thresholds
+    are re-read every cycle, so the loop must keep running even when none are
+    set yet (settings can appear at runtime).
+    """
+    from .retention import normalize_days, source_cleanup_days
 
     def _get_thresholds():
         # DB overrides env vars
@@ -463,80 +471,112 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
         if gb is None:
             g = os.environ.get("CLEANUP_MAX_GB", "")
             gb = float(g) if g else None
-        return days, gb
+        return normalize_days(days), gb
 
-    cleanup_days, cleanup_gb = _get_thresholds()
-    if not cleanup_days and not cleanup_gb:
-        LOG.info("no cleanup thresholds set — auto-cleanup disabled")
-        return
-    LOG.info("auto-cleanup: days=%s max_gb=%s", cleanup_days, cleanup_gb)
-
+    LOG.info("auto-cleanup loop started")
     while not stop_event.is_set():
         try:
-            cutoff_ts = time.time() - (cleanup_days * 86400) if cleanup_days else None
+            cleanup_days, cleanup_gb = _get_thresholds()
+            day_overrides = source_cleanup_days(video_db)
+            now = time.time()
+
             total_used = sum(
                 f.stat().st_size for f in video_dir.rglob("*.mp4") if f.is_file()
             ) if cleanup_gb else 0
+            over_gb = bool(cleanup_gb) and total_used > cleanup_gb * 1e9
 
-            if cutoff_ts or (cleanup_gb and total_used > cleanup_gb * 1e9):
-                with video_db._connect() as conn:
-                    where = "end_ts IS NOT NULL"
-                    params = []
-                    if cutoff_ts:
-                        where += " AND end_ts < ?"
-                        params.append(cutoff_ts)
-                    elif cleanup_gb and total_used > cleanup_gb * 1e9:
-                        # Delete oldest segments until under limit
-                        where += " AND end_ts < (SELECT AVG(end_ts) FROM segments WHERE end_ts IS NOT NULL)"
-                    segs = [dict(r) for r in conn.execute(
-                        f"SELECT id, path, end_ts FROM segments WHERE {where}", params
+            # Per-source age horizon (override wins over global). Notification
+            # expiry uses the same horizons, scoped by source so a 1-day
+            # camera's cleanup can never wipe a 30-day camera's notifications.
+            override_ids = sorted(day_overrides)
+            horizons = {sid: now - days * 86400
+                        for sid, days in day_overrides.items()}
+
+            segs = []
+            with video_db._connect() as conn:
+                if cleanup_days is not None:
+                    pl = ",".join("?" * len(override_ids))
+                    not_in = f" AND source_id NOT IN ({pl})" if override_ids else ""
+                    segs += [dict(r) for r in conn.execute(
+                        "SELECT id, path, end_ts, source_id FROM segments"
+                        f" WHERE end_ts IS NOT NULL AND end_ts < ?{not_in}",
+                        [now - cleanup_days * 86400, *override_ids],
                     ).fetchall()]
+                for sid in override_ids:
+                    segs += [dict(r) for r in conn.execute(
+                        "SELECT id, path, end_ts, source_id FROM segments"
+                        " WHERE end_ts IS NOT NULL AND end_ts < ? AND source_id = ?",
+                        [horizons[sid], sid],
+                    ).fetchall()]
+                if over_gb:
+                    # Delete oldest segments until under limit
+                    segs += [dict(r) for r in conn.execute(
+                        "SELECT id, path, end_ts, source_id FROM segments"
+                        " WHERE end_ts IS NOT NULL AND end_ts <"
+                        " (SELECT AVG(end_ts) FROM segments WHERE end_ts IS NOT NULL)"
+                    ).fetchall()]
+            # A segment can match both the days and the GB pass.
+            segs = list({s["id"]: s for s in segs}.values())
 
-                freed = 0
+            # Notification horizon per source: the configured age horizon
+            # where one exists; under GB pressure additionally the newest
+            # end_ts deleted for that source (footage is gone either way).
+            notif_cutoffs = dict(horizons)
+            if cleanup_days is not None:
+                global_cutoff = now - cleanup_days * 86400
+                with video_db._connect() as conn:
+                    for (sid,) in conn.execute(
+                        "SELECT DISTINCT source_id FROM notification_events"
+                    ).fetchall():
+                        notif_cutoffs.setdefault(sid, global_cutoff)
+            if over_gb:
                 for seg in segs:
-                    p = video_dir / seg["path"]
-                    try:
-                        if p.exists():
-                            freed += p.stat().st_size
-                            p.unlink()
-                        sprite = p.with_suffix("")
-                        if sprite.is_dir():
-                            import shutil as _sh; _sh.rmtree(sprite, ignore_errors=True)
-                    except Exception:
-                        pass
+                    if seg.get("end_ts"):
+                        sid = seg["source_id"]
+                        notif_cutoffs[sid] = max(
+                            notif_cutoffs.get(sid, 0.0), float(seg["end_ts"])
+                        )
 
-                if segs:
-                    # Notifications point at footage; expire them on the same
-                    # horizon so none outlive the segment/event they reference.
-                    # In GB-only mode there is no time cutoff, so derive one
-                    # from the newest segment we just removed.
-                    notif_cutoff = cutoff_ts
-                    if notif_cutoff is None:
-                        ends = [float(s["end_ts"]) for s in segs if s.get("end_ts")]
-                        notif_cutoff = max(ends) if ends else None
-                    with video_db._connect() as conn:
+            freed = 0
+            for seg in segs:
+                p = video_dir / seg["path"]
+                try:
+                    if p.exists():
+                        freed += p.stat().st_size
+                        p.unlink()
+                    sprite = p.with_suffix("")
+                    if sprite.is_dir():
+                        import shutil as _sh; _sh.rmtree(sprite, ignore_errors=True)
+                except Exception:
+                    pass
+
+            if segs or notif_cutoffs:
+                with video_db._connect() as conn:
+                    if segs:
                         ids = [s["id"] for s in segs]
                         pl  = ",".join("?" * len(ids))
                         conn.execute(f"DELETE FROM video_events WHERE segment_id IN ({pl})", ids)
                         conn.execute(f"DELETE FROM object_events WHERE segment_id IN ({pl})", ids)
                         conn.execute(f"DELETE FROM video_detections WHERE segment_id IN ({pl})", ids)
                         conn.execute(f"DELETE FROM segments WHERE id IN ({pl})", ids)
-                        if notif_cutoff is not None:
-                            conn.execute(
-                                "DELETE FROM notification_events WHERE event_ts < ?",
-                                (notif_cutoff,),
-                            )
-                            conn.execute(
-                                "DELETE FROM notification_confirmations WHERE event_ts < ?",
-                                (notif_cutoff,),
-                            )
-                    LOG.info("auto-cleanup: deleted %d segments, freed %.1f GB",
-                             len(segs), freed / 1e9)
+                    for sid, cutoff in notif_cutoffs.items():
+                        conn.execute(
+                            "DELETE FROM notification_events"
+                            " WHERE source_id = ? AND event_ts < ?",
+                            (sid, cutoff),
+                        )
+                        conn.execute(
+                            "DELETE FROM notification_confirmations"
+                            " WHERE source_id = ? AND event_ts < ?",
+                            (sid, cutoff),
+                        )
+            if segs:
+                LOG.info("auto-cleanup: deleted %d segments, freed %.1f GB",
+                         len(segs), freed / 1e9)
         except Exception:
             LOG.exception("auto-cleanup error")
 
         stop_event.wait(3600)
-        cleanup_days, cleanup_gb = _get_thresholds()  # re-read in case UI changed them
 
     LOG.info("auto-cleanup loop stopped")
 

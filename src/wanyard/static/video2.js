@@ -2722,6 +2722,21 @@ function renderSrcCtrl() {
   if (el.emptyCta)  el.emptyCta.hidden = !!rtsp.length;
   if (!rtsp.length) return;
 
+  // Live-only cameras have no recorder (no DVR, no live HLS here) — they are
+  // watchable on the realtime wall only. Badge the pill and, when selected,
+  // explain instead of presenting a dead player.
+  const selected = rtsp.find(s => s.id === st.source);
+  if (selected?.record_mode === "live_only") {
+    if (el.emptyText) el.emptyText.textContent =
+      `${selected.name || selected.id} is live-only — no recordings. Watch it on the realtime wall.`;
+    if (el.emptyCta) {
+      el.emptyCta.textContent = "Open live wall →";
+      el.emptyCta.href = "/?view=wall";
+      el.emptyCta.hidden = false;
+    }
+    if (el.empty) el.empty.style.display = "block";
+  }
+
   const items = rtsp.length > 1 ? [{ id:"all", name:"All" }, ...rtsp] : rtsp;
   items.forEach(s => {
     const b = document.createElement("button");
@@ -2730,6 +2745,13 @@ function renderSrcCtrl() {
     const label = document.createElement("span");
     label.textContent = s.name || s.id;
     b.appendChild(label);
+    if (s.record_mode === "live_only") {
+      const tag = document.createElement("span");
+      tag.className = "lo-tag";
+      tag.textContent = "live-only";
+      b.appendChild(tag);
+      b.title = "Live-only camera — realtime wall only, no recordings";
+    }
     if (s.id !== "all") {
       const dot = document.createElement("span");
       dot.className = "dot";

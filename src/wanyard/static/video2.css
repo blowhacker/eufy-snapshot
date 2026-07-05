@@ -142,6 +142,16 @@ body {
 }
 .ab-src-pills .ab-src-pill .dot.buffering { background: var(--amber); }
 .ab-src-pills .ab-src-pill .dot.offline   { background: var(--red); }
+.ab-src-pills .ab-src-pill .lo-tag {
+  font: 500 9px var(--font-ui);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  color: var(--txt-3);
+  margin-left: 2px;
+}
 .ab-status {
   display: flex;
   align-items: center;

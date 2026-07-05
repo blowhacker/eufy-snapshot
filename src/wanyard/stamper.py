@@ -692,10 +692,34 @@ class _StamperSupervisor:
             source_db_path=self.source_db_path,
         )
 
+    def _live_only(self, source_id: str) -> bool:
+        """True when the camera is view-only (realtime wall, no pipeline).
+
+        Skipping the stamp saves an NVENC session + CPU, and because the live
+        detector only follows ``-stamped`` relay paths it also disables
+        detection/notifications for the camera — intended: live_only cameras
+        produce no footage for notifications to point at. Any settings error
+        defaults to stamping (never silently drop a recorded camera).
+        """
+        if self.source_db_path is None:
+            return False
+        try:
+            from .db import SourceDB
+            from .retention import is_live_only
+
+            return is_live_only(SourceDB(Path(self.source_db_path)), source_id)
+        except Exception:
+            LOG.warning("record-mode lookup failed for %s", source_id, exc_info=True)
+            return False
+
     def _sync_paths(self) -> None:
-        # Source paths only — never stamp our own output (would loop).
+        # Source paths only — never stamp our own output (would loop) — and
+        # only cameras that record: live_only paths get no stamper worker, so
+        # no -stamped output, no recorder input, no detection. A mode flip is
+        # picked up by the periodic path refresh; the removed-path diff below
+        # stops the worker of a camera that just went live_only.
         paths = {p for p in _list_relay_paths(self.relay_host)
-                 if not p.endswith(_STAMPED_SUFFIX)}
+                 if not p.endswith(_STAMPED_SUFFIX) and not self._live_only(p)}
         for source_id in sorted(paths - set(self.workers)):
             worker = self._make_worker(source_id)
             self.workers[source_id] = worker

@@ -904,19 +904,124 @@ document.getElementById('notifySource').addEventListener('change', e => {
   populateNotifyZones(e.target.value, 'whole_frame');
 });
 
-// ── Auto-cleanup ──────────────────────────────────────
+// ── Auto-cleanup / per-camera retention ───────────────
+let _retention = null;
+const RETENTION_DAY_CHOICES = [1, 2, 3, 7, 14, 30, 60, 90];
+
+function retentionDaysLabel(days) {
+  if (days == null) return 'forever';
+  return days === 1 ? '1 day' : `${days} days`;
+}
+
+function updateRetentionPreview() {
+  const globalRaw = document.getElementById('autoDays')?.value.trim();
+  const globalDays = globalRaw ? parseFloat(globalRaw) : null;
+  document.querySelectorAll('[data-retention-source]').forEach(select => {
+    const sourceId = select.dataset.retentionSource;
+    const globalOption = select.querySelector('option[value="global"]');
+    if (globalOption) globalOption.textContent = `Use global (${retentionDaysLabel(globalDays)})`;
+    const mode = document.querySelector(`[data-record-mode-source="${CSS.escape(sourceId)}"]`)?.value;
+    const detail = document.querySelector(`[data-retention-detail="${CSS.escape(sourceId)}"]`);
+    if (!detail) return;
+    if (mode === 'live_only') {
+      detail.textContent = 'Realtime page only — no recording, no detection';
+      return;
+    }
+    const days = select.value === 'global' ? globalDays : parseFloat(select.value);
+    detail.textContent = `Keeps footage ${days == null ? 'forever' : retentionDaysLabel(days)}`;
+  });
+}
+
+function renderRetention() {
+  const table = document.getElementById('retentionTable');
+  if (!table || !_retention) return;
+  const sources = _retention.sources || _sources || [];
+  table.innerHTML = '';
+  if (!sources.length) {
+    table.innerHTML = '<tr><td colspan="3" class="s-quality-empty">No cameras configured.</td></tr>';
+    return;
+  }
+  sources.forEach(source => {
+    const sourceId = source.id;
+    const row = document.createElement('tr');
+
+    const camera = document.createElement('td');
+    camera.dataset.label = 'Camera';
+    const name = document.createElement('span');
+    name.className = 's-quality-camera';
+    name.textContent = source.name || sourceId;
+    const id = document.createElement('span');
+    id.className = 's-quality-camera-id';
+    id.textContent = sourceId;
+    camera.append(name, id);
+
+    const modeTd = document.createElement('td');
+    modeTd.dataset.label = 'Recording';
+    const modeSel = document.createElement('select');
+    modeSel.className = 's-quality-select';
+    modeSel.dataset.recordModeSource = sourceId;
+    [['continuous', 'Continuous'], ['live_only', 'Live only']].forEach(([v, label]) => {
+      const opt = document.createElement('option');
+      opt.value = v; opt.textContent = label;
+      modeSel.appendChild(opt);
+    });
+    modeSel.value = _retention.record_modes?.[sourceId] || 'continuous';
+    modeSel.addEventListener('change', updateRetentionPreview);
+    modeTd.appendChild(modeSel);
+
+    const ageTd = document.createElement('td');
+    ageTd.dataset.label = 'Max age';
+    const ageSel = document.createElement('select');
+    ageSel.className = 's-quality-select';
+    ageSel.dataset.retentionSource = sourceId;
+    const globalOpt = document.createElement('option');
+    globalOpt.value = 'global';
+    ageSel.appendChild(globalOpt);
+    const override = _retention.day_overrides?.[sourceId];
+    const choices = [...RETENTION_DAY_CHOICES];
+    if (override != null && !choices.includes(override)) choices.push(override);
+    choices.sort((a, b) => a - b).forEach(days => {
+      const opt = document.createElement('option');
+      opt.value = String(days);
+      opt.textContent = retentionDaysLabel(days);
+      ageSel.appendChild(opt);
+    });
+    ageSel.value = override != null ? String(override) : 'global';
+    ageSel.addEventListener('change', updateRetentionPreview);
+    const detail = document.createElement('span');
+    detail.className = 's-quality-detail';
+    detail.dataset.retentionDetail = sourceId;
+    ageTd.append(ageSel, detail);
+
+    row.append(camera, modeTd, ageTd);
+    table.appendChild(row);
+  });
+  updateRetentionPreview();
+}
+
 async function loadCleanupConfig() {
   const d = await fetch('/api/settings/cleanup-config').then(r=>r.json()).catch(()=>({}));
+  _retention = d;
   const daysEl = document.getElementById('autoDays');
   const gbEl   = document.getElementById('autoGb');
-  if (daysEl) daysEl.value = d.cleanup_days ?? '';
+  if (daysEl) { daysEl.value = d.cleanup_days ?? ''; daysEl.oninput = updateRetentionPreview; }
   if (gbEl)   gbEl.value   = d.cleanup_max_gb ?? '';
+  renderRetention();
 }
 
 document.getElementById('autoSaveBtn').addEventListener('click', async () => {
   const days = document.getElementById('autoDays').value.trim();
   const gb   = document.getElementById('autoGb').value.trim();
   const msg  = document.getElementById('autoMsg');
+  const dayOverrides = {};
+  document.querySelectorAll('[data-retention-source]').forEach(select => {
+    dayOverrides[select.dataset.retentionSource] =
+      select.value === 'global' ? null : parseFloat(select.value);
+  });
+  const recordModes = {};
+  document.querySelectorAll('[data-record-mode-source]').forEach(select => {
+    recordModes[select.dataset.recordModeSource] = select.value;
+  });
   msg.textContent = 'Saving…'; msg.className = 's-save-msg';
   const r = await fetch('/api/settings/cleanup-config', {
     method: 'POST',
@@ -924,10 +1029,14 @@ document.getElementById('autoSaveBtn').addEventListener('click', async () => {
     body: JSON.stringify({
       cleanup_days:   days ? parseFloat(days) : null,
       cleanup_max_gb: gb   ? parseFloat(gb)   : null,
+      day_overrides:  dayOverrides,
+      record_modes:   recordModes,
     })
   });
   const d = await r.json();
   if (r.ok) {
+    _retention = d;
+    renderRetention();
     msg.textContent = `Saved — ${d.cleanup_days ?? '∞'} days / ${d.cleanup_max_gb ?? '∞'} GB`;
     msg.className = 's-save-msg ok';
   } else {

@@ -27,6 +27,16 @@ from starlette.staticfiles import StaticFiles
 from . import native_hls
 from .config import AppConfig
 from .media_health import MediaHealthCollector, MediaHealthStore, default_db_path
+from .retention import (
+    RECORD_MODE_CONTINUOUS,
+    cleanup_days_key,
+    normalize_days as retention_normalize_days,
+    record_mode as retention_record_mode,
+    record_mode_key,
+    retention_settings_payload,
+    source_cleanup_days,
+    validate_record_mode,
+)
 from .recording_quality import (
     GLOBAL_QUALITY_KEY,
     configured_quality_id,
@@ -1658,17 +1668,80 @@ def make_app(
         return JSONResponse(payload)
 
     async def api_settings_cleanup_config(request: Request) -> JSONResponse:
-        """Get or update auto-cleanup thresholds (stored in DB, read by yolo-serve)."""
+        """Get or update auto-cleanup thresholds and per-camera retention.
+
+        Global ``cleanup_days``/``cleanup_max_gb`` plus per-camera max-age
+        overrides (``day_overrides``, video db) and record modes
+        (``record_modes``, source db: continuous | live_only). No reload
+        plumbing: the recorder watchdog and stamper path refresh both pick up
+        record-mode flips within ~30s.
+        """
         if not video_db:
             return JSONResponse({"error": "video db not configured"}, status_code=501)
+
+        def _payload() -> dict:
+            sources = _sources_list(config, source_db)
+            if source_db is not None:
+                return retention_settings_payload(source_db, video_db, sources)
+            return {
+                "cleanup_days": retention_normalize_days(video_db.get_setting("cleanup_days")),
+                "cleanup_max_gb": video_db.get_setting("cleanup_max_gb"),
+                "day_overrides": source_cleanup_days(video_db),
+                "record_modes": {},
+                "effective_days": {},
+                "sources": sources,
+            }
+
         if request.method == "GET":
-            days = video_db.get_setting("cleanup_days")
-            gb   = video_db.get_setting("cleanup_max_gb")
-            return JSONResponse({"cleanup_days": days, "cleanup_max_gb": gb})
+            return JSONResponse(_payload())
         try:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"}, status_code=400
+            )
+
+        source_ids = {s["id"] for s in _sources_list(config, source_db)}
+        day_overrides = body.get("day_overrides") or {}
+        record_modes = body.get("record_modes") or {}
+        for field, mapping in (("day_overrides", day_overrides),
+                               ("record_modes", record_modes)):
+            if not isinstance(mapping, dict):
+                return JSONResponse(
+                    {"error": f"{field} must be an object"}, status_code=400
+                )
+            unknown = sorted(set(mapping) - source_ids)
+            if unknown:
+                return JSONResponse(
+                    {"error": f"unknown camera: {unknown[0]}"}, status_code=400
+                )
+        if record_modes and source_db is None:
+            return JSONResponse({"error": "db_path not configured"}, status_code=501)
+
+        # Validate everything before writing anything.
+        parsed_days: dict[str, float | None] = {}
+        for sid, value in day_overrides.items():
+            if value in (None, "", "global"):
+                parsed_days[sid] = None
+                continue
+            days = retention_normalize_days(value)
+            if days is None:
+                return JSONResponse(
+                    {"error": f"invalid max age for {sid}"}, status_code=400
+                )
+            parsed_days[sid] = days
+        parsed_modes: dict[str, str | None] = {}
+        for sid, value in record_modes.items():
+            if value in (None, "", "global"):
+                parsed_modes[sid] = None
+                continue
+            try:
+                parsed_modes[sid] = validate_record_mode(value)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+
         if "cleanup_days" in body:
             v = body["cleanup_days"]
             if v is None:
@@ -1681,9 +1754,19 @@ def make_app(
                 with video_db._connect() as c: c.execute("DELETE FROM app_settings WHERE key='cleanup_max_gb'")
             else:
                 video_db.set_setting("cleanup_max_gb", float(v))
-        days = video_db.get_setting("cleanup_days")
-        gb   = video_db.get_setting("cleanup_max_gb")
-        return JSONResponse({"cleanup_days": days, "cleanup_max_gb": gb})
+        for sid, days in parsed_days.items():
+            if days is None:
+                with video_db._connect() as c:
+                    c.execute("DELETE FROM app_settings WHERE key=?",
+                              (cleanup_days_key(sid),))
+            else:
+                video_db.set_setting(cleanup_days_key(sid), days)
+        for sid, mode in parsed_modes.items():
+            if mode is None or mode == RECORD_MODE_CONTINUOUS:
+                source_db.delete_setting(record_mode_key(sid))
+            else:
+                source_db.set_setting(record_mode_key(sid), mode)
+        return JSONResponse(_payload())
 
     async def api_settings_cleanup(request: Request) -> JSONResponse:
         """Delete segments (and their data) older than N days."""
@@ -1894,6 +1977,12 @@ def _sources_list(config: AppConfig, source_db=None) -> list:
             "enabled": s.enabled,
             "interval_seconds": s.interval_seconds,
             "mutable": True,
+            # live_only = realtime wall only: no recorder, no stamper, no
+            # detection. The viewer uses this to explain the missing DVR.
+            "record_mode": (
+                retention_record_mode(source_db, s.id)
+                if source_db else RECORD_MODE_CONTINUOUS
+            ),
         }
         for s in sources if s.type == "rtsp"
     ]

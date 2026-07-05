@@ -320,6 +320,20 @@
                 <input id="autoGb" type="number" min="1" step="10" placeholder="GB">
                 <span class="s-field-hint">Oldest footage deleted to stay under limit.</span>
               </div>
+              <div class="s-quality-table-wrap">
+                <table class="s-quality-table">
+                  <thead>
+                    <tr>
+                      <th>Camera</th>
+                      <th>Recording</th>
+                      <th>Max age</th>
+                    </tr>
+                  </thead>
+                  <tbody id="retentionTable">
+                    <tr><td colspan="3" class="s-quality-empty">Loading cameras.</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
             <div class="s-card-footer">
               <button id="autoSaveBtn" class="s-btn s-btn-primary" type="button">Save</button>
@@ -363,6 +377,6 @@
     </main>
   </div>
 
-  <script src="/settings.js?v=recording-quality-2"></script>
+  <script src="/settings.js?v=per-camera-retention-1"></script>
 </body>
 </html>
