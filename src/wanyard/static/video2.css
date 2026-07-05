@@ -427,6 +427,24 @@ body {
   display: none;
   content: none;
 }
+#v2StageZoom {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+#v2StageZoom.zoomed,
+#v2StageZoom.zoomed #v2Video,
+#v2StageZoom.zoomed .v2-live-video {
+  cursor: grab;
+  touch-action: none;
+}
+#v2StageZoom.panning,
+#v2StageZoom.panning #v2Video,
+#v2StageZoom.panning .v2-live-video {
+  cursor: grabbing;
+}
 .v2-stage #v2Video,
 .v2-live-video {
   position: relative;
@@ -554,6 +572,16 @@ body {
   color: var(--txt-4);
   cursor: not-allowed;
   opacity: 0.55;
+}
+.stage-zoom-chip {
+  width: auto;
+  min-width: 58px;
+  padding: 0 9px;
+  font: 600 12px var(--font-mono);
+  white-space: nowrap;
+}
+.stage-zoom-chip[hidden] {
+  display: none;
 }
 .st-btn-wide {
   width: auto;
