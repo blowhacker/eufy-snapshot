@@ -1273,6 +1273,7 @@ const st = {
   notificationsOpen: false,
   notifications: [],
   unreadNotifications: 0,
+  timelineAutoFollow: true,
 };
 const stageZoom = new StageZoom(
   el.stage,
@@ -2731,11 +2732,11 @@ async function load() {
     : st.eventsLoaded.ranges;
   timeline.setEventsRanges(visRanges);
 
-  // Advance right-edge only when viewing recent content (within 2h of now)
-  // Scrolling into history must not reset window.to to now — that causes
-  // the events since/until to span days and hit the 10k limit, losing old events
+  // Advance the right edge only while explicitly following live. Any manual
+  // timeline interaction pins the visible range so a refresh cannot destroy a
+  // precise zoom or clip selection.
   const nowTs = Date.now() / 1000;
-  if (nowTs > st.window.to - 60 && st.window.to > nowTs - 7200) {
+  if (st.timelineAutoFollow && nowTs > st.window.to - 60 && st.window.to > nowTs - 7200) {
     st.window.to = nowTs + LIVE_TIMELINE_FUTURE_PAD_SECONDS;
     setTimelineWindow(st.window.from, st.window.to);
   }
@@ -3012,6 +3013,7 @@ function startClipSelection({ showToolbar = false } = {}) {
     anchor.sourceId,
   );
   st.clip.active = true;
+  st.timelineAutoFollow = false;
   st.clip.toolbarOpen = showToolbar;
   st.clip.start = range.start;
   st.clip.end = range.end;
@@ -3237,6 +3239,7 @@ function releaseTimelinePointer(e) {
 
 function beginTimelineDrag(e) {
   if (e.button != null && e.button !== 0) return;
+  st.timelineAutoFollow = false;
   const pt = timelineLocalPoint(e);
   if (st.clip.active) {
     const hit = timeline.clipHit(pt.x, pt.y);
@@ -3336,6 +3339,7 @@ el.tlCanvas.addEventListener("click", e => {
   const rect = el.tlCanvas.getBoundingClientRect();
   const hit  = timeline.decode(e.clientX - rect.left, e.clientY - rect.top);
   if (!hit) return;
+  st.timelineAutoFollow = false;
   // Delay single-click action so dblclick can cancel it
   clearTimeout(_clickTimer);
   _clickTimer = setTimeout(async () => {
@@ -3370,6 +3374,7 @@ function _windowBounds() {
 }
 
 function _applyWindowShift(shift) {
+  st.timelineAutoFollow = false;
   const span = st.window.to - st.window.from;
   const { oldest, newest } = _windowBounds();
   let newFrom = st.window.from + shift;
@@ -3382,6 +3387,7 @@ function _applyWindowShift(shift) {
 }
 
 function _applyZoom(factor, cursorX, rectWidth) {
+  st.timelineAutoFollow = false;
   const span   = st.window.to - st.window.from;
   const plotW  = Math.max(1, rectWidth - timeline.labelWidth);
   const newSpan = Math.max(TL_MIN_SPAN, Math.min(TL_MAX_SPAN, span * factor));
@@ -3399,6 +3405,7 @@ function _applyZoom(factor, cursorX, rectWidth) {
 }
 
 function _animateZoomTo(targetFrom, targetTo, ms = 180) {
+  st.timelineAutoFollow = false;
   if (_zoomRaf) { cancelAnimationFrame(_zoomRaf); _zoomRaf = null; }
   const sf = st.window.from, st0 = st.window.to, t0 = performance.now();
   function step(now) {
@@ -3997,6 +4004,7 @@ el.liveBtn.addEventListener("click", () => {
   // tail even if already live, dropping any pinned ts (so the URL goes back to
   // ?source&live=1 with no ts — proper live, not a fixed point in the DVR).
   // To leave live, click a point on the timeline; that stops the tail.
+  st.timelineAutoFollow = true;
   startLiveTail(st.source !== "all" ? st.source : null, { force: true });
   scrollTimelineToTs(Date.now() / 1000);
 });
@@ -5213,9 +5221,9 @@ function pointInPoly(pt, poly) {
 setInterval(async () => {
   setStatus(liveTail.active ? "LIVE" : "SYNC");
   const nowTs = Date.now() / 1000;
-  // Only advance right edge when viewing recent content — never override
-  // manual scroll into history (would corrupt the events window range)
-  if (st.window.to > nowTs - 7200) {
+  // Refresh data in every mode, but move the visible range only while the user
+  // is explicitly following live. Clicking Live re-enables this mode.
+  if (st.timelineAutoFollow && st.window.to > nowTs - 7200) {
     st.window.to = nowTs + LIVE_TIMELINE_FUTURE_PAD_SECONDS;
     setTimelineWindow(st.window.from, st.window.to);
   }
