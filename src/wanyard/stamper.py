@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import bitc
+from . import bitc, sei
 from .live_detector import _list_relay_paths
 from .media_health import MediaHealthStore, default_db_path
 from .recording_quality import (
@@ -71,7 +71,15 @@ class _BitcMediaTimeline:
         self.last_bitc: float | None = None
         self.last_pts = -1
 
-    def pts(self, bitc_ts: float) -> int | None:
+    def pts(self, bitc_ts: float, *, nudge: bool = False) -> int | None:
+        """Media pts for ``bitc_ts``; None for unusable (stale) samples.
+
+        ``nudge=True`` is for codec-copy mode, where a packet can never be
+        dropped (dropping a reference frame corrupts the GOP downstream): a
+        non-advancing clock sample yields ``last_pts + 1`` — one 90kHz tick,
+        11µs of timeline — instead of None. Real gaps still raise
+        :class:`_BitcEpochDiscontinuity` in both modes.
+        """
         if not np.isfinite(bitc_ts):
             return None
         if self.epoch is None:
@@ -83,13 +91,20 @@ class _BitcMediaTimeline:
         assert self.last_bitc is not None
         step = bitc_ts - self.last_bitc
         if step <= 0:
-            return None
+            if not nudge:
+                return None
+            # Clock did not advance: keep last_bitc (the estimator's truth),
+            # emit the next representable pts so the container stays monotonic.
+            self.last_pts += 1
+            return self.last_pts
         if step > self.max_gap_seconds:
             raise _BitcEpochDiscontinuity(step)
 
         pts = int(round((bitc_ts - self.epoch) * self.ticks_per_second))
         if pts <= self.last_pts:
-            return None
+            if not nudge:
+                return None
+            pts = self.last_pts + 1
         self.last_bitc = bitc_ts
         self.last_pts = pts
         return pts
@@ -436,6 +451,50 @@ class _StamperWorker:
                 self._quality_settings_error_reported = True
             return None
 
+    def _resolve_stamp_mode(self) -> str:
+        """Per-source stamp mode: DB setting > WANYARD_STAMP_MODE env > reencode."""
+        mode = None
+        if self._source_db_path is not None:
+            try:
+                from .db import SourceDB
+
+                mode = sei.stamp_mode(
+                    SourceDB(Path(self._source_db_path)), self.source_id,
+                    default=None,
+                )
+            except Exception:
+                LOG.warning("stamper %s could not read stamp mode settings",
+                            self.source_id, exc_info=True)
+        if mode is None:
+            mode = sei.normalize_stamp_mode(
+                self._src_env("MODE"), sei.STAMP_MODE_REENCODE
+            )
+        return mode
+
+    def _add_audio_stream(self, out, ain):
+        """Copy-through audio stream on ``out``; None when unsupported."""
+        aout = None
+        rate = getattr(ain.codec_context, "sample_rate", None) or 8000
+        for attempt in ("explicit", "template"):
+            try:
+                if attempt == "explicit":
+                    aout = out.add_stream(ain.codec_context.name, rate=rate)
+                    try:
+                        aout.layout = ain.layout
+                    except Exception:
+                        pass
+                else:
+                    aout = out.add_stream(template=ain)
+                break
+            except Exception as exc:
+                LOG.info("stamper %s audio add_stream(%s) failed: %s",
+                         self.source_id, attempt, exc)
+                aout = None
+        if aout is None:
+            LOG.warning("stamper %s audio unsupported — video only",
+                        self.source_id)
+        return aout
+
     def _video_metadata(self, vin) -> tuple[int, int, float]:
         width = int(getattr(vin.codec_context, "width", 0) or 0)
         height = int(getattr(vin.codec_context, "height", 0) or 0)
@@ -483,6 +542,17 @@ class _StamperWorker:
             ain = next((s for s in inp.streams if s.type == "audio"), None)
             width, height, fps = self._video_metadata(vin)
 
+            mode = self._resolve_stamp_mode()
+            if mode == sei.STAMP_MODE_SEI_COPY:
+                input_codec = getattr(vin.codec_context, "name", "")
+                if input_codec == "h264":
+                    self._stream_sei_copy(inp, vin, ain, width, height, fps)
+                    return
+                LOG.warning(
+                    "stamper %s stamp_mode=sei_copy needs h264 input, got %s — "
+                    "falling back to re-encode", self.source_id, input_codec,
+                )
+
             out = av.open(self.out_url, "w", format="rtsp",
                           options={"rtsp_transport": "tcp"})
             codec = self._video_codec()
@@ -528,27 +598,7 @@ class _StamperWorker:
                     },
                 )
                 self._reported_encoder = codec
-            aout = None
-            if ain is not None:
-                rate = getattr(ain.codec_context, "sample_rate", None) or 8000
-                for attempt in ("explicit", "template"):
-                    try:
-                        if attempt == "explicit":
-                            aout = out.add_stream(ain.codec_context.name, rate=rate)
-                            try:
-                                aout.layout = ain.layout
-                            except Exception:
-                                pass
-                        else:
-                            aout = out.add_stream(template=ain)
-                        break
-                    except Exception as exc:
-                        LOG.info("stamper %s audio add_stream(%s) failed: %s",
-                                 self.source_id, attempt, exc)
-                        aout = None
-                if aout is None:
-                    LOG.warning("stamper %s audio unsupported — video only",
-                                self.source_id)
+            aout = self._add_audio_stream(out, ain) if ain is not None else None
 
             anchor = _StampAnchor(self.source_id)
             timeline = _BitcMediaTimeline(max_gap_seconds=self.epoch_gap_seconds)
@@ -637,6 +687,118 @@ class _StamperWorker:
                 except Exception:
                     pass
             inp.close()
+
+
+    def _stream_sei_copy(self, inp, vin, ain, width, height, fps) -> None:
+        """Codec-copy stamping: per-AU SEI injection, no decode, no encode.
+
+        The camera bitstream passes through bit-identical (zero generation
+        loss, archive size = camera native, no NVENC session); each video
+        packet gains an unregistered SEI NAL carrying the same BITC
+        centisecond value + CRC the pixel marker would have burned, and its
+        pts is rewritten on the same BITC media timeline. Packets are never
+        dropped mid-GOP (that would corrupt downstream decode): the timeline
+        runs in nudge mode, and startup waits for a keyframe so the copy
+        starts on a clean GOP. ``inp`` is closed by the caller's finally.
+        """
+        import av
+
+        out = av.open(self.out_url, "w", format="rtsp",
+                      options={"rtsp_transport": "tcp"})
+        try:
+            vout = out.add_stream_from_template(vin)
+            out_tb = Fraction(1, 90000)
+            self._active_codec = "copy"
+            self._health_state("connecting", active_encoder="copy",
+                               width=width, height=height, fps=fps)
+            if "copy" != self._reported_encoder:
+                self._health_event(
+                    "info", "encoder_selected",
+                    "stamp mode sei_copy: h264 passthrough + SEI timecode",
+                    {"encoder": "copy", "width": width, "height": height,
+                     "fps": fps},
+                )
+                self._reported_encoder = "copy"
+            aout = self._add_audio_stream(out, ain) if ain is not None else None
+
+            anchor = _StampAnchor(self.source_id)
+            timeline = _BitcMediaTimeline(max_gap_seconds=self.epoch_gap_seconds)
+            wait_key = True
+            inject_fail_logged = False
+            last_health_update = 0.0
+            for packet in inp.demux():
+                if self.stopped():
+                    break
+                if packet.dts is None:
+                    continue
+                if packet.stream is vin:
+                    wall = time.time()
+                    if wait_key:
+                        if not packet.is_keyframe:
+                            continue
+                        wait_key = False
+                    tb = packet.time_base or vin.time_base
+                    base_pts = packet.pts if packet.pts is not None else packet.dts
+                    rtp = (
+                        float(base_pts * tb)
+                        if base_pts is not None and tb is not None
+                        else wall
+                    )
+                    abs_ts = anchor.observe(rtp, wall)
+                    pts = timeline.pts(abs_ts, nudge=True)
+                    if pts is None:
+                        # Only a non-finite abs_ts lands here; nothing sane to
+                        # stamp or time it with.
+                        continue
+                    data = bytes(packet)
+                    try:
+                        value = bitc.encode_value(abs_ts)
+                    except ValueError:
+                        LOG.warning("stamper %s abs_ts %.3f out of range",
+                                    self.source_id, abs_ts)
+                    else:
+                        injected = sei.inject(data, value)
+                        if injected is not None:
+                            data = injected
+                        elif not inject_fail_logged:
+                            LOG.warning(
+                                "stamper %s could not inject SEI (no slice NAL "
+                                "found) — passing packets through untimed",
+                                self.source_id,
+                            )
+                            inject_fail_logged = True
+                    op = av.Packet(data)
+                    op.pts = pts
+                    op.dts = pts
+                    op.time_base = out_tb
+                    op.stream = vout
+                    op.is_keyframe = packet.is_keyframe
+                    out.mux(op)
+                    if wall - last_health_update >= 15.0:
+                        self._health_state("live", active_encoder="copy",
+                                           width=width, height=height, fps=fps)
+                        if self._reconnect_count > self._reported_recovery_count:
+                            self._health_event(
+                                "info", "stream_recovered",
+                                f"stream recovered after {self._reconnect_count} reconnects",
+                                {"reconnect_count": self._reconnect_count},
+                            )
+                            self._reported_recovery_count = self._reconnect_count
+                        last_health_update = wall
+                elif aout is not None and packet.stream is ain:
+                    packet.stream = aout
+                    try:
+                        out.mux(packet)
+                    except Exception as exc:
+                        LOG.info("stamper %s audio mux dropped: %s",
+                                 self.source_id, exc)
+            if not self.stopped():
+                raise EOFError("rtsp input ended")
+        finally:
+            try:
+                out.close()
+            except Exception:
+                pass
 
 
 class _StamperSupervisor:

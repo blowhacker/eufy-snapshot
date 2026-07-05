@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 import urllib.request
 
-from . import bitc
+from . import bitc, sei
 
 LOG = logging.getLogger(__name__)
 
@@ -3446,7 +3446,13 @@ def _decode_bitc_media_epoch(
                     frame_pts = _frame_pts_seconds(frame)
                     if first_pts is None and frame_pts is not None:
                         first_pts = frame_pts
-                    bitc_ts, crc_ok = bitc.decode(frame.to_ndarray(format="bgr24"))
+                    # SEI side data first (sei_copy segments), pixel marker as
+                    # fallback (re-encode segments and legacy archives). Both
+                    # carry the same clock; only the carrier differs.
+                    bitc_ts, crc_ok = sei.decode_frame(frame)
+                    if not crc_ok:
+                        bitc_ts, crc_ok = bitc.decode(
+                            frame.to_ndarray(format="bgr24"))
                     if crc_ok and bitc_ts is not None:
                         if frame_pts is None:
                             if samples:

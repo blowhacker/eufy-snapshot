@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.request
 
-from . import bitc
+from . import bitc, sei
 
 LOG = logging.getLogger(__name__)
 
@@ -194,8 +194,13 @@ class _SourceWorker:
 
         from .video import _CCTV_CLASS_IDS, _CONF_THRESHOLD, _parse_results
 
+        # SEI first (sei_copy streams carry the clock as frame side data),
+        # pixel marker as fallback (re-encode streams and legacy archives).
+        abs_ts, crc_ok = sei.decode_frame(frame)
+        sei_timed = crc_ok
         frame_bgr = frame.to_ndarray(format="bgr24")
-        abs_ts, crc_ok = bitc.decode(frame_bgr)
+        if not crc_ok:
+            abs_ts, crc_ok = bitc.decode(frame_bgr)
         if not crc_ok or abs_ts is None:
             if wall - self.last_marker_fail_log_wall >= _MARKER_FAIL_LOG_SECONDS:
                 LOG.info("live detector %s skip frame unreadable BITC marker",
@@ -220,7 +225,10 @@ class _SourceWorker:
                 self.last_stale_log_wall = wall
             return
 
-        bitc.mask(frame_bgr)
+        if not sei_timed:
+            # Only pixel-marked streams have a strip to hide from YOLO; on a
+            # SEI stream the bottom-left pixels are real scene content.
+            bitc.mask(frame_bgr)
         with self.predict_lock:
             results = self.model.predict(
                 frame_bgr,
