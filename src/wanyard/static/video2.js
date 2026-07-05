@@ -1893,11 +1893,6 @@ function latestLiveBoxDetection() {
 }
 
 function liveTailCurrentTs(mediaTime = null) {
-  const markerTs = decodeLiveMarker(el.liveVideo);
-  if (markerTs != null) {
-    liveTail.clockSource = "pixel";
-    return markerTs;
-  }
   const explicitMediaTime = mediaTime != null ? Number(mediaTime) : NaN;
   const presentedMediaTime = liveTail.presentedMediaTime != null
     ? Number(liveTail.presentedMediaTime)
@@ -1910,6 +1905,16 @@ function liveTailCurrentTs(mediaTime = null) {
   if (seiTs != null) {
     liveTail.clockSource = "sei";
     return seiTs;
+  }
+  // A copy stream has real scene pixels where the old marker strip lived.
+  // Random imagery passes the marker's 8-bit CRC often enough to create
+  // periodic false timestamps, so SEI must win whenever this frame has one.
+  // The wall-time guard also prevents a false pixel decode from poisoning the
+  // detection query during the brief interval before hls.js delivers SEI.
+  const markerTs = decodeLiveMarker(el.liveVideo);
+  if (markerTs != null && Math.abs(markerTs - Date.now() / 1000) <= LIVE_OPEN_MAX_AGE) {
+    liveTail.clockSource = "pixel";
+    return markerTs;
   }
   if (liveTail.bitcTimeOffset != null) {
     liveTail.clockSource = "mapped";
