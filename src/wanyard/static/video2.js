@@ -2473,7 +2473,9 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
 
     let resolved = null;
     if (srcId) {
-      setStatus("BUFFERING");
+      // quiet = scrub preview: no status flips (the chip's 120-160ms colour
+      // transitions strobe when a drag crosses several segments).
+      if (!options.quiet) setStatus("BUFFERING");
       resolved = await resolveVideoTimestamp(srcId, lookupTs, {
         preRoll: options.resolvePreRoll,
         window: options.resolveWindow,
@@ -2504,7 +2506,7 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
       });
       if (seq !== absoluteSeekSeq) return false;
       if (landing) {
-        setStatus("REPLAY");
+        if (!options.quiet) setStatus("REPLAY");
         if (autoplay) player.play();
         if (updateHistory) pushState();
         if (options.scroll) scrollTimelineToTs(scrollTs);
@@ -2525,7 +2527,7 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
     if (attempt < retries) await sleep(retryMs);
   }
 
-  setStatus("NONE");
+  if (!options.quiet) setStatus("NONE");
   return false;
 }
 
@@ -3351,6 +3353,7 @@ async function _runPlayheadScrub() {
       retries: 0,
       liveFallback: false,
       frameClock: "lazy",
+      quiet: true,
     });
   } finally {
     state.busy = false;
