@@ -1280,6 +1280,11 @@ const liveTail = {
   mode: null,                 // LIVE_M | PAUSED_M | DVR_M — the one source of truth
   nativeDelay: LIVE_NATIVE_DEFAULT_DELAY_SECONDS,
   usingNativeLowLatency: false,
+  seiClock: window.WanyardLiveSeiClock
+    ? new window.WanyardLiveSeiClock.LiveSeiClock()
+    : null,
+  presentedMediaTime: null,
+  clockSource: null,
   stats: null,
 };
 
@@ -1288,6 +1293,18 @@ const liveTail = {
 // PAUSED— frozen; hls load stopped so it can't chase the edge (no jerk). Not green.
 // DVR   — seeked to a past point in the live window, playing/paused. Not green.
 const LIVE_M = "live", PAUSED_M = "paused", DVR_M = "dvr";
+
+// Small diagnostic surface for verifying that hls.js delivered SEI samples
+// and that presented frames are using them. It is read-only and safe to call
+// from the browser console during rollout.
+window.wanyardLiveClockStatus = () => ({
+  active: liveTail.active,
+  sourceId: liveTail.srcId,
+  mode: liveTail.mode,
+  clockSource: liveTail.clockSource,
+  seiFrames: liveTail.seiClock?.frames.length || 0,
+  presentedMediaTime: liveTail.presentedMediaTime,
+});
 
 function urlTimestamp(ts) {
   const n = Number(ts);
@@ -1875,13 +1892,35 @@ function latestLiveBoxDetection() {
     : null;
 }
 
-function liveTailCurrentTs() {
+function liveTailCurrentTs(mediaTime = null) {
   const markerTs = decodeLiveMarker(el.liveVideo);
-  if (markerTs != null) return markerTs;
+  if (markerTs != null) {
+    liveTail.clockSource = "pixel";
+    return markerTs;
+  }
+  const explicitMediaTime = mediaTime != null ? Number(mediaTime) : NaN;
+  const presentedMediaTime = liveTail.presentedMediaTime != null
+    ? Number(liveTail.presentedMediaTime)
+    : NaN;
+  const currentMediaTime = Number(el.liveVideo.currentTime);
+  const frameMediaTime = Number.isFinite(explicitMediaTime)
+    ? explicitMediaTime
+    : (Number.isFinite(presentedMediaTime) ? presentedMediaTime : currentMediaTime);
+  const seiTs = liveTail.seiClock?.timestampForMediaTime(frameMediaTime);
+  if (seiTs != null) {
+    liveTail.clockSource = "sei";
+    return seiTs;
+  }
   if (liveTail.bitcTimeOffset != null) {
+    liveTail.clockSource = "mapped";
     return liveTail.bitcTimeOffset + (el.liveVideo.currentTime || 0);
   }
-  return liveTail.latestDet?.abs_ts ?? Date.now() / 1000;
+  if (liveTail.latestDet?.abs_ts != null) {
+    liveTail.clockSource = "detection";
+    return liveTail.latestDet.abs_ts;
+  }
+  liveTail.clockSource = "wall";
+  return Date.now() / 1000;
 }
 
 function selectedPlaybackRate() {
@@ -3562,6 +3601,9 @@ async function startLiveTail(srcId = null, options = {}) {
   liveTail.mode = seekTs == null ? LIVE_M : DVR_M;   // edge-follow vs seeked DVR
   liveTail.latestDet = null;
   liveTail.recentDets = [];
+  liveTail.seiClock?.reset();
+  liveTail.presentedMediaTime = null;
+  liveTail.clockSource = null;
   liveTail.window = liveWindow;
   liveTail.bitcTimeOffset = null;
   liveTail.targetTs = seekTs;
@@ -3629,6 +3671,10 @@ async function startLiveTail(srcId = null, options = {}) {
       liveTail.hls = hls;
       hls.loadSource(hlsUrl);
       hls.attachMedia(el.liveVideo);
+      hls.on(HlsCtor.Events.FRAG_PARSING_USERDATA, (_, data) => {
+        if (token !== liveTail.token) return;
+        liveTail.seiClock?.ingest(data?.samples || []);
+      });
       hls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
         if (!useNativeLowLatency && seekTs != null && liveWindow) seekLiveVideoToTs(seekTs, liveWindow);
         updateLivePlaybackRate();
@@ -3695,6 +3741,9 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   liveTail.srcId = null;
   liveTail.latestDet = null;
   liveTail.recentDets = [];
+  liveTail.seiClock?.reset();
+  liveTail.presentedMediaTime = null;
+  liveTail.clockSource = null;
   liveTail.recentSeq++;
   liveTail._tracklets = null;
   liveTail.window = null;
@@ -3797,9 +3846,11 @@ function startLiveFrameLoop() {
   const v = el.liveVideo;
   if (typeof v.requestVideoFrameCallback === "function") {
     let id;
-    const onFrame = () => {
+    const onFrame = (_now, metadata) => {
       if (!liveTail.active) return;
-      drawLiveBoxes();
+      const mediaTime = Number(metadata?.mediaTime);
+      liveTail.presentedMediaTime = Number.isFinite(mediaTime) ? mediaTime : null;
+      drawLiveBoxes(liveTail.presentedMediaTime);
       id = v.requestVideoFrameCallback(onFrame);
     };
     id = v.requestVideoFrameCallback(onFrame);
@@ -4452,11 +4503,11 @@ function drawBoxes(ts) {
   drawBoxList(v, boxesAtOverlayTime(ts));
 }
 
-function drawLiveBoxes() {
+function drawLiveBoxes(mediaTime = null) {
   // Pixel-BITC streams read the displayed frame directly; SEI-copy streams
   // use the server-anchored HLS media-time mapping. Both paths are owned by
   // liveTailCurrentTs(), so overlays must not require a pixel marker here.
-  const markerTs = liveTailCurrentTs();
+  const markerTs = liveTailCurrentTs(mediaTime);
   if (!Number.isFinite(markerTs)) { drawBoxList(el.liveVideo, []); return; }
   const sample = liveTail.recentDets.length
     ? sampleTrackletBoxes(liveTracklets(), markerTs, true)   // live: fade held boxes
