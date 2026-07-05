@@ -4448,6 +4448,16 @@ player.on("ended", () => {
 player.on("timeupdate", () => {
   const ts = player.currentTs;
   if (ts == null) return;
+  if (_playheadDrag) {
+    // Scrub preview: the drag owns the playhead and the chip (mouse
+    // position, not the keyframe the video landed on — otherwise the cursor
+    // fights the mouse), and nearest-event re-renders are deferred (each
+    // uncached event thumb costs the server an ffmpeg extraction; a drag
+    // would fire dozens). Overlays still track the painted frame.
+    drawBoxes(ts);
+    drawZones();
+    return;
+  }
   timeline.setPlayhead(ts);
   setTimestampChip(ts, player.currentSeg?.source_id ?? null, false);
   drawBoxes(ts);
