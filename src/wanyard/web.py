@@ -43,18 +43,26 @@ LOG = logging.getLogger(__name__)
 _THUMB_W  = 160
 _IMG_CACHE = "public, max-age=604800, immutable"
 _GZIP_SKIP_PREFIXES = ("/video/live/", "/video/native-live/")
+# Already-compressed media: gzip gains nothing, burns CPU per request, and a
+# gzip+chunked full-file response breaks the browser's byte-range strategy
+# for <video> (Content-Length gone, 200 instead of clean 206 semantics) —
+# scrubbing needs cheap ranges.
+_GZIP_SKIP_SUFFIXES = (".mp4", ".m4s", ".ts", ".jpg", ".jpeg")
 
 
 class _PathAwareGZipMiddleware:
-    def __init__(self, app, *, minimum_size: int, skip_prefixes: tuple[str, ...]):
+    def __init__(self, app, *, minimum_size: int, skip_prefixes: tuple[str, ...],
+                 skip_suffixes: tuple[str, ...] = ()):
         self.app = app
         self.gzip_app = GZipMiddleware(app, minimum_size=minimum_size)
         self.skip_prefixes = skip_prefixes
+        self.skip_suffixes = skip_suffixes
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":
-            path = scope.get("path", "")
-            if any(path.startswith(prefix) for prefix in self.skip_prefixes):
+            path = scope.get("path", "").lower()
+            if (any(path.startswith(prefix) for prefix in self.skip_prefixes)
+                    or path.endswith(self.skip_suffixes)):
                 await self.app(scope, receive, send)
                 return
         await self.gzip_app(scope, receive, send)
@@ -1524,7 +1532,19 @@ def make_app(
         }.get(suffix[1:])
         headers = {"Accept-Ranges": "bytes"}
         if suffix in {".mp4", ".json"}:
-            headers["Cache-Control"] = "no-cache"
+            # A young mtime means the file can still change (open fMP4 being
+            # written, sidecar just re-cut, salvage/finalize rewrite) — do not
+            # cache. Anything older is sealed and its URL is unique per
+            # segment timestamp: cache hard, scrubbing re-visits ranges
+            # constantly. Retention deleting the file later just 404s.
+            try:
+                age = time.time() - path.stat().st_mtime
+            except OSError:
+                age = 0.0
+            headers["Cache-Control"] = (
+                "no-cache" if age < 120
+                else "public, max-age=2592000, immutable"
+            )
         return FileResponse(path, media_type=media, headers=headers)
 
     async def api_settings_status(request: Request) -> JSONResponse:
@@ -1952,7 +1972,8 @@ def make_app(
 
     app = Starlette(routes=routes, lifespan=lifespan)
     return _PathAwareGZipMiddleware(app, minimum_size=1024,
-                                    skip_prefixes=_GZIP_SKIP_PREFIXES)
+                                    skip_prefixes=_GZIP_SKIP_PREFIXES,
+                                    skip_suffixes=_GZIP_SKIP_SUFFIXES)
 
 
 # ── helpers ───────────────────────────────────────────────
