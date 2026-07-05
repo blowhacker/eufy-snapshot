@@ -20,7 +20,6 @@ let _editingRuleId = null;
 let _mediaHealth = null;
 let _healthHours = 24;
 let _healthSource = '';
-let _recordingQuality = null;
 
 async function loadStatus() {
   const d = await fetch('/api/settings/status',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}));
@@ -325,7 +324,6 @@ async function loadMediaHealth() {
   renderHealthTable();
   renderHealthEvents();
   drawHealthChart();
-  renderRecordingQuality();
   if (button) button.disabled = false;
 }
 
@@ -387,215 +385,13 @@ async function loadCameras() {
     btn.addEventListener('click', async () => {
       if (!confirm(`Remove ${btn.dataset.del}? This cannot be undone.`)) return;
       await fetch('/api/sources/'+btn.dataset.del,{method:'DELETE'});
-      loadCameras().then(() => { loadNotificationRules(); loadRecordingQuality(); });
+      loadCameras().then(() => { loadNotificationRules(); });
     });
   });
 
   populateNotifySources();
   renderNotificationRules();
 }
-
-// ── Recording quality ─────────────────────────────────
-function qualityPreset(id) {
-  return (_recordingQuality?.presets || []).find(p => p.id === id)
-    || (_recordingQuality?.presets || []).find(p => p.id === _recordingQuality?.default_quality)
-    || null;
-}
-
-function qualityLabel(id) {
-  return qualityPreset(id)?.label || id || '--';
-}
-
-function qualitySummary(id) {
-  return qualityPreset(id)?.summary || '';
-}
-
-function parseQualityRate(value) {
-  const match = String(value || '').trim().match(/^([0-9]+(?:\.[0-9]+)?)([kKmMgG]?)$/);
-  if (!match) return null;
-  const scale = { '': 1, k: 1e3, m: 1e6, g: 1e9 }[match[2].toLowerCase()];
-  return Number(match[1]) * scale;
-}
-
-function qualityRateText(value) {
-  const parsed = parseQualityRate(value);
-  return parsed == null ? String(value || '--') : fmt.bitrate(parsed);
-}
-
-function qualityElementByDataset(attr, value) {
-  return [...document.querySelectorAll(`[data-${attr}]`)]
-    .find(el => el.dataset[attr.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] === value);
-}
-
-function currentQualityForSource(sourceId) {
-  const select = qualityElementByDataset('quality-source', sourceId);
-  const global = document.getElementById('qualityGlobal')?.value
-    || _recordingQuality?.global_quality
-    || _recordingQuality?.default_quality
-    || 'balanced';
-  const value = select?.value || _recordingQuality?.overrides?.[sourceId] || 'global';
-  return value === 'global' ? global : value;
-}
-
-function qualityCapText(sourceId, qualityId) {
-  const preset = qualityPreset(qualityId);
-  if (!preset) return '--';
-  const current = _mediaHealth?.current?.[sourceId] || {};
-  const encoder = String(current.stamper?.active_encoder || current.recorder_codec || '').toLowerCase();
-  if (encoder.includes('hevc') || encoder.includes('h265')) {
-    return `HEVC ${qualityRateText(preset.hevc_maxrate)}`;
-  } else if (encoder.includes('264') || encoder.includes('x264')) {
-    return `H.264 ${qualityRateText(preset.h264_maxrate)}`;
-  }
-  return `HEVC ${qualityRateText(preset.hevc_maxrate)} / H.264 ${qualityRateText(preset.h264_maxrate)}`;
-}
-
-function qualityMeasuredText(sourceId) {
-  const current = _mediaHealth?.current?.[sourceId] || {};
-  const measured = current.stamped_bitrate_bps == null
-    ? ''
-    : ` · now ${fmt.bitrate(current.stamped_bitrate_bps)}`;
-  return measured;
-}
-
-function updateQualityPreview() {
-  if (!_recordingQuality) return;
-  const global = document.getElementById('qualityGlobal')?.value
-    || _recordingQuality.global_quality
-    || _recordingQuality.default_quality;
-  const summary = document.getElementById('qualityPresetSummary');
-  if (summary) summary.textContent = qualitySummary(global);
-  document.querySelectorAll('[data-quality-source]').forEach(select => {
-    const option = select.options[0];
-    if (option) option.textContent = `Use global (${qualityLabel(global)})`;
-    const sourceId = select.dataset.qualitySource;
-    const effective = currentQualityForSource(sourceId);
-    const current = _recordingQuality.effective?.[sourceId]
-      || _recordingQuality.global_quality
-      || _recordingQuality.default_quality
-      || 'balanced';
-    const target = qualityElementByDataset('quality-effective', sourceId);
-    const detail = qualityElementByDataset('quality-detail', sourceId);
-    if (effective === current) {
-      if (target) target.textContent = qualityLabel(current);
-      if (detail) detail.textContent = `Current cap ${qualityCapText(sourceId, current)}${qualityMeasuredText(sourceId)}`;
-    } else {
-      if (target) target.textContent = `Current: ${qualityLabel(current)} (${qualityCapText(sourceId, current)})`;
-      if (detail) detail.textContent = `New: ${qualityLabel(effective)} (${qualityCapText(sourceId, effective)})${qualityMeasuredText(sourceId)}`;
-    }
-  });
-}
-
-function renderRecordingQuality() {
-  if (!_recordingQuality) return;
-  const globalSelect = document.getElementById('qualityGlobal');
-  const table = document.getElementById('qualityTable');
-  if (!globalSelect || !table) return;
-
-  globalSelect.innerHTML = '';
-  (_recordingQuality.presets || []).forEach(preset => {
-    const option = document.createElement('option');
-    option.value = preset.id;
-    option.textContent = preset.label;
-    globalSelect.appendChild(option);
-  });
-  globalSelect.value = _recordingQuality.global_quality || _recordingQuality.default_quality || 'balanced';
-  globalSelect.onchange = updateQualityPreview;
-
-  const sources = _recordingQuality.sources || _sources || [];
-  table.innerHTML = '';
-  if (!sources.length) {
-    table.innerHTML = '<tr><td colspan="3" class="s-quality-empty">No cameras configured.</td></tr>';
-    updateQualityPreview();
-    return;
-  }
-
-  sources.forEach(source => {
-    const sourceId = source.id;
-    const row = document.createElement('tr');
-
-    const camera = document.createElement('td');
-    camera.dataset.label = 'Camera';
-    const name = document.createElement('span');
-    name.className = 's-quality-camera';
-    name.textContent = source.name || sourceId;
-    const id = document.createElement('span');
-    id.className = 's-quality-camera-id';
-    id.textContent = sourceId;
-    camera.append(name, id);
-
-    const quality = document.createElement('td');
-    quality.dataset.label = 'Quality';
-    const select = document.createElement('select');
-    select.className = 's-quality-select';
-    select.dataset.qualitySource = sourceId;
-    const globalOption = document.createElement('option');
-    globalOption.value = 'global';
-    select.appendChild(globalOption);
-    (_recordingQuality.presets || []).forEach(preset => {
-      const option = document.createElement('option');
-      option.value = preset.id;
-      option.textContent = preset.label;
-      select.appendChild(option);
-    });
-    select.value = _recordingQuality.overrides?.[sourceId] || 'global';
-    select.addEventListener('change', updateQualityPreview);
-    quality.appendChild(select);
-
-    const effective = document.createElement('td');
-    effective.dataset.label = 'Effective';
-    const effectiveName = document.createElement('span');
-    effectiveName.className = 's-quality-camera';
-    effectiveName.dataset.qualityEffective = sourceId;
-    const detail = document.createElement('span');
-    detail.className = 's-quality-detail';
-    detail.dataset.qualityDetail = sourceId;
-    detail.textContent = 'Current cap --';
-    effective.append(effectiveName, detail);
-
-    row.append(camera, quality, effective);
-    table.appendChild(row);
-  });
-  updateQualityPreview();
-}
-
-async function loadRecordingQuality() {
-  const response = await fetch('/api/settings/recording-quality', {cache:'no-store'}).catch(() => null);
-  if (!response?.ok) return;
-  _recordingQuality = await response.json();
-  renderRecordingQuality();
-}
-
-document.getElementById('qualitySaveBtn')?.addEventListener('click', async () => {
-  const msg = document.getElementById('qualityMsg');
-  const button = document.getElementById('qualitySaveBtn');
-  const global = document.getElementById('qualityGlobal')?.value || 'balanced';
-  const overrides = {};
-  document.querySelectorAll('[data-quality-source]').forEach(select => {
-    overrides[select.dataset.qualitySource] = select.value;
-  });
-  if (msg) { msg.textContent = 'Saving...'; msg.className = 's-save-msg'; }
-  if (button) button.disabled = true;
-  const response = await fetch('/api/settings/recording-quality', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({global_quality: global, overrides, apply: true}),
-  }).catch(() => null);
-  const data = await response?.json().catch(() => ({})) || {};
-  if (button) button.disabled = false;
-  if (!response?.ok) {
-    if (msg) { msg.textContent = data.error || `Error ${response?.status || ''}`; msg.className = 's-save-msg err'; }
-    return;
-  }
-  _recordingQuality = data;
-  renderRecordingQuality();
-  const n = data.applied_source_ids?.length || 0;
-  if (msg) {
-    msg.textContent = n ? `Saved — restarting ${n} camera${n === 1 ? '' : 's'}` : 'Saved';
-    msg.className = 's-save-msg ok';
-  }
-  if (n) setTimeout(loadMediaHealth, 4000);
-});
 
 // ── Add camera drawer ─────────────────────────────────
 const showAddBtn   = document.getElementById('showAddBtn');
@@ -646,7 +442,7 @@ document.getElementById('addBtn').addEventListener('click', async () => {
   const url  = document.getElementById('newUrl').value.trim();
   if (!name || !url) return;
   const r = await fetch('/api/sources',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,url})});
-  if (r.ok) { closeDrawer(); loadCameras().then(() => { loadNotificationRules(); loadRecordingQuality(); }); }
+  if (r.ok) { closeDrawer(); loadCameras().then(() => { loadNotificationRules(); }); }
 });
 
 // ── Notification rules ───────────────────────────────
@@ -1097,7 +893,7 @@ sections.forEach(s => observer.observe(s));
 
 // ── Init ──────────────────────────────────────────────
 loadStatus();
-loadCameras().then(() => { loadNotificationRules(); loadRecordingQuality(); });
+loadCameras().then(() => { loadNotificationRules(); });
 loadMediaHealth();
 loadCleanupConfig();
 setInterval(loadMediaHealth, 30000);

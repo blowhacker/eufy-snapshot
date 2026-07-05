@@ -452,7 +452,12 @@ class _StamperWorker:
             return None
 
     def _resolve_stamp_mode(self) -> str:
-        """Per-source stamp mode: DB setting > WANYARD_STAMP_MODE env > reencode."""
+        """Per-source stamp mode: DB setting > WANYARD_STAMP_MODE env > sei_copy.
+
+        sei_copy is the default everywhere; reencode survives as the
+        automatic fallback for non-h264 input and as an explicit per-source
+        escape hatch (visible burned timecode).
+        """
         mode = None
         if self._source_db_path is not None:
             try:
@@ -467,7 +472,7 @@ class _StamperWorker:
                             self.source_id, exc_info=True)
         if mode is None:
             mode = sei.normalize_stamp_mode(
-                self._src_env("MODE"), sei.STAMP_MODE_REENCODE
+                self._src_env("MODE"), sei.STAMP_MODE_SEI_COPY
             )
         return mode
 

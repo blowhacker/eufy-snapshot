@@ -275,37 +275,10 @@
           <p class="s-sec-sub">Manage disk usage. Blank fields disable that rule.</p>
         </div>
 
-        <div class="s-card">
-          <div class="s-card-section">
-            <div class="s-card-section-head">Recording quality</div>
-            <div class="s-auto-grid">
-              <div class="s-field-row">
-                <label for="qualityGlobal">Global default</label>
-                <select id="qualityGlobal"></select>
-                <span id="qualityPresetSummary" class="s-field-hint"></span>
-              </div>
-              <div class="s-quality-table-wrap">
-                <table class="s-quality-table">
-                  <thead>
-                    <tr>
-                      <th>Camera</th>
-                      <th>Quality</th>
-                      <th>Effective</th>
-                    </tr>
-                  </thead>
-                  <tbody id="qualityTable">
-                    <tr><td colspan="3" class="s-quality-empty">Loading cameras.</td></tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-            <div class="s-card-footer">
-              <button id="qualitySaveBtn" class="s-btn s-btn-primary" type="button">Save and apply</button>
-              <span id="qualityMsg" class="s-save-msg"></span>
-            </div>
-          </div>
-        </div>
-
+        <!-- Recording quality culled: stamping is SEI codec-copy (archive =
+             the camera's own bits), so archive quality/size is the CAMERA's
+             encoder setting now. The re-encode fallback (non-h264 input)
+             keeps env-level knobs only. -->
         <div class="s-card">
           <div class="s-card-section">
             <div class="s-card-section-head">Auto-cleanup</div>
@@ -377,6 +350,6 @@
     </main>
   </div>
 
-  <script src="/settings.js?v=per-camera-retention-2"></script>
+  <script src="/settings.js?v=sei-default-1"></script>
 </body>
 </html>

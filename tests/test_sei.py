@@ -131,24 +131,24 @@ class StampModeTests(unittest.TestCase):
         ))
         return db
 
-    def test_default_is_reencode(self) -> None:
+    def test_default_is_sei_copy(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             self.assertEqual(sei.stamp_mode(self._db(tmpdir), "front"),
-                             "reencode")
+                             "sei_copy")
 
     def test_source_override_beats_global(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = self._db(tmpdir)
-            db.set_setting(sei.STAMP_MODE_GLOBAL_KEY, "sei_copy")
-            self.assertEqual(sei.stamp_mode(db, "front"), "sei_copy")
-            db.set_setting(sei.stamp_mode_key("front"), "reencode")
+            db.set_setting(sei.STAMP_MODE_GLOBAL_KEY, "reencode")
             self.assertEqual(sei.stamp_mode(db, "front"), "reencode")
+            db.set_setting(sei.stamp_mode_key("front"), "sei_copy")
+            self.assertEqual(sei.stamp_mode(db, "front"), "sei_copy")
 
     def test_garbage_setting_falls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = self._db(tmpdir)
             db.set_setting(sei.stamp_mode_key("front"), "banana")
-            self.assertEqual(sei.stamp_mode(db, "front"), "reencode")
+            self.assertEqual(sei.stamp_mode(db, "front"), "sei_copy")
 
     def test_normalize_aliases(self) -> None:
         self.assertEqual(sei.normalize_stamp_mode("SEI"), "sei_copy")

@@ -55,8 +55,14 @@ def normalize_stamp_mode(value, default: str | None = None) -> str | None:
     return mode if mode in STAMP_MODES else default
 
 
-def stamp_mode(settings, source_id: str, default: str = STAMP_MODE_REENCODE) -> str:
-    """Effective stamp mode: per-source override > global setting > default."""
+def stamp_mode(settings, source_id: str, default: str = STAMP_MODE_SEI_COPY) -> str:
+    """Effective stamp mode: per-source override > global setting > default.
+
+    Default is sei_copy — codec-copy with the clock as SEI: zero generation
+    loss, archive = camera bits, no GPU. The stamper still falls back to
+    reencode automatically for non-h264 input, and reencode remains settable
+    per source (DB/env) as the forensic visible-timecode mode.
+    """
     override = normalize_stamp_mode(settings.get_setting(stamp_mode_key(source_id)))
     if override:
         return override
