@@ -26,7 +26,15 @@ body {
 .wall-logo img { width: 100%; height: 100%; display: block; }
 .wall-title { color: var(--txt); font-size: 14px; font-weight: 500; line-height: 1; letter-spacing: -0.005em; }
 .wall-sub   { color: var(--txt-3); font-size: 12px; }
-.wall-head .v2-notify-toggle { margin-left: auto; }
+/* Tile size: drives the wall grid's minmax() floor. min-ed with 100% so a
+   large tile floor can never overflow a narrow viewport. */
+.wall-size {
+  margin-left: auto;
+  width: 120px;
+  accent-color: var(--amber);
+  cursor: pointer;
+}
+@media (max-width: 560px) { .wall-size { width: 84px; } }
 
 /* ── Notifications (ported from video2.css) ───────────── */
 .ab-icon {
@@ -104,7 +112,7 @@ body {
   display: grid;
   gap: 10px;
   padding: 0 16px 16px;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(var(--tile-min, 320px), 100%), 1fr));
 }
 
 .tile {

@@ -168,6 +168,26 @@ async function build() {
   sources.forEach(s => grid.append(makeTile(s)));
 }
 
+// ── Tile size ────────────────────────────────────────────────────────────────
+// The slider drives --tile-min, the wall grid's minmax() floor: bigger floor =
+// fewer columns = bigger live tiles. Pure CSS relayout — the <video> elements
+// never detach, so streams keep playing while resizing. Persisted per browser.
+const _sizeEl = document.getElementById("wallSize");
+if (_sizeEl) {
+  const saved = parseInt(localStorage.getItem("wall_tile_min") || "", 10);
+  const clamped = Number.isFinite(saved)
+    ? Math.min(Number(_sizeEl.max), Math.max(Number(_sizeEl.min), saved))
+    : 320;
+  _sizeEl.value = String(clamped);
+  const applyTileMin = () => document.getElementById("wall")
+    .style.setProperty("--tile-min", `${_sizeEl.value}px`);
+  if (clamped !== 320) applyTileMin();
+  _sizeEl.addEventListener("input", () => {
+    applyTileMin();
+    localStorage.setItem("wall_tile_min", _sizeEl.value);
+  });
+}
+
 // Warm the hls.js library early (Chromium only; iOS uses native HLS) so the
 // instant HLS first layer is ready on a cold load instead of waiting for the
 // library to fetch — which would let the WebRTC keyframe wait show through.
