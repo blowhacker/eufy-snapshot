@@ -69,6 +69,44 @@ class VideoWorkerTests(unittest.TestCase):
         ])
         container.close.assert_called_once()
 
+    def test_mp4_frame_clock_negative_caches_sei_less_files(self) -> None:
+        """A SEI-less file writes an EMPTY sidecar once; later calls answer
+        from the mtime guard without reopening the media. (Deleting the
+        sidecar instead meant every seek into legacy footage re-scanned the
+        whole MP4.)"""
+        class Packet:
+            def __init__(self) -> None:
+                self._data = b"\x00\x00\x00\x04\x65\x88\x84\x00"   # slice, no SEI
+                self.pts = 100
+                self.time_base = Fraction(1, 1000)
+                self.size = len(self._data)
+
+            def __bytes__(self) -> bytes:
+                return self._data
+
+        container = mock.Mock()
+        container.streams = [types.SimpleNamespace(type="video")]
+        container.demux.return_value = [Packet()]
+        fake_av = types.SimpleNamespace(open=lambda _path: container)
+
+        def _no_reopen(_path):
+            raise AssertionError("negative cache must not reopen the media")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "segment.mp4"
+            path.write_bytes(b"mp4")
+            with mock.patch.dict(sys.modules, {"av": fake_av}):
+                sidecar = video._write_mp4_frame_clock(path)
+            assert sidecar is not None
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(payload, {"version": 1, "frames": []})
+
+            with mock.patch.dict(
+                sys.modules, {"av": types.SimpleNamespace(open=_no_reopen)}
+            ):
+                again = video._write_mp4_frame_clock(path)
+            self.assertEqual(again, sidecar)
+
     def test_stamped_codec_is_reprobed_after_early_exit_invalidation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._worker(Path(tmpdir))

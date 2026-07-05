@@ -3613,10 +3613,12 @@ def _write_mp4_frame_clock(path: Path) -> Path | None:
                 continue
             by_pts[round(pts * 1_000_000)] = (pts, value)
         frames = [[round(pts, 9), value] for pts, value in sorted(by_pts.values())]
-        if not frames:
-            sidecar.unlink(missing_ok=True)
-            return None
-
+        # A SEI-less file (re-encode segments, legacy archives) persists an
+        # EMPTY sidecar as a negative cache: the mtime guard above then
+        # answers every later request without touching the media. Deleting it
+        # instead meant each seek into old footage re-scanned the whole MP4 —
+        # multi-second stalls on every random timeline seek until the file
+        # aged out. The frontend treats empty frames as "no clock" (fallback).
         payload = {
             "version": _FRAME_CLOCK_VERSION,
             "frames": frames,
