@@ -2687,7 +2687,15 @@ let _loadCount = 0;
 function _loadStart() { _loadCount++; _loadBar?.classList.add("loading"); }
 function _loadEnd()   { if (--_loadCount <= 0) { _loadCount = 0; _loadBar?.classList.remove("loading"); } }
 
+// Supersession token: load() runs concurrently (15s auto-refresh interval,
+// timeline drags, source switches) and applies responses with a WHOLESALE
+// st.segments replace — a stale in-flight response (old source or old
+// window) must never clobber state written by a newer load. Each load bails
+// after any await if another load started since.
+let _loadSeq = 0;
+
 async function load() {
+  const seq = ++_loadSeq;
   _loadStart();
   const p = new URLSearchParams();
   if (st.source !== "all") p.set("source", st.source);
@@ -2714,6 +2722,12 @@ async function load() {
     fetch(`/api/video/classes?${p}`, { cache:"no-store" }).then(r=>r.json()).catch(()=>({})),
     fetchZonesForSource(),
   ]);
+  if (seq !== _loadSeq) {
+    // Superseded while fetching (source switch / newer refresh): the newer
+    // load owns all state and the fetching-range indicator — touch nothing.
+    _loadEnd();
+    return;
+  }
 
   st.segments = (sr.segments || []).map(worldizeSeg);
   if (sr.bounds) st.segmentBounds = sr.bounds;
@@ -2757,8 +2771,10 @@ async function load() {
   timeline.setData(allSegsForSrc(), filteredEvts());
 
   await fetchSourceStatus();
+  if (seq !== _loadSeq) { _loadEnd(); return; }
   renderSrcCtrl();
   await fetchActivitySummary();
+  if (seq !== _loadSeq) { _loadEnd(); return; }
   updateActivityCount();
   renderClsCtrl();
   updateZoneControl();

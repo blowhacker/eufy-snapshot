@@ -311,18 +311,29 @@ function drawHealthChart() {
   line('stamped_bitrate_bps',colors.stamped);
 }
 
+// Ordering token: the 30s poll, the refresh button, and the hours switcher
+// can overlap — a slow older response must not overwrite a newer one.
+let _healthSeq = 0;
+
 async function loadMediaHealth() {
+  const seq = ++_healthSeq;
   const updated = document.getElementById('healthUpdated');
   const button = document.getElementById('healthRefreshBtn');
   if (button) button.disabled = true;
   const query = new URLSearchParams({hours:String(_healthHours)});
   const response = await fetch(`/api/settings/media-health?${query}`, {cache:'no-store'}).catch(()=>null);
+  if (seq !== _healthSeq) return;   // superseded — the newer call owns the UI
   if (!response?.ok) {
     if (updated) updated.textContent = 'Unavailable';
     if (button) button.disabled = false;
     return;
   }
-  _mediaHealth = await response.json();
+  const payload = await response.json().catch(() => null);
+  if (seq !== _healthSeq || !payload) {
+    if (button && seq === _healthSeq) button.disabled = false;
+    return;
+  }
+  _mediaHealth = payload;
   if (updated) updated.textContent = `Updated ${fmt.age(Date.now()/1000-_mediaHealth.generated_at)} ago`;
   populateHealthSources();
   renderHealthTable();
