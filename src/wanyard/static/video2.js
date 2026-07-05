@@ -4453,11 +4453,11 @@ function drawBoxes(ts) {
 }
 
 function drawLiveBoxes() {
-  // The displayed frame carries its exact BITC time in the burned marker. HLS
-  // playback is held near the freshest YOLO timestamp, so recentDets should
-  // bracket the marker time or land exactly on the latest boxes.
-  const markerTs = decodeLiveMarker(el.liveVideo);
-  if (markerTs == null) { drawBoxList(el.liveVideo, []); return; }
+  // Pixel-BITC streams read the displayed frame directly; SEI-copy streams
+  // use the server-anchored HLS media-time mapping. Both paths are owned by
+  // liveTailCurrentTs(), so overlays must not require a pixel marker here.
+  const markerTs = liveTailCurrentTs();
+  if (!Number.isFinite(markerTs)) { drawBoxList(el.liveVideo, []); return; }
   const sample = liveTail.recentDets.length
     ? sampleTrackletBoxes(liveTracklets(), markerTs, true)   // live: fade held boxes
     : { boxes: [], mode: "empty" };
