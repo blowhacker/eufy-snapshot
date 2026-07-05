@@ -111,11 +111,15 @@ function sourceRecordMode(sourceId) {
 function healthState(row) {
   if (!row?.ts) return { cls:'warn', label:'Collecting' };
   const sampleAge = Date.now()/1000 - Number(row.ts || 0);
-  // Live-only cameras have no stamper/recorder BY DESIGN — judging them on
-  // those reads "Offline" for a healthy camera. Only the raw relay matters.
+  // Live-only cameras have no stamper/recorder BY DESIGN, and their relay
+  // path is pulled ON DEMAND — it drops to not-ready the moment the last
+  // wall viewer leaves. Idle is not offline: without probing the camera we
+  // cannot distinguish "nobody watching" from "camera down", so claim
+  // neither. Green = streaming right now; neutral = idle.
   if (sourceRecordMode(row.source_id) === 'live_only') {
-    if (sampleAge > 60 || !row.raw_ready) return { cls:'dead', label:'Offline' };
-    return { cls:'ok', label:'Live-only' };
+    if (sampleAge > 60) return { cls:'dead', label:'Offline' };
+    if (row.raw_ready) return { cls:'ok', label:'Live-only' };
+    return { cls:'', label:'Live-only' };
   }
   const stamper = row.stamper || {};
   const stamperAge = Date.now()/1000 - Number(stamper.updated_at || 0);
@@ -158,9 +162,9 @@ function renderHealthTable() {
       <td><span class="s-health-camera"></span></td>
       <td><span class="s-health-state ${state.cls}">${state.label}</span></td>
       <td><span class="s-health-metric">${stamper.active_encoder || '--'}</span><span class="s-health-detail">${resolution}${fps ? ' · '+fps : ''}</span></td>
-      <td><span class="s-health-metric">${fmt.bitrate(row.raw_bitrate_bps)}</span><span class="s-health-detail">${row.raw_ready ? 'relay ready' : 'relay offline'}</span></td>
+      <td><span class="s-health-metric">${fmt.bitrate(row.raw_bitrate_bps)}</span><span class="s-health-detail">${row.raw_ready ? (liveOnly ? 'streaming (on demand)' : 'relay ready') : (liveOnly ? 'idle — streams on demand' : 'relay offline')}</span></td>
       <td><span class="s-health-metric">${liveOnly ? '--' : fmt.bitrate(row.stamped_bitrate_bps)}</span><span class="s-health-detail">${liveOnly ? 'live-only' : cap == null ? (row.stamped_ready ? 'relay ready' : 'relay offline') : `${cap}% of ${fmt.bitrate(maxrate)}`}</span></td>
-      <td><span class="s-health-metric">${fmt.age(row.hls_age_seconds)}</span><span class="s-health-detail">${row.hls_age_seconds != null && Number(row.hls_age_seconds) <= 5 ? 'fresh' : 'stale'}</span></td>
+      <td><span class="s-health-metric">${liveOnly ? '--' : fmt.age(row.hls_age_seconds)}</span><span class="s-health-detail">${liveOnly ? 'live-only' : row.hls_age_seconds != null && Number(row.hls_age_seconds) <= 5 ? 'fresh' : 'stale'}</span></td>
       <td><span class="s-health-metric">${row.recorder_codec || '--'}</span><span class="s-health-detail">${recorderIssue}</span></td>`;
     ['Camera','State','Encoder','Raw','Stamped','HLS','Recorder'].forEach((label,index) => {
       tr.children[index].dataset.label = label;
