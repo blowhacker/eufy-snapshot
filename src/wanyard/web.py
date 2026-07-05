@@ -1478,6 +1478,32 @@ def make_app(
             )
         return response
 
+    # Frame-clock builds are full-file packet scans (seconds for a legacy
+    # 500MB HEVC file). Scrubbing across old segments can request many at
+    # once, and an aborted HTTP fetch does NOT stop a to_thread scan — a
+    # short drag once queued a dozen parallel scans that pinned the disk and
+    # starved every other request. Dedup per path (concurrent requesters
+    # await one build) and serialize globally (one scan owns the disk).
+    _clock_builds: dict[str, asyncio.Future] = {}
+    _clock_build_gate = asyncio.Semaphore(1)
+
+    async def _ensure_frame_clock(media_path) -> None:
+        key = str(media_path)
+        fut = _clock_builds.get(key)
+        if fut is None:
+            async def _build() -> None:
+                from .video import _write_mp4_frame_clock
+                async with _clock_build_gate:
+                    await asyncio.to_thread(_write_mp4_frame_clock, media_path)
+            fut = asyncio.ensure_future(_build())
+            _clock_builds[key] = fut
+            fut.add_done_callback(lambda _f: _clock_builds.pop(key, None))
+        try:
+            await fut
+        except Exception:
+            LOG.warning("frame clock build failed for %s", media_path,
+                        exc_info=True)
+
     async def serve_video_file(request: Request) -> Response:
         if not video_dir:
             return Response(status_code=404)
@@ -1488,8 +1514,7 @@ def make_app(
         if not path.is_file() and path.name.endswith(".mp4.clock.json"):
             media_path = path.with_name(path.name[:-len(".clock.json")])
             if media_path.is_file() and media_path.suffix.lower() == ".mp4":
-                from .video import _write_mp4_frame_clock
-                await asyncio.to_thread(_write_mp4_frame_clock, media_path)
+                await _ensure_frame_clock(media_path)
         if not path.is_file():
             return Response(status_code=404)
         suffix = path.suffix.lower()

@@ -160,8 +160,15 @@ class V2Player {
       }
 
       if (signal.aborted) return null;
-      await frameClockPromise;
-      if (signal.aborted) return null;
+      // frameClock "lazy": don't block the landing on the sidecar (a legacy
+      // file's first request BUILDS it server-side — seconds). The clock
+      // ingests when the fetch resolves; currentTs falls back to the epoch
+      // mapping until then, then flips to frame-exact. Scrub/drag seeks use
+      // this; normal seeks still wait for frame-exact landing.
+      if (opts.frameClock !== "lazy") {
+        await frameClockPromise;
+        if (signal.aborted) return null;
+      }
       this.#activeSeg = seg;
       if (Math.abs((this.#v.currentTime || 0) - startPosition) > 0.05) {
         const seeked = this.#waitFor("seeked", signal);
@@ -2493,6 +2500,7 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
         segmentId: resolved.segment_id,
         requestedTs: desiredTs,
         autoplay,
+        frameClock: options.frameClock,
       });
       if (seq !== absoluteSeekSeq) return false;
       if (landing) {
@@ -3342,6 +3350,7 @@ async function _runPlayheadScrub() {
       scroll: false,
       retries: 0,
       liveFallback: false,
+      frameClock: "lazy",
     });
   } finally {
     state.busy = false;
@@ -3470,7 +3479,7 @@ function endTimelineDrag(e) {
     _playheadDrag = null;
     cancelPlayheadScrub();   // no trailing preview seek after the final one
     el.tlCanvas.style.cursor = "";
-    seekToTimestamp(drag.sourceId, drag.ts, { scroll: false });
+    seekToTimestamp(drag.sourceId, drag.ts, { scroll: false, frameClock: "lazy" });
     return;
   }
   if (st.clip.drag) {
