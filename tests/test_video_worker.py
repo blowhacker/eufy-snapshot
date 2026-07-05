@@ -126,48 +126,6 @@ class VideoWorkerTests(unittest.TestCase):
             self.assertEqual(status["codec"], "h264")
             self.assertIsNotNone(status["codec_probe_ts"])
 
-    def test_hvc1_mismatch_is_recognized_for_corrective_retry(self) -> None:
-        stderr = (
-            "[mp4 @ 0x123] Tag hvc1 incompatible with output codec id '27' (avc1)\n"
-            "Could not write header: Invalid data found when processing input"
-        )
-        self.assertTrue(VideoWorker._is_hvc1_tag_mismatch(stderr))
-        self.assertFalse(VideoWorker._is_hvc1_tag_mismatch("connection timed out"))
-
-    def test_run_retries_hvc1_mismatch_once_without_tag(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            worker = self._worker(Path(tmpdir))
-            first = mock.Mock()
-            first.poll.return_value = 1
-            first.returncode = 1
-            first.stderr = io.BytesIO(
-                b"Tag hvc1 incompatible with output codec id '27' (avc1)"
-            )
-            second = mock.Mock()
-            second.poll.return_value = None
-            second.returncode = None
-            attempts: list[bool] = []
-
-            def start(_ts: float, *, omit_hvc1: bool = False) -> None:
-                attempts.append(omit_hvc1)
-                worker._segment_hvc1 = not omit_hvc1
-                worker._proc = first if len(attempts) == 1 else second
-
-            def stop(_ts: float) -> bool:
-                worker._proc = None
-                return False
-
-            def wait(_seconds: float) -> bool:
-                worker._stop.set()
-                return True
-
-            with mock.patch.object(worker, "_start_segment", side_effect=start), \
-                 mock.patch.object(worker, "_stop_segment", side_effect=stop), \
-                 mock.patch.object(worker._stop, "wait", side_effect=wait):
-                worker.run()
-
-            self.assertEqual(attempts, [False, True])
-
     def test_clean_early_exit_completes_epoch_without_failure_or_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._worker(Path(tmpdir))
@@ -176,8 +134,7 @@ class VideoWorkerTests(unittest.TestCase):
             proc.returncode = 0
             proc.stderr = io.BytesIO(b"input stream ended")
 
-            def start(_ts: float, *, omit_hvc1: bool = False) -> None:
-                worker._segment_hvc1 = not omit_hvc1
+            def start(_ts: float) -> None:
                 worker._proc = proc
 
             def completed(_ts: float, *, reset_failures: bool = True) -> None:
@@ -197,7 +154,9 @@ class VideoWorkerTests(unittest.TestCase):
             record_failure.assert_not_called()
             wait.assert_not_called()
 
-    def test_start_segment_can_omit_hvc1_for_corrective_retry(self) -> None:
+    def test_start_segment_never_tags_hvc1(self) -> None:
+        """Stamped streams are always H.264 now (sei_copy or the h264-only
+        re-encode fallback); the HEVC hvc1-tagging dance is gone."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db = mock.Mock()
             db.open_segment.return_value = 7
@@ -207,13 +166,12 @@ class VideoWorkerTests(unittest.TestCase):
                             return_value="rtsp://relay/camera"), \
                  mock.patch("wanyard.video.shutil.which", return_value="/usr/bin/ffmpeg"), \
                  mock.patch.object(worker, "_wait_for_relay_path", return_value=True), \
-                 mock.patch.object(worker, "_stamped_codec", return_value="hevc"), \
+                 mock.patch.object(worker, "_stamped_codec", return_value="h264"), \
                  mock.patch("wanyard.video.subprocess.Popen", return_value=proc) as popen:
-                worker._start_segment(1_781_600_000.0, omit_hvc1=True)
+                worker._start_segment(1_781_600_000.0)
 
             command = popen.call_args.args[0]
             self.assertNotIn("hvc1", command)
-            self.assertFalse(worker._segment_hvc1)
 
     def test_stop_segment_removes_only_empty_failed_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -1,7 +1,9 @@
 # Banishing BITC and its acolytes
 
-Status: Phase 1 not started. Prod runs SEI (`sei_copy` default) on master since
-2026-07-05; this plan removes the legacy pixel-marker machinery.
+Status: **Phase 1 done (2026-07-05)** — no process writes pixels; the
+reencode fallback injects SEI on its encoded packets, output is h264-only,
+the recorder's hvc1 dance and recording_quality.py are gone. Phase 2 waits on
+the gate below. Prod runs SEI (`sei_copy` default) on master since 2026-07-05.
 
 ## The constraint that shapes everything
 

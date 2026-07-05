@@ -418,3 +418,59 @@ class YoloTagTests(EndToEndTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
+class ReencodeSeiInjectionTests(unittest.TestCase):
+    """The re-encode fallback carries the clock as SEI on its encoded packets
+    (no pixel marker). Mirrors the stamper's pending_values pattern: value
+    keyed by assigned pts, re-attached to the encoder packet with that pts."""
+
+    def test_values_bind_through_a_real_encoder(self) -> None:
+        import av
+
+        epoch = 1_760_000_000.0
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reencoded.mp4"
+            out = av.open(str(path), "w", format="mp4")
+            vout = out.add_stream("libx264", rate=10)
+            vout.width, vout.height, vout.pix_fmt = 320, 240, "yuv420p"
+            vout.options = {"bf": "0", "g": "5", "tune": "zerolatency"}
+            # like the stamper: encoder time_base == assigned frame pts base,
+            # so packet pts round-trips exactly and the value map keys match
+            vout.codec_context.time_base = Fraction(1, 90_000)
+            pending = {}
+
+            def mux_encoded(packets):
+                for op in packets:
+                    value = pending.pop(op.pts, None)
+                    if value is not None:
+                        injected = sei.inject(bytes(op), value)
+                        if injected is not None:
+                            np_ = av.Packet(injected)
+                            np_.pts = op.pts
+                            np_.dts = op.dts
+                            np_.time_base = op.time_base
+                            np_.stream = op.stream
+                            np_.is_keyframe = op.is_keyframe
+                            op = np_
+                    out.mux(op)
+
+            expected = []
+            for i in range(12):
+                frame = av.VideoFrame(320, 240, "yuv420p")
+                frame.pts = i * 9000
+                frame.time_base = Fraction(1, 90_000)
+                value = sei.encode_value(epoch + i / 10)
+                pending[frame.pts] = value
+                expected.append(value)
+                mux_encoded(vout.encode(frame))
+            mux_encoded(vout.encode())
+            out.close()
+            self.assertEqual(pending, {}, "every submitted value was attached")
+
+            got = []
+            with av.open(str(path)) as container:
+                for frame in container.decode(video=0):
+                    got.append(sei.decode_value_frame(frame))
+            self.assertEqual(got, expected)

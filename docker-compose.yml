@@ -80,7 +80,6 @@ services:
       # WHEP proxy uses the address the browser reached us on — works out of the
       # box. Set only for topologies where that host isn't reachable for ICE.
       - WANYARD_WEBRTC_ADDITIONAL_HOSTS=${WANYARD_WEBRTC_ADDITIONAL_HOSTS:-}
-      # (recorder auto-detects the stamped codec and tags hvc1 only for HEVC)
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
@@ -140,24 +139,14 @@ services:
       - VIDEO_DIR=/app/video
       - WANYARD_RELAY_HOST=mediamtx
       - WANYARD_MEDIA_HEALTH_DB=/app/data/media-health.db
-      # Encoder auto-detects NVENC (GPU) and falls back to libx264. Quality-
-      # targeted (cq/crf) with a VBV cap above camera native (~1.6M garden /
-      # ~0.8M front): re-encoding compressed video needs headroom to match the
-      # original's look; the cap just bounds motion peaks for retention.
-      # All cameras HEVC for the trial. cq28 (not 25): at cq25 HEVC sat at the
-      # 2.5M cap = no storage win vs h264; cq28 lets HEVC's ~30% efficiency drop
-      # the bitrate at ~h264-cq25 quality, which is the whole point. Recorder
-      # tags the .mp4 hvc1 for browser playback (WANYARD_RECORD_VIDEO_TAG).
+      # Stamping is SEI codec-copy by default (zero re-encode; archive = the
+      # camera's own bits). These knobs tune the h264 re-encode FALLBACK only
+      # (non-h264 camera input): NVENC when available, else libx264; quality-
+      # targeted (cq/crf) with a VBV cap bounding motion peaks for retention.
       - WANYARD_STAMP_ENCODER=auto
       - WANYARD_STAMP_CQ=28
       - WANYARD_STAMP_MAXRATE=2.5M
       - WANYARD_STAMP_BUFSIZE=5M
-      # Garden is 2560x1440 at ~1.6 Mbps native. If NVENC is unavailable and it
-      # falls back to CPU H.264, 2.5M starves each 1s keyframe and causes a
-      # visible quality pulse. Keep HEVC on the storage-efficient global cap,
-      # but give garden H.264 enough VBV headroom to preserve source quality.
-      - WANYARD_STAMP_TAPO_GARDEN_H264_MAXRATE=5M
-      - WANYARD_STAMP_TAPO_GARDEN_H264_BUFSIZE=10M
       # realtime-live experiment: 1s keyframe interval -> 1s HLS segments ->
       # lower live latency (see liveSyncDurationCount + hls_time=1).
       - WANYARD_STAMP_GOP_SECONDS=1

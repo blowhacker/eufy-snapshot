@@ -22,14 +22,9 @@ from pathlib import Path
 
 import numpy as np
 
-from . import bitc, sei
+from . import sei
 from .live_detector import _list_relay_paths
 from .media_health import MediaHealthStore, default_db_path
-from .recording_quality import (
-    configured_quality_id,
-    encoder_options_for_quality,
-    read_stamper_reload_request,
-)
 
 LOG = logging.getLogger("wanyard.stamper")
 
@@ -221,7 +216,6 @@ class _StamperWorker:
         self._invalid_metadata_count = 0
         self._last_invalid_metadata_event_ts = 0.0
         self._source_db_path = source_db_path
-        self._quality_settings_error_reported = False
         try:
             self.epoch_gap_seconds = float(
                 self._src_env("EPOCH_GAP_SECONDS", "2.0") or "2.0"
@@ -303,10 +297,10 @@ class _StamperWorker:
 
     def _demote_on_encoder_error(self, exc: Exception) -> bool:
         """On a failure to OPEN the video encoder (e.g. NVENC session cap hit at
-        runtime), fall back hevc_nvenc → h264_nvenc → libx264 for the rest of the
-        process so the camera stays alive (CPU) instead of looping on a codec that
-        can't open. Non-open errors (network etc.) take the normal reconnect."""
-        demote = {"hevc_nvenc": "h264_nvenc", "h264_nvenc": "libx264"}
+        runtime), fall back h264_nvenc → libx264 for the rest of the process so
+        the camera stays alive (CPU) instead of looping on a codec that can't
+        open. Non-open errors (network etc.) take the normal reconnect."""
+        demote = {"h264_nvenc": "libx264"}
         nxt = demote.get(self._active_codec or "")
         if nxt and "avcodec_open2" in str(exc):
             LOG.warning("stamper %s encoder %s failed to open — falling back to %s",
@@ -374,37 +368,35 @@ class _StamperWorker:
             time.sleep(min(0.25, max(0.0, end - time.time())))
 
     def _video_codec(self) -> str:
-        """Resolve the output video encoder.
+        """Resolve the re-encode fallback's output encoder — H.264 only.
 
-        ``auto`` prefers GPU and best codec: hevc_nvenc → h264_nvenc → libx264,
-        each gated by a real open+encode probe (the codecs are compiled in even
-        with no GPU / a container started without gpu.yml, so presence is not
-        enough). A GPU-less box (the default `docker compose up`) lands on
-        libx264 — no crash loop.
+        The clock rides as an H.264 SEI NAL on the encoded packets, so the
+        fallback emits h264: h264_nvenc when the GPU probe succeeds, else
+        libx264 (a GPU-less box — the default `docker compose up` — lands on
+        libx264, no crash loop). HEVC output is gone with the pixel marker:
+        its only justification was re-encode storage efficiency, and it cost
+        an hvc1-tagging dance plus playback holes on cheap Android.
         """
         if self._codec_override:
             return self._codec_override   # runtime fallback after an open failure
         if self.encoder == "libx264":
             return "libx264"
-        if self.encoder in ("nvenc", "h264_nvenc"):
+        requested = self.encoder or "auto"
+        if requested not in ("auto", "nvenc", "h264_nvenc"):
+            LOG.warning("stamper %s encoder=%s unsupported (h264 only) — "
+                        "using auto", self.source_id, requested)
+        if requested in ("nvenc", "h264_nvenc"):
             return "h264_nvenc"
-        if self.encoder in ("hevc", "hevc_nvenc", "h265_nvenc"):
-            return "hevc_nvenc"
-        for cand in ("hevc_nvenc", "h264_nvenc"):
-            if _nvenc_available(cand):
-                LOG.info("stamper %s encoder=auto resolved to %s", self.source_id, cand)
-                return cand
-        codec = "libx264"
-        LOG.info("stamper %s encoder=auto resolved to %s (no usable NVENC)",
-                 self.source_id, codec)
-        return codec
+        if _nvenc_available("h264_nvenc"):
+            LOG.info("stamper %s encoder=auto resolved to h264_nvenc",
+                     self.source_id)
+            return "h264_nvenc"
+        LOG.info("stamper %s encoder=auto resolved to libx264 (no usable NVENC)",
+                 self.source_id)
+        return "libx264"
 
     def _video_options(self, codec: str, gop: int) -> dict[str, str]:
         opts = {"g": str(gop), "keyint_min": str(gop)}
-        quality_id = self._configured_quality_id()
-        quality_options = (
-            encoder_options_for_quality(quality_id, codec) if quality_id else {}
-        )
         if codec.endswith("_nvenc"):
             # Low-latency tuning is mandatory, not optional: the live detector
             # drops frames whose age exceeds 1.0s (_MAX_LIVE_LAG_SECONDS), and
@@ -414,42 +406,20 @@ class _StamperWorker:
             # Quality comes from cq + bitrate, not from B-frames, so the look is
             # unaffected.
             opts.update({"preset": self.nvenc_preset, "tune": "ll", "rc": "vbr",
-                         "cq": quality_options.get("cq", self.cq),
+                         "cq": self.cq,
                          "bf": "0", "rc-lookahead": "0",
                          "delay": "0"})
         else:
             # zerolatency: same reason — keep the re-encode within the live
             # detector's 1.0s staleness gate.
             opts.update({"preset": self.preset, "tune": "zerolatency",
-                         "crf": quality_options.get("crf", self.crf)})
-        family = "HEVC" if codec == "hevc_nvenc" else "H264"
-        maxrate = quality_options.get("maxrate")
-        bufsize = quality_options.get("bufsize")
-        if not maxrate:
-            maxrate = self._src_env(f"{family}_MAXRATE", self.maxrate)
-            bufsize = self._src_env(f"{family}_BUFSIZE", self.bufsize)
+                         "crf": self.crf})
+        maxrate = self._src_env("H264_MAXRATE", self.maxrate)
+        bufsize = self._src_env("H264_BUFSIZE", self.bufsize)
         if maxrate:
             opts["maxrate"] = maxrate
             opts["bufsize"] = bufsize or maxrate
         return opts
-
-    def _configured_quality_id(self) -> str | None:
-        if self._source_db_path is None:
-            return None
-        try:
-            from .db import SourceDB
-
-            settings = SourceDB(Path(self._source_db_path))
-            return configured_quality_id(settings, self.source_id)
-        except Exception:
-            if not self._quality_settings_error_reported:
-                LOG.warning(
-                    "stamper %s could not read recording quality settings",
-                    self.source_id,
-                    exc_info=True,
-                )
-                self._quality_settings_error_reported = True
-            return None
 
     def _resolve_stamp_mode(self) -> str:
         """Per-source stamp mode: DB setting > WANYARD_STAMP_MODE env > sei_copy.
@@ -607,7 +577,33 @@ class _StamperWorker:
 
             anchor = _StampAnchor(self.source_id)
             timeline = _BitcMediaTimeline(max_gap_seconds=self.epoch_gap_seconds)
+            # Clock values for frames submitted to the encoder, keyed by the
+            # pts we assigned. The encoder may hold frames briefly (startup
+            # delay), so the value is re-attached to the packet that carries
+            # that exact pts — same per-frame binding as the copy path.
+            pending_values: dict[int, int] = {}
             last_health_update = 0.0
+
+            def _mux_encoded(packets) -> None:
+                # Defensive bound: with codec tb == 1/90000 every packet pts
+                # matches a submitted frame exactly, but never let a mismatch
+                # grow the map unbounded.
+                while len(pending_values) > 300:
+                    pending_values.pop(next(iter(pending_values)))
+                for op in packets:
+                    value = pending_values.pop(op.pts, None)
+                    if value is not None:
+                        injected = sei.inject(bytes(op), value)
+                        if injected is not None:
+                            np_ = av.Packet(injected)
+                            np_.pts = op.pts
+                            np_.dts = op.dts
+                            np_.time_base = op.time_base
+                            np_.stream = op.stream
+                            np_.is_keyframe = op.is_keyframe
+                            op = np_
+                    out.mux(op)
+
             for packet in inp.demux():
                 if self.stopped():
                     break
@@ -627,34 +623,24 @@ class _StamperWorker:
                         pts = timeline.pts(abs_ts)
                         if pts is None:
                             LOG.debug(
-                                "stamper %s dropped stale BITC frame %.6f",
+                                "stamper %s dropped stale frame %.6f",
                                 self.source_id,
                                 abs_ts,
                             )
                             continue
-                        # Stamp directly into the decoded yuv420p planes: the
-                        # marker is pure luma, so write the Y cells and
-                        # neutralise chroma in place. Avoids the bgr24
-                        # round-trip (two full-frame colourspace conversions
-                        # per frame just to touch a luma strip).
-                        if frame.format.name != "yuv420p":
-                            frame = frame.reformat(format="yuv420p")
+                        # The clock rides as an SEI NAL on the encoded packet
+                        # (injected in _mux_encoded) — the re-encode fallback
+                        # emits the same carrier as sei_copy, no pixel marker.
                         try:
-                            value = bitc.encode_value(abs_ts)
+                            pending_values[pts] = sei.encode_value(abs_ts)
                         except ValueError:
                             LOG.warning("stamper %s abs_ts %.3f out of range",
                                         self.source_id, abs_ts)
-                        else:
-                            yb, ub, vb = frame.planes
-                            y = np.frombuffer(yb, np.uint8).reshape(-1, yb.line_size)
-                            u = np.frombuffer(ub, np.uint8).reshape(-1, ub.line_size)
-                            vp = np.frombuffer(vb, np.uint8).reshape(-1, vb.line_size)
-                            bitc.render_yuv420(y, u, vp, value)
+                        if frame.format.name != "yuv420p":
+                            frame = frame.reformat(format="yuv420p")
                         frame.pts = pts
                         frame.time_base = out_tb
-                        encoded = vout.encode(frame)
-                        for op in encoded:
-                            out.mux(op)
+                        _mux_encoded(vout.encode(frame))
                         if wall - last_health_update >= 15.0:
                             self._health_state(
                                 "live",
@@ -682,8 +668,7 @@ class _StamperWorker:
                         LOG.info("stamper %s audio mux dropped: %s",
                                  self.source_id, exc)
             if not self.stopped():
-                for op in vout.encode():
-                    out.mux(op)
+                _mux_encoded(vout.encode())
                 raise EOFError("rtsp input ended")
         finally:
             if out is not None:
@@ -757,7 +742,7 @@ class _StamperWorker:
                         continue
                     data = bytes(packet)
                     try:
-                        value = bitc.encode_value(abs_ts)
+                        value = sei.encode_value(abs_ts)
                     except ValueError:
                         LOG.warning("stamper %s abs_ts %.3f out of range",
                                     self.source_id, abs_ts)
@@ -817,8 +802,6 @@ class _StamperSupervisor:
         self.relay_host = os.environ.get("WANYARD_RELAY_HOST", "mediamtx").strip() or "mediamtx"
         self.workers: dict[str, _StamperWorker] = {}
         self.source_db_path = source_db_path
-        initial_reload = read_stamper_reload_request(source_db_path)
-        self._last_reload_token = initial_reload["token"] if initial_reload else None
         self.health_store: MediaHealthStore | None = None
         try:
             # Telemetry is best-effort and runs on the frame thread. Bound any
@@ -844,7 +827,6 @@ class _StamperSupervisor:
                 except Exception:
                     LOG.exception("stamper path discovery failed")
                 next_path_refresh = now + _PATH_REFRESH_SECONDS
-            self._handle_reload_request()
             self.stop_event.wait(_SUPERVISOR_POLL_SECONDS)
         for worker in self.workers.values():
             worker.stop()
@@ -896,44 +878,6 @@ class _StamperSupervisor:
             self.workers[source_id].stop()
             del self.workers[source_id]
             LOG.info("stamper stopped removed path=%s", source_id)
-
-    def _handle_reload_request(self) -> None:
-        request = read_stamper_reload_request(self.source_db_path)
-        if not request or request["token"] == self._last_reload_token:
-            return
-        self._last_reload_token = request["token"]
-        requested = set(request["source_ids"])
-        source_ids = set(self.workers) if not requested or "*" in requested else requested
-        for source_id in sorted(source_ids):
-            if source_id in self.workers:
-                self._restart_worker(source_id)
-
-    def _restart_worker(self, source_id: str) -> None:
-        old = self.workers.get(source_id)
-        if old is None:
-            return
-        old.stop()
-        old.thread.join(timeout=10.0)
-        if old.thread.is_alive():
-            LOG.warning(
-                "stamper %s did not stop cleanly before quality reload",
-                source_id,
-            )
-        worker = self._make_worker(source_id)
-        self.workers[source_id] = worker
-        worker.start()
-        LOG.info("stamper restarted path=%s reason=recording_quality", source_id)
-        if self.health_store is not None:
-            try:
-                self.health_store.event(
-                    source_id,
-                    "stamper",
-                    "info",
-                    "recording_quality_reload",
-                    "recording quality changed; restarted stream",
-                )
-            except Exception:
-                LOG.warning("could not record stamper reload event", exc_info=True)
 
 
 def run(config=None) -> int:

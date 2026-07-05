@@ -3092,7 +3092,6 @@ class VideoWorker:
         self._last_failure_kind: str | None = None
         self._consecutive_failures = 0
         self._completed_segments = 0
-        self._segment_hvc1 = False
         self._codec_cache_valid = False
         self._codec_cache: str | None = None
 
@@ -3219,15 +3218,11 @@ class VideoWorker:
         LOG.info("continuous recording started: %s", self.source.id)
         self._salvage_orphan_segments()
         backoff = _RECORD_RETRY_INITIAL_SECONDS
-        omit_hvc1_once = False
         while not self._stop.is_set():
             try:
                 ts = time.time()
-                omit_hvc1 = omit_hvc1_once
-                omit_hvc1_once = False
-                self._start_segment(ts, omit_hvc1=omit_hvc1)
+                self._start_segment(ts)
                 if self._proc:
-                    attempted_hvc1 = self._segment_hvc1
                     early_stderr = ""
                     returncode = None
                     # Poll every 5s so we detect ffmpeg exit within 5 seconds
@@ -3265,18 +3260,7 @@ class VideoWorker:
                             self._record_segment_completed(
                                 stopped_ts, reset_failures=False,
                             )
-                        if clean_epoch_end:
-                            pass
-                        elif attempted_hvc1 and self._is_hvc1_tag_mismatch(early_stderr):
-                            self._record_failure("codec_tag_mismatch")
-                            if not omit_hvc1:
-                                LOG.warning(
-                                    "retrying %s immediately without hvc1 tag",
-                                    self.source.id,
-                                )
-                                omit_hvc1_once = True
-                                continue
-                        else:
+                        if not clean_epoch_end:
                             self._record_failure("ffmpeg_early_exit")
                     elif segment_ok:
                         self._record_segment_completed(stopped_ts)
@@ -3297,8 +3281,6 @@ class VideoWorker:
                                     elapsed, self.source.id, backoff)
                         self._stop.wait(backoff)
                 else:
-                    if omit_hvc1:
-                        omit_hvc1_once = True
                     LOG.warning("ffmpeg failed to start for %s — backoff %.0fs",
                                 self.source.id, backoff)
                     self._stop.wait(backoff)
@@ -3316,11 +3298,6 @@ class VideoWorker:
         self._stop.set()
         if self._seg_id or self._proc:
             self._stop_segment(time.time())
-
-    @staticmethod
-    def _is_hvc1_tag_mismatch(stderr: str) -> bool:
-        text = stderr.lower()
-        return "tag hvc1 incompatible with output codec id" in text
 
     def _invalidate_stamped_codec(self) -> None:
         with self._status_lock:
@@ -3358,7 +3335,7 @@ class VideoWorker:
             self._codec_cache_valid = codec is not None
         return codec
 
-    def _start_segment(self, ts: float, *, omit_hvc1: bool = False) -> None:
+    def _start_segment(self, ts: float) -> None:
         from .capture import resolve_rtsp_url
         url    = resolve_rtsp_url(self.source)
         ffmpeg = shutil.which("ffmpeg")
@@ -3374,14 +3351,10 @@ class VideoWorker:
         self._prune_live_dir()
         seg_path = date_dir / dt.strftime("%Y-%m-%d_%H-%M-%S.mp4")
         rel_path = seg_path.relative_to(self.video_dir).as_posix()
-        # HEVC in MP4 needs the 'hvc1' tag for Chrome/Safari (ffmpeg's mov muxer
-        # defaults to 'hev1', which they refuse). H264 must NOT be tagged hvc1 —
-        # it's incompatible and ffmpeg fails to write the header. The stamper's
-        # encoder is auto-resolved (hevc/h264/libx264), so tag only when the
-        # actual stream is HEVC. Applies to the .mp4 archive only.
-        codec = self._stamped_codec(url)
-        self._segment_hvc1 = codec == "hevc" and not omit_hvc1
-        mp4_tag = ["-tag:v", "hvc1"] if self._segment_hvc1 else []
+        # The stamped stream is always H.264 now (sei_copy passthrough, or the
+        # h264-only re-encode fallback), so the old HEVC hvc1-tagging dance is
+        # gone. The codec probe stays for health display.
+        self._stamped_codec(url)
         try:
             self._proc = subprocess.Popen(
                 [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
@@ -3403,7 +3376,7 @@ class VideoWorker:
                  # flush_packets: fragments hit the disk as they complete
                  # instead of sitting in the 32KB avio buffer — without it a
                  # crash can still eat several seconds at low bitrates.
-                 "-c:v", "copy", *mp4_tag, "-c:a", "aac", "-b:a", "64k",
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
                  "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                  "-flush_packets", "1",
                  str(seg_path),
@@ -3484,7 +3457,6 @@ class VideoWorker:
         seg_path  = self._seg_path; self._seg_path = None
         seg_id    = self._seg_id
         seg_start = self._seg_start
-        self._segment_hvc1 = False
         if proc and proc.poll() is None:
             try:
                 proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)

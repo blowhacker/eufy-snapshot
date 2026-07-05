@@ -275,64 +275,6 @@ class RecorderFaultIntegrationTests(unittest.TestCase):
             "zero-byte MP4 files were not cleaned up",
         )
 
-    def test_codec_transition_mismatch_and_corrected_retry_use_real_ffmpeg(self) -> None:
-        path = "fault-codec-transition"
-        publisher = _Publisher(path, "hevc")
-        publisher.start()
-        self.addCleanup(publisher.stop)
-
-        with tempfile.TemporaryDirectory(prefix="wanyard-codec-fault-") as tmp:
-            root = Path(tmp)
-            worker, db, _thread = self._new_worker(root, "codec-camera", path)
-            self.assertEqual(worker._stamped_codec(publisher.url), "hevc")
-
-            publisher.stop()
-            publisher = _Publisher(path, "h264")
-            publisher.start()
-            self.addCleanup(publisher.stop)
-            real_probe = worker._stamped_codec
-            first_ts = time.time()
-            worker._stamped_codec = mock.Mock(return_value="hevc")
-            worker._start_segment(first_ts)
-            self.assertTrue(worker._segment_hvc1)
-            failed_proc = worker._proc
-            self.assertIsNotNone(failed_proc)
-            _wait_for(
-                "real FFmpeg hvc1 mismatch",
-                lambda: failed_proc.poll() is not None,
-                timeout=10,
-            )
-            stderr = (failed_proc.stderr.read() or b"").decode("utf-8", "replace")
-            self.assertTrue(worker._is_hvc1_tag_mismatch(stderr), stderr)
-            self.assertFalse(worker._stop_segment(time.time()))
-            worker._record_failure("codec_tag_mismatch")
-
-            worker._invalidate_stamped_codec()
-            worker._stamped_codec = real_probe
-            worker._start_segment(first_ts + 2.0, omit_hvc1=True)
-            self.assertFalse(worker._segment_hvc1)
-            corrected_proc = worker._proc
-            self.assertIsNotNone(corrected_proc)
-            _wait_for(
-                "corrected H.264 MP4 output",
-                lambda: (
-                    corrected_proc.poll() is None
-                    and worker._seg_path is not None
-                    and worker._seg_path.exists()
-                    and worker._seg_path.stat().st_size > 0
-                ),
-                timeout=10,
-            )
-            stopped_ts = time.time()
-            self.assertTrue(worker._stop_segment(stopped_ts))
-            worker._record_segment_completed(stopped_ts)
-
-            status = worker.status()
-            self.assertEqual(status["codec"], "h264")
-            self.assertEqual(status["last_failure_kind"], "codec_tag_mismatch")
-            self.assertEqual(status["consecutive_failures"], 0)
-            self._assert_segment_files_valid(db, root / "video")
-
     def test_unavailable_path_uses_exponential_capped_backoff(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wanyard-backoff-fault-") as tmp:
             root = Path(tmp)
