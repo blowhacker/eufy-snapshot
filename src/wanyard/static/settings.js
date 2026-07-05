@@ -104,10 +104,21 @@ function healthSourceName(sourceId) {
   return source?.name || sourceId || 'System';
 }
 
+function sourceRecordMode(sourceId) {
+  const source = (_mediaHealth?.sources || _sources).find(s => s.id === sourceId);
+  return source?.record_mode || 'continuous';
+}
+
 function healthState(row) {
   if (!row?.ts) return { cls:'warn', label:'Collecting' };
-  const stamper = row.stamper || {};
   const sampleAge = Date.now()/1000 - Number(row.ts || 0);
+  // Live-only cameras have no stamper/recorder BY DESIGN — judging them on
+  // those reads "Offline" for a healthy camera. Only the raw relay matters.
+  if (sourceRecordMode(row.source_id) === 'live_only') {
+    if (sampleAge > 60 || !row.raw_ready) return { cls:'dead', label:'Offline' };
+    return { cls:'ok', label:'Live-only' };
+  }
+  const stamper = row.stamper || {};
   const stamperAge = Date.now()/1000 - Number(stamper.updated_at || 0);
   const dead = sampleAge > 60
     || !row.raw_ready || !row.stamped_ready || !row.recorder_thread_alive;
@@ -138,7 +149,9 @@ function renderHealthTable() {
     const cap = maxrate && stamped ? Math.round(stamped/maxrate*100) : null;
     const resolution = stamper.width && stamper.height ? `${stamper.width}×${stamper.height}` : '--';
     const fps = stamper.fps ? `${Number(stamper.fps).toFixed(0)} fps` : '';
-    const recorderIssue = Number(row.consecutive_failures) > 0
+    const liveOnly = sourceRecordMode(row.source_id) === 'live_only';
+    const recorderIssue = liveOnly ? 'live-only'
+      : Number(row.consecutive_failures) > 0
       ? `${row.consecutive_failures} failures`
       : row.recorder_thread_alive ? 'running' : 'stopped';
     const tr = document.createElement('tr');
@@ -147,7 +160,7 @@ function renderHealthTable() {
       <td><span class="s-health-state ${state.cls}">${state.label}</span></td>
       <td><span class="s-health-metric">${stamper.active_encoder || '--'}</span><span class="s-health-detail">${resolution}${fps ? ' · '+fps : ''}</span></td>
       <td><span class="s-health-metric">${fmt.bitrate(row.raw_bitrate_bps)}</span><span class="s-health-detail">${row.raw_ready ? 'relay ready' : 'relay offline'}</span></td>
-      <td><span class="s-health-metric">${fmt.bitrate(row.stamped_bitrate_bps)}</span><span class="s-health-detail">${cap == null ? (row.stamped_ready ? 'relay ready' : 'relay offline') : `${cap}% of ${fmt.bitrate(maxrate)}`}</span></td>
+      <td><span class="s-health-metric">${liveOnly ? '--' : fmt.bitrate(row.stamped_bitrate_bps)}</span><span class="s-health-detail">${liveOnly ? 'live-only' : cap == null ? (row.stamped_ready ? 'relay ready' : 'relay offline') : `${cap}% of ${fmt.bitrate(maxrate)}`}</span></td>
       <td><span class="s-health-metric">${fmt.age(row.hls_age_seconds)}</span><span class="s-health-detail">${row.hls_age_seconds != null && Number(row.hls_age_seconds) <= 5 ? 'fresh' : 'stale'}</span></td>
       <td><span class="s-health-metric">${row.recorder_codec || '--'}</span><span class="s-health-detail">${recorderIssue}</span></td>`;
     ['Camera','State','Encoder','Raw','Stamped','HLS','Recorder'].forEach((label,index) => {
@@ -356,7 +369,7 @@ async function loadCameras() {
       <span class="s-cam-dot ${dotCls}" data-cam-dot="${s.id}"></span>
       <div class="s-cam-info">
         <div class="s-cam-name">${s.name||s.id}</div>
-        <div class="s-cam-meta">${s.id}</div>
+        <div class="s-cam-meta">${s.id}${s.record_mode === 'live_only' ? ' · live-only' : ''}</div>
       </div>
       ${s.mutable
         ? `<button class="s-cam-remove" data-del="${s.id}" title="Remove ${s.name||s.id}" type="button" aria-label="Remove camera">
