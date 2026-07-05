@@ -1388,6 +1388,23 @@ class VideoSegmentDB:
         rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
         return rows[:limit]
 
+    def notification_class_for_ref(self, event_ref: str) -> str | None:
+        """Class of the notification that references ``event_ref``.
+
+        Detection refs (``d:<id>``) resolve with NULL class — a per-frame
+        detection row can hold several classes at once — but the notification
+        knows which class fired. Thumb cropping needs it: on a frame with a
+        high-confidence car and the notified bird, classless selection crops
+        the car.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT class FROM notification_events"
+                " WHERE event_ref=? ORDER BY id DESC LIMIT 1",
+                (event_ref,),
+            ).fetchone()
+        return row["class"] if row and row["class"] else None
+
     def event_like_for_notification_ref(self, event_ref: str,
                                         tolerance: float = 2.0) -> dict | None:
         """Best current stand-in for a notification's dead event ref.

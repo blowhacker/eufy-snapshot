@@ -383,6 +383,27 @@ class VideoBitcAnchorTests(unittest.TestCase):
         boxes = json.loads(resolved["boxes_json"])
         self.assertEqual(boxes[0]["cls"], "person")
 
+    def test_notification_class_recovers_for_detection_refs(self) -> None:
+        """d:<id> refs resolve with NULL class; the notification's own class
+        must drive box selection (a frame can hold a high-conf car AND the
+        notified bird — classless selection crops the car)."""
+        with tempfile.TemporaryDirectory(prefix="wanyard-video-db-") as tmp:
+            db = VideoSegmentDB(Path(tmp) / "video.sqlite")
+            with db._connect() as conn:
+                rule_id = conn.execute(
+                    "INSERT INTO notification_rules(name, source_id)"
+                    " VALUES('Bird','garden')").lastrowid
+                conn.execute(
+                    "INSERT INTO notification_events"
+                    " (rule_id, rule_name, source_id, zone_ref, event_ref,"
+                    "  event_ts, class, title, body)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
+                    (rule_id, "Bird", "garden", "whole_frame", "d:123",
+                     1_781_600_010.0, "bird", "t", "b"),
+                )
+            self.assertEqual(db.notification_class_for_ref("d:123"), "bird")
+            self.assertIsNone(db.notification_class_for_ref("d:999"))
+
     def test_dead_notification_ref_re_resolves_to_nearest_detection(self) -> None:
         """Backfill's replace_detections churns detection ids; a notification's
         d:<id> ref must re-resolve via (source, time) to an equivalent row."""

@@ -597,7 +597,16 @@ def make_app(
             boxes = json.loads(evt["boxes_json"]) if evt.get("boxes_json") else []
         except (TypeError, json.JSONDecodeError):
             boxes = []
-        box = _select_event_box(boxes, evt.get("class", ""))
+        cls = evt.get("class") or ""
+        if not cls:
+            # d:<id> refs resolve with NULL class (a detection frame can hold
+            # several classes at once); the notification knows which one
+            # fired. Without it, selection scores by size/confidence and
+            # crops the wrong object — a parked car instead of the notified
+            # bird.
+            cls = await asyncio.to_thread(
+                video_db.notification_class_for_ref, event_id_raw) or ""
+        box = _select_event_box(boxes, cls)
 
         async def _try_live_thumb() -> Response | None:
             if not evt.get("provisional") or not box:
@@ -628,7 +637,9 @@ def make_app(
             ch if ch.isalnum() or ch in {"-", "_"} else "_"
             for ch in event_id_raw
         )
-        cache_file = cache_dir / f"event_{safe_event_id}_crop_v1.jpg"
+        # v2: v1 crops were cut with a classless box pick (car instead of the
+        # notified bird) and are cached immutable — new key invalidates them.
+        cache_file = cache_dir / f"event_{safe_event_id}_crop_v2.jpg"
         if not cache_file.exists():
             ok = await asyncio.to_thread(_extract_video_thumb, seg_path, cache_file, t, box)
             if not ok:
@@ -637,8 +648,11 @@ def make_app(
                     return live_response
                 return Response(status_code=404)
 
+        # Not immutable: an event thumb can be re-cut under the same URL
+        # (dead-ref healing, crop fixes). A day of caching keeps the
+        # notification panel cheap without freezing a wrong crop for a week.
         return FileResponse(cache_file, media_type="image/jpeg",
-                            headers={"Cache-Control": "public, max-age=604800, immutable"})
+                            headers={"Cache-Control": "public, max-age=86400"})
 
     async def api_video_event_thumb(request: Request) -> Response:
         return await _serve_event_thumb(request.path_params["event_id"])
