@@ -67,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen_go2rtc = sub.add_parser("gen-go2rtc", help="generate go2rtc config from configured sources")
     gen_go2rtc.add_argument("--out", default="/run/go2rtc/go2rtc.yaml",
                             help="output path for go2rtc config (default: /run/go2rtc/go2rtc.yaml)")
-    sub.add_parser("stamp", help="BITC stamper: burn world-time into frames, republish <src>-stamped")
+    sub.add_parser("stamp", help="clock stamper: attach world-time as SEI, republish <src>-stamped")
     return parser
 
 
@@ -184,12 +184,12 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
             continue
         # Source from go2rtc, not the camera: go2rtc is the single ingest (it
         # pulls the camera once and also serves the instant WebRTC wall). mediamtx
-        # reads go2rtc's RTSP for recording/BITC — no extra camera pull.
+        # reads go2rtc's RTSP for recording/stamping — no extra camera pull.
         config_lines.append(f"  {source.id}:")
         config_lines.append(f"    source: rtsp://{go2rtc_host}:8554/{source.id}")
         config_lines.append("    sourceProtocol: tcp")
         config_lines.append("    sourceOnDemand: yes")
-        # BITC stamper republishes the marked stream here (no source = accepts
+        # The clock stamper republishes the stamped stream here (no source = accepts
         # a publisher). Consumers read <id>-stamped post-cutover.
         config_lines.append(f"  {source.id}-stamped: {{}}")
 
@@ -205,7 +205,7 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
 
 def cmd_gen_go2rtc(args, config: AppConfig) -> int:
     # go2rtc is the single camera ingest: it reads each camera directly, serves
-    # RTSP downstream to mediamtx (recording/BITC) and WebRTC to the wall. Reading
+    # RTSP downstream to mediamtx (recording/stamping) and WebRTC to the wall. Reading
     # direct + a warm producer means new WebRTC viewers paint near-instantly.
     source_db = SourceDB(config.db_path) if config.db_path else None
     if not source_db:
@@ -244,7 +244,7 @@ def cmd_gen_go2rtc(args, config: AppConfig) -> int:
     for s in sources:
         # go2rtc is the SOLE camera ingest: it reads the camera directly (the
         # configured URL, whatever it is — no stream-name assumptions), serves
-        # RTSP downstream to mediamtx (recording/BITC) AND WebRTC to the wall.
+        # RTSP downstream to mediamtx (recording/stamping) AND WebRTC to the wall.
         # Direct read = go2rtc's RTCP keyframe request (PLI) reaches the camera →
         # instant first frame for new viewers, at near-zero latency (Frigate's
         # model). One pull per camera, same budget as the old mediamtx ingest.

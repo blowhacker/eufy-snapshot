@@ -2,8 +2,8 @@
 
 Website: https://wanyard.com
 
-RTSP camera capture with BITC-stamped video, YOLO object detection, live HLS,
-and a LAN web viewer.
+RTSP camera capture with an SEI frame clock stamped onto every frame, YOLO
+object detection, live HLS, and a LAN web viewer.
 
 ## Quick start
 
@@ -26,10 +26,11 @@ docker compose up --build -d
 
 ## What it does
 
-- Burns BITC Unix time into each frame before recording and detection
+- Stamps Unix time onto each frame as an H.264 SEI clock before recording and
+  detection (codec copy — zero generation loss, archive = camera bits)
 - Records stamped camera streams as continuous MP4 segments
 - Serves rolling live HLS streams for browser playback
-- Runs live YOLO detection plus MP4 backfill, with detections keyed by BITC time
+- Runs live YOLO detection plus MP4 backfill, with detections keyed by clock time
 - **Live wall (god view)** — all cameras at once on the landing page, instant
   load with near-zero-latency WebRTC; click a camera to open its full viewer
 - Web UI: live view, timeline filmstrip, event feed with class filtering, clip export
@@ -39,22 +40,22 @@ docker compose up --build -d
 
 Ingest: `camera → go2rtc → mediamtx → stamper → recorder/yolo`. go2rtc is the
 single camera puller; it serves the live wall over WebRTC directly (instant,
-low latency) while mediamtx sources from it for recording/BITC/HLS — no extra
-camera pull.
+low latency) while mediamtx sources from it for recording/stamping/HLS — no
+extra camera pull.
 
 Main services in `docker-compose.yml`:
 
 - **app** (`wanyard`) — web server, APIs, recording, HLS/MP4 serving
 - **go2rtc** — camera ingest; serves the live wall over WebRTC (WHEP)
 - **mediamtx** — RTSP relay (sources from go2rtc), live HLS
-- **stamper** — burns BITC into frames and republishes stamped streams
+- **stamper** — attaches the SEI frame clock and republishes stamped streams
 - **yolo** (`wanyard-yolo`) — live detector, thumbnail crops, MP4 backfill
 
 ## Commands
 
 ```bash
 wanyard serve        # web server, APIs, recording
-wanyard stamp        # BITC stamper
+wanyard stamp        # SEI frame-clock stamper
 wanyard yolo-serve   # YOLO live detection + MP4 backfill
 ```
 

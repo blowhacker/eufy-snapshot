@@ -1,13 +1,13 @@
-"""Media-time resolver — the single boundary between BITC time and media time.
+"""Media-time resolver — the single boundary between clock time and media time.
 
 See docs/media-time-architecture.md.
 
-BITC time = (source_id, t), t = the decoded BITC/Unix seconds burned into the
+clock time = (source_id, t), t = the decoded clock/Unix seconds carried on the
 frame. This is the only point-in-time coordinate that crosses module
 boundaries. Media time = (asset, offset), exists only inside this module and
 the player/decoder.
 
-Hard rule: BITC time is the only public point-in-time coordinate. Recorded
+Hard rule: clock time is the only public point-in-time coordinate. Recorded
 media is anchored by segments.media_epoch, and media offsets stay private to
 this resolver/player boundary.
 """
@@ -22,7 +22,7 @@ from pathlib import Path
 
 EPS = 0.05  # round-trip identity tolerance, seconds
 
-# Live HLS fragment boundaries can land slightly away from decoded BITC frames.
+# Live HLS fragment boundaries can land slightly away from decoded clock frames.
 _LIVE_EDGE_SLOP_SECONDS = 2.0
 _LIVE_PROBE_CACHE_MAX = 128
 
@@ -40,12 +40,12 @@ _COVERAGE_TAIL_GRACE_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
-class _LiveBitcProbe:
-    bitc_ts: float
+class _LiveClockProbe:
+    clock_ts: float
     media_offset: float
 
 
-_LIVE_PROBE_CACHE: dict[tuple[str, int, int], _LiveBitcProbe | None] = {}
+_LIVE_PROBE_CACHE: dict[tuple[str, int, int], _LiveClockProbe | None] = {}
 _LIVE_PROBE_LOCK = threading.Lock()
 
 
@@ -72,16 +72,16 @@ def _recorded_media_epoch_sql(alias: str | None = None) -> str:
 
 @dataclass(frozen=True)
 class Anchor:
-    """BITC<->media conversion for one playable asset.
+    """clock<->media conversion for one playable asset.
 
-    media_epoch is the BITC/Unix time of media_offset == 0.
+    media_epoch is the clock/Unix time of media_offset == 0.
     """
     provider: str            # "mp4" | "hls"
     asset_ref: str           # mp4 rel path, or live .ts filename
     media_epoch: float
     duration: float | None   # seconds; None if open/unknown
 
-    def bitc_to_media(self, t: float) -> float:
+    def clock_to_media(self, t: float) -> float:
         o = t - self.media_epoch
         if o < 0:
             return 0.0
@@ -89,7 +89,7 @@ class Anchor:
             return self.duration
         return o
 
-    def media_to_bitc(self, o: float) -> float:
+    def media_to_clock(self, o: float) -> float:
         return self.media_epoch + o
 
 
@@ -145,13 +145,13 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
         if media_epoch is None:
             return _none("no_anchor")
         # Include the final-GOP flush tail so a detection on the last fragment
-        # both selects (above) and clamps (bitc_to_media) to its own file.
+        # both selects (above) and clamps (clock_to_media) to its own file.
         media_duration = (_recorded_duration(row) or 0.0) + _COVERAGE_TAIL_GRACE_SECONDS
         anchor = Anchor("mp4", row["path"], media_epoch, media_duration)
         return MediaLocation(
             provider="mp4",
             url=f"/video/files/{row['path']}",
-            media_offset=anchor.bitc_to_media(t),
+            media_offset=anchor.clock_to_media(t),
             coverage=Coverage(media_epoch, media_epoch + media_duration),
             anchor=anchor,
             reason="recorded",
@@ -186,7 +186,7 @@ def _live_playlist_entries(video_dir: Path, source_id: str) -> tuple[object | No
     """Return playlist stat and media-offset entries.
 
     EXT-X-PROGRAM-DATE-TIME is intentionally ignored. It is a transport hint,
-    not scene time. The only absolute anchor comes from decoded BITC markers.
+    not scene time. The only absolute anchor comes from the decoded frame clock (SEI).
     """
     if not _safe_live_source_id(source_id):
         return None, []
@@ -259,9 +259,9 @@ def _stream_rate(stream) -> float | None:
     return None
 
 
-def _decode_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
-    """Decode one BITC marker and its media offset within an HLS fragment."""
-    from . import bitc, sei
+def _decode_live_clock_probe(path: Path) -> _LiveClockProbe | None:
+    """Decode one frame's clock (SEI) and its media offset within an HLS fragment."""
+    from . import sei
     import av
 
     container = None
@@ -286,15 +286,11 @@ def _decode_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
                     rel = 0.0
                 frame_index += 1
 
-                # SEI-copy streams carry the clock in frame side data and do
-                # not have a rendered pixel marker. Re-encoded streams and
-                # existing archives still use the pixel marker fallback.
+                # The clock rides in frame side data (SEI) for both sei_copy
+                # and reencode streams; there is no pixel carrier.
                 marker, crc_ok = sei.decode_frame(frame)
-                if not crc_ok:
-                    frame_bgr = frame.to_ndarray(format="bgr24")
-                    marker, crc_ok = bitc.decode(frame_bgr)
                 if crc_ok and marker is not None:
-                    return _LiveBitcProbe(float(marker), float(rel))
+                    return _LiveClockProbe(float(marker), float(rel))
     except Exception:
         return None
     finally:
@@ -306,7 +302,7 @@ def _decode_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
     return None
 
 
-def _cached_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
+def _cached_live_clock_probe(path: Path) -> _LiveClockProbe | None:
     try:
         stat = path.stat()
     except OSError:
@@ -316,7 +312,7 @@ def _cached_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
         if key in _LIVE_PROBE_CACHE:
             return _LIVE_PROBE_CACHE[key]
 
-    probe = _decode_live_bitc_probe(path)
+    probe = _decode_live_clock_probe(path)
     with _LIVE_PROBE_LOCK:
         if len(_LIVE_PROBE_CACHE) >= _LIVE_PROBE_CACHE_MAX:
             _LIVE_PROBE_CACHE.clear()
@@ -327,9 +323,9 @@ def _cached_live_bitc_probe(path: Path) -> _LiveBitcProbe | None:
 def _live_window_epoch(video_dir: Path, source_id: str, entries: list[dict]) -> float | None:
     live_dir = video_dir / "live" / source_id
     for entry in reversed(entries):
-        probe = _cached_live_bitc_probe(live_dir / entry["uri"])
+        probe = _cached_live_clock_probe(live_dir / entry["uri"])
         if probe is not None:
-            return probe.bitc_ts - (float(entry["offset"]) + probe.media_offset)
+            return probe.clock_ts - (float(entry["offset"]) + probe.media_offset)
     return None
 
 
@@ -356,13 +352,13 @@ def _live_chunks_and_stat(video_dir: Path, source_id: str) -> tuple[list[dict], 
 
 
 def _live_chunks(video_dir: Path, source_id: str) -> list[dict]:
-    """[{uri, start_ts(BITC), end_ts, duration}] for the live playlist."""
+    """[{uri, start_ts(clock), end_ts, duration}] for the live playlist."""
     chunks, _stat = _live_chunks_and_stat(video_dir, source_id)
     return chunks
 
 
 def live_window(video_dir: Path, source_id: str | None) -> dict | None:
-    """Public live HLS DVR window, anchored on decoded BITC time."""
+    """Public live HLS DVR window, anchored on decoded clock time."""
     if not source_id:
         return None
     chunks, stat = _live_chunks_and_stat(video_dir, source_id)
@@ -397,7 +393,7 @@ def _resolve_live(video_dir: Path, source_id: str,
             return MediaLocation(
                 provider="hls",
                 url=f"/video/live/{source_id}/{c['uri']}",
-                media_offset=anchor.bitc_to_media(t),
+                media_offset=anchor.clock_to_media(t),
                 coverage=window,
                 anchor=anchor,
                 reason="live",
@@ -448,7 +444,7 @@ def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
 
 def resolve(conn: sqlite3.Connection, video_dir: Path,
             source_id: str, t: float) -> MediaLocation:
-    """The only place BITC time is converted to media time.
+    """The only place clock time is converted to media time.
 
     Closed recorded MP4 wins for the past; live HLS for the recent edge
     (including the currently-open, not-yet-finalized segment); otherwise a gap.
@@ -493,34 +489,41 @@ def _decode_mp4_frame(path: Path, offset: float):
         cap.release()
 
 
-def _decode_ts_frame_at_bitc(path: Path, t: float, max_drift: float = 0.5):
-    """Return the HLS frame whose decoded BITC marker is nearest ``t``."""
-    import cv2
+def _decode_ts_frame_at_sei(path: Path, t: float, max_drift: float = 0.5):
+    """Return the HLS frame (bgr ndarray) whose SEI clock is nearest ``t``.
 
-    from . import bitc
+    cv2 discards side data, so the clock is read via PyAV like every other
+    frame consumer; the live .ts carries it as SEI, never in pixels.
+    """
+    import av
 
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
+    from . import sei
+
+    try:
+        container = av.open(str(path))
+    except Exception:
         return None
     try:
         best_frame = None
         best_diff = max_drift
-        while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                break
-            marker, crc_ok = bitc.decode(frame)
+        for frame in container.decode(video=0):
+            marker, crc_ok = sei.decode_frame(frame)
             if not crc_ok or marker is None:
                 continue
             diff = abs(float(marker) - t)
             if diff < best_diff:
                 best_diff = diff
-                best_frame = frame
+                best_frame = frame.to_ndarray(format="bgr24")
                 if diff < 0.02:
                     break
         return best_frame
+    except Exception:
+        return None
     finally:
-        cap.release()
+        try:
+            container.close()
+        except Exception:
+            pass
 
 
 def _expected_close_ts(conn: sqlite3.Connection, source_id: str,
@@ -559,7 +562,7 @@ def read_frame(conn: sqlite3.Connection, video_dir: Path,
 
     if loc.provider == "hls":
         path = video_dir / "live" / source_id / loc.anchor.asset_ref
-        frame = _decode_ts_frame_at_bitc(path, t)
+        frame = _decode_ts_frame_at_sei(path, t)
         if frame is not None:
             return FrameResult(frame, "ok", "hls", None)
         # Live chunk not fetchable; authoritative MP4 exists after segment close.
@@ -569,14 +572,14 @@ def read_frame(conn: sqlite3.Connection, video_dir: Path,
     return FrameResult(None, loc.reason, "none", None)
 
 
-# ── BITC round-trip invariant check ─────────────────────────────────────────
+# ── clock round-trip invariant check ─────────────────────────────────────────
 
 @dataclass(frozen=True)
 class RoundTrip:
     ok: bool
     detection_id: int
     status: str               # ok | sentinel | no_anchor | gap | world_mismatch | no_detection
-    world_delta: float | None  # |resolved BITC - detection BITC|, the real invariant
+    world_delta: float | None  # |resolved clock - detection clock|, the real invariant
     expected_offset: float
     resolved_offset: float | None
     provider: str
@@ -585,11 +588,11 @@ class RoundTrip:
 
 def check_detection_round_trip(conn: sqlite3.Connection, video_dir: Path,
                                detection_id: int) -> RoundTrip:
-    """Invariant: resolve(media->BITC(detection)) lands on a usable asset whose
-    BITC time equals the detection's BITC time, within EPS.
+    """Invariant: resolve(media->clock(detection)) lands on a usable asset whose
+    clock time equals the detection's clock time, within EPS.
 
-    The invariant is on BITC time, not offset equality: at contiguous segment
-    boundaries the same BITC instant exists in two files, so resolving to the
+    The invariant is on clock time, not offset equality: at contiguous segment
+    boundaries the same clock instant exists in two files, so resolving to the
     adjacent segment (different offset) is correct. The expected media offset is
     derived (abs_ts - media_epoch), never stored. No side effects.
     """
@@ -605,14 +608,14 @@ def check_detection_round_trip(conn: sqlite3.Connection, video_dir: Path,
                          0.0, None, "none", False)
 
     expected = float(row["media_offset"])
-    bitc_t = float(row["abs_ts"])
-    loc = resolve(conn, video_dir, row["source_id"], bitc_t)
+    clock_t = float(row["abs_ts"])
+    loc = resolve(conn, video_dir, row["source_id"], clock_t)
     if loc.provider != "mp4" or loc.anchor is None or loc.media_offset is None:
         return RoundTrip(False, detection_id, loc.reason, None,
                          expected, loc.media_offset, loc.provider, False)
-    resolved_bitc = loc.anchor.media_to_bitc(loc.media_offset)
-    bitc_delta = abs(resolved_bitc - bitc_t)
-    ok = bitc_delta < EPS
+    resolved_clock = loc.anchor.media_to_clock(loc.media_offset)
+    clock_delta = abs(resolved_clock - clock_t)
+    ok = clock_delta < EPS
     alternate = abs(loc.media_offset - expected) > EPS
     return RoundTrip(ok, detection_id, "ok" if ok else "world_mismatch",
-                     bitc_delta, expected, loc.media_offset, loc.provider, alternate)
+                     clock_delta, expected, loc.media_offset, loc.provider, alternate)

@@ -18,13 +18,25 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from wanyard import bitc, media_time
+from wanyard import media_time, sei
 from wanyard.video import (
     VideoSegmentDB,
-    _BITC_ZERO_FIRST_FRAME,
-    _decode_bitc_media_epoch,
-    _yolo_tag_video,
+    _CLOCK_ZERO_FIRST_FRAME,
+    _decode_media_epoch,
 )
+
+
+class _FakeSEI(bytes):
+    """Frame side-data entry carrying our unregistered-SEI clock payload.
+
+    cv2 dropped side data; every clock consumer now reads it via PyAV, so the
+    fakes attach a real SEI body that ``sei.decode_frame`` parses.
+    """
+
+    def __new__(cls, unix_seconds: float) -> "_FakeSEI":
+        obj = super().__new__(cls, sei.build_payload(sei.encode_value(unix_seconds)))
+        obj.type = types.SimpleNamespace(name="SEI_UNREGISTERED")
+        return obj
 
 
 class _FakeFrame:
@@ -34,10 +46,12 @@ class _FakeFrame:
         *,
         pts: int | None = None,
         time_base: Fraction | None = None,
+        side_data: list | None = None,
     ) -> None:
         self.frame_bgr = frame_bgr
         self.pts = pts
         self.time_base = time_base
+        self.side_data = side_data or []
 
     def to_ndarray(self, *, format: str):
         if format != "bgr24":
@@ -46,178 +60,119 @@ class _FakeFrame:
 
 
 class _FakePacket:
-    def __init__(self, frames: list[np.ndarray] | list[_FakeFrame]) -> None:
-        self._frames = [
-            frame if isinstance(frame, _FakeFrame) else _FakeFrame(frame)
-            for frame in frames
-        ]
+    def __init__(self, frames: list[_FakeFrame]) -> None:
+        self._frames = frames
 
     def decode(self):
         return list(self._frames)
 
 
 class _FakeContainer:
-    def __init__(
-        self,
-        frames: list[np.ndarray] | list[_FakeFrame],
-        *,
-        has_video: bool = True,
-    ) -> None:
+    def __init__(self, frames: list[_FakeFrame], *, has_video: bool = True) -> None:
         self.streams = []
         if has_video:
             self.streams.append(types.SimpleNamespace(type="video"))
         self._packets = [_FakePacket(frames)]
+        self._frames = frames
         self.closed = False
 
     def demux(self, _stream):
         return list(self._packets)
 
+    def decode(self, video=0):
+        return list(self._frames)
+
     def close(self) -> None:
         self.closed = True
 
 
-class _FakeCapture:
-    def __init__(self, frames: list[np.ndarray], offsets: list[float], fps: float) -> None:
-        self.frames = frames
-        self.offsets = offsets
-        self.fps = fps
-        self.index = -1
-        self.released = False
-
-    def isOpened(self) -> bool:
-        return True
-
-    def read(self):
-        self.index += 1
-        if self.index >= len(self.frames):
-            return False, None
-        return True, self.frames[self.index].copy()
-
-    def get(self, prop):
-        if prop == 5:
-            return self.fps
-        if prop == 0:
-            return self.offsets[self.index] * 1000.0
-        raise AssertionError(prop)
-
-    def release(self) -> None:
-        self.released = True
+def _blank(width: int = 320) -> np.ndarray:
+    return np.full((64, width, 3), 180, dtype=np.uint8)
 
 
-class _FakeModel:
-    def __init__(self) -> None:
-        self.frames: list[np.ndarray] = []
-
-    def predict(self, frame, **_kwargs):
-        self.frames.append(frame.copy())
-        return ["unused"]
-
-
-class _FakeVideoDB:
-    def __init__(self, media_epoch: float) -> None:
-        self.segment = {"media_epoch": media_epoch}
-        self.detections: list[dict] | None = None
-        self.scanned: list[int] = []
-
-    def get_segment(self, _segment_id: int):
-        return self.segment
-
-    def replace_detections(self, _segment_id: int, detections: list[dict]) -> None:
-        self.detections = detections
-
-    def mark_scanned(self, segment_id: int) -> None:
-        self.scanned.append(segment_id)
-
-
-class VideoBitcAnchorTests(unittest.TestCase):
-    def test_decode_bitc_media_epoch_reads_first_video_frame(self) -> None:
+class MediaEpochAnchorTests(unittest.TestCase):
+    def test_decode_media_epoch_reads_first_video_frame(self) -> None:
         unix_seconds = 1_781_600_000.12
-        first = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
-        second = np.full_like(first, 40)
-        bitc.render(first, bitc.encode_value(unix_seconds))
-        bitc.render(second, bitc.encode_value(unix_seconds + 10.0))
-        container = _FakeContainer([first, second])
+        frames = [
+            _FakeFrame(_blank(), side_data=[_FakeSEI(unix_seconds)]),
+            _FakeFrame(np.full_like(_blank(), 40),
+                       side_data=[_FakeSEI(unix_seconds + 10.0)]),
+        ]
+        container = _FakeContainer(frames)
 
         fake_av = types.SimpleNamespace(open=lambda _path: container)
         with mock.patch.dict(sys.modules, {"av": fake_av}):
-            decoded = _decode_bitc_media_epoch("segment.mp4")
+            decoded = _decode_media_epoch("segment.mp4")
 
         self.assertIsNotNone(decoded)
-        self.assertEqual(round(decoded * 100), bitc.encode_value(unix_seconds))
+        self.assertEqual(round(decoded * 100), sei.encode_value(unix_seconds))
         self.assertTrue(container.closed)
 
-    def test_decode_bitc_media_epoch_returns_none_without_valid_marker(self) -> None:
-        frame = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
-        container = _FakeContainer([frame])
+    def test_decode_media_epoch_returns_none_without_clock(self) -> None:
+        container = _FakeContainer([_FakeFrame(_blank(), side_data=[])])
 
         fake_av = types.SimpleNamespace(open=lambda _path: container)
         with mock.patch.dict(sys.modules, {"av": fake_av}):
-            decoded = _decode_bitc_media_epoch("segment.mp4")
+            decoded = _decode_media_epoch("segment.mp4")
 
         self.assertIsNone(decoded)
         self.assertTrue(container.closed)
 
-    def test_decode_bitc_media_epoch_returns_none_without_video(self) -> None:
+    def test_decode_media_epoch_returns_none_without_video(self) -> None:
         container = _FakeContainer([], has_video=False)
 
         fake_av = types.SimpleNamespace(open=lambda _path: container)
         with mock.patch.dict(sys.modules, {"av": fake_av}):
-            decoded = _decode_bitc_media_epoch("audio-only.mp4")
+            decoded = _decode_media_epoch("audio-only.mp4")
 
         self.assertIsNone(decoded)
         self.assertTrue(container.closed)
 
-    def test_decode_bitc_media_epoch_uses_mp4_player_offset(self) -> None:
+    def test_decode_media_epoch_uses_mp4_player_offset(self) -> None:
         unix_seconds = 1_781_600_010.12
-        blank = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
-        marked = blank.copy()
-        bitc.render(marked, bitc.encode_value(unix_seconds + 2.0))
         frames = [
-            _FakeFrame(blank, pts=100, time_base=Fraction(1, 1000)),
-            _FakeFrame(blank, pts=1100, time_base=Fraction(1, 1000)),
-            _FakeFrame(marked, pts=2100, time_base=Fraction(1, 1000)),
+            _FakeFrame(_blank(), pts=100, time_base=Fraction(1, 1000)),
+            _FakeFrame(_blank(), pts=1100, time_base=Fraction(1, 1000)),
+            _FakeFrame(_blank(), pts=2100, time_base=Fraction(1, 1000),
+                       side_data=[_FakeSEI(unix_seconds + 2.0)]),
         ]
         container = _FakeContainer(frames)
 
         fake_av = types.SimpleNamespace(open=lambda _path: container)
         with mock.patch.dict(sys.modules, {"av": fake_av}):
-            decoded = _decode_bitc_media_epoch("segment.mp4")
+            decoded = _decode_media_epoch("segment.mp4")
 
         self.assertIsNotNone(decoded)
-        self.assertEqual(round(decoded * 100), bitc.encode_value(unix_seconds - 0.1))
+        self.assertEqual(round(decoded * 100), sei.encode_value(unix_seconds - 0.1))
         self.assertTrue(container.closed)
 
-    def test_decode_bitc_media_epoch_can_use_live_provisional_zero(self) -> None:
+    def test_decode_media_epoch_can_use_live_provisional_zero(self) -> None:
         unix_seconds = 1_781_600_010.12
-        blank = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
-        marked = blank.copy()
-        bitc.render(marked, bitc.encode_value(unix_seconds + 2.0))
         frames = [
-            _FakeFrame(blank, pts=100, time_base=Fraction(1, 1000)),
-            _FakeFrame(blank, pts=1100, time_base=Fraction(1, 1000)),
-            _FakeFrame(marked, pts=2100, time_base=Fraction(1, 1000)),
+            _FakeFrame(_blank(), pts=100, time_base=Fraction(1, 1000)),
+            _FakeFrame(_blank(), pts=1100, time_base=Fraction(1, 1000)),
+            _FakeFrame(_blank(), pts=2100, time_base=Fraction(1, 1000),
+                       side_data=[_FakeSEI(unix_seconds + 2.0)]),
         ]
         container = _FakeContainer(frames)
 
         fake_av = types.SimpleNamespace(open=lambda _path: container)
         with mock.patch.dict(sys.modules, {"av": fake_av}):
-            decoded = _decode_bitc_media_epoch(
+            decoded = _decode_media_epoch(
                 "segment.ts",
-                playback_zero=_BITC_ZERO_FIRST_FRAME,
+                playback_zero=_CLOCK_ZERO_FIRST_FRAME,
             )
 
         self.assertIsNotNone(decoded)
-        self.assertEqual(round(decoded * 100), bitc.encode_value(unix_seconds))
+        self.assertEqual(round(decoded * 100), sei.encode_value(unix_seconds))
         self.assertTrue(container.closed)
 
-    def test_live_hls_window_uses_decoded_bitc_not_pdt(self) -> None:
+    def test_live_hls_window_uses_decoded_clock_not_pdt(self) -> None:
         marker_ts = 1_781_700_010.12
-        blank = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
-        marked = blank.copy()
-        bitc.render(marked, bitc.encode_value(marker_ts))
         container = _FakeContainer([
-            _FakeFrame(blank, pts=100, time_base=Fraction(1, 1000)),
-            _FakeFrame(marked, pts=600, time_base=Fraction(1, 1000)),
+            _FakeFrame(_blank(), pts=100, time_base=Fraction(1, 1000)),
+            _FakeFrame(_blank(), pts=600, time_base=Fraction(1, 1000),
+                       side_data=[_FakeSEI(marker_ts)]),
         ])
         opened: list[str] = []
 
@@ -253,62 +208,27 @@ class VideoBitcAnchorTests(unittest.TestCase):
         self.assertGreater(abs(window["start_ts"] - 1_577_836_800.0), 1_000_000.0)
         self.assertTrue(container.closed)
 
-    def test_live_hls_window_uses_sei_before_pixel_fallback(self) -> None:
-        marker_ts = 1_781_700_010.12
-        blank = np.full((64, bitc.WIDTH + 16, 3), 180, dtype=np.uint8)
-        container = _FakeContainer([
-            _FakeFrame(blank, pts=100, time_base=Fraction(1, 1000)),
-            _FakeFrame(blank, pts=600, time_base=Fraction(1, 1000)),
-        ])
-
-        with tempfile.TemporaryDirectory(prefix="wanyard-live-window-sei-") as tmp:
-            live_dir = Path(tmp) / "live" / "front"
-            live_dir.mkdir(parents=True)
-            (live_dir / "seg.ts").write_bytes(b"sei")
-            (live_dir / "live.m3u8").write_text(
-                "#EXTM3U\n"
-                "#EXT-X-TARGETDURATION:4\n"
-                "#EXTINF:4.0,\n"
-                "seg.ts\n",
-                encoding="utf-8",
-            )
-
-            fake_av = types.SimpleNamespace(open=lambda _path: container)
-            with (
-                mock.patch.dict(sys.modules, {"av": fake_av}),
-                mock.patch(
-                    "wanyard.sei.decode_frame",
-                    side_effect=[(None, False), (marker_ts, True)],
-                ) as decode_sei,
-                mock.patch("wanyard.bitc.decode", return_value=(None, False)) as decode_pixel,
-            ):
-                window = media_time.live_window(Path(tmp), "front")
-
-        assert window is not None
-        self.assertEqual(decode_sei.call_count, 2)
-        self.assertEqual(decode_pixel.call_count, 1)
-        self.assertAlmostEqual(window["start_ts"], marker_ts - 0.5, places=2)
-        self.assertTrue(container.closed)
-
-    def test_hls_frame_read_matches_nearest_decoded_bitc(self) -> None:
+    def test_hls_frame_read_matches_nearest_clock(self) -> None:
         target = 1_781_700_100.0
-        early = np.full((64, bitc.WIDTH + 16, 3), 50, dtype=np.uint8)
-        close = np.full((64, bitc.WIDTH + 16, 3), 150, dtype=np.uint8)
-        late = np.full((64, bitc.WIDTH + 16, 3), 250, dtype=np.uint8)
-        bitc.render(early, bitc.encode_value(target - 0.4))
-        bitc.render(close, bitc.encode_value(target + 0.03))
-        bitc.render(late, bitc.encode_value(target + 1.0))
-        capture = _FakeCapture([early, close, late], [0.0, 0.1, 0.2], 10.0)
-        fake_cv2 = types.SimpleNamespace(VideoCapture=lambda _path: capture)
+        early = np.full((64, 320, 3), 50, dtype=np.uint8)
+        close = np.full((64, 320, 3), 150, dtype=np.uint8)
+        late = np.full((64, 320, 3), 250, dtype=np.uint8)
+        container = _FakeContainer([
+            _FakeFrame(early, side_data=[_FakeSEI(target - 0.4)]),
+            _FakeFrame(close, side_data=[_FakeSEI(target + 0.03)]),
+            _FakeFrame(late, side_data=[_FakeSEI(target + 1.0)]),
+        ])
+        fake_av = types.SimpleNamespace(open=lambda _path: container)
 
-        with mock.patch.dict(sys.modules, {"cv2": fake_cv2}):
-            frame = media_time._decode_ts_frame_at_bitc(
+        with mock.patch.dict(sys.modules, {"av": fake_av}):
+            frame = media_time._decode_ts_frame_at_sei(
                 Path("seg.ts"), target, max_drift=0.2)
 
         self.assertIsNotNone(frame)
         self.assertEqual(int(frame[0, 0, 0]), 150)
-        self.assertTrue(capture.released)
 
+
+class VideoDbLogicTests(unittest.TestCase):
     def test_live_status_returns_requested_detection_window(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wanyard-live-status-") as tmp:
             db = VideoSegmentDB(Path(tmp) / "video.sqlite")
@@ -463,50 +383,12 @@ class VideoBitcAnchorTests(unittest.TestCase):
             assert segment is not None
             self.assertEqual(segment["media_epoch"], 1_781_600_002.0)
 
-    def test_yolo_tag_video_stores_decoded_bitc_time(self) -> None:
-        """Pixel-marked segment: backfill reads the marker from the frame,
-        stores its exact time, and masks the strip from YOLO's input.
-        (Reads via PyAV now — cv2 discarded SEI side data — and the clock must
-        sit inside the segment's own span, so the fake epoch matches.)"""
-        import av
 
-        unix_seconds = 1_781_600_100.12
-        model = _FakeModel()
-        db = _FakeVideoDB(media_epoch=unix_seconds - 0.5)
-        with tempfile.TemporaryDirectory(prefix="wanyard-yolo-tag-") as tmp:
-            path = Path(tmp) / "segment.mp4"
-            out = av.open(str(path), "w", format="mp4")
-            vs = out.add_stream("libx264", rate=5)
-            vs.width, vs.height, vs.pix_fmt = 640, 360, "yuv420p"
-            vs.options = {"bf": "0", "g": "5", "crf": "18"}
-            img = np.full((360, 640, 3), 180, dtype=np.uint8)
-            bitc.render(img, bitc.encode_value(unix_seconds))
-            for _ in range(3):
-                for p in vs.encode(av.VideoFrame.from_ndarray(img, format="bgr24")):
-                    out.mux(p)
-            for p in vs.encode(None):
-                out.mux(p)
-            out.close()
-
-            with mock.patch("wanyard.video._parse_results",
-                            return_value=(False, 0.0, [])):
-                stored = _yolo_tag_video(model, path, 7, db)
-
-        self.assertEqual(stored, 1)   # 3 frames at 5fps = one 1s sample window
-        self.assertEqual(db.scanned, [7])
-        assert db.detections is not None
-        self.assertEqual(round(db.detections[0]["abs_ts"] * 100),
-                         bitc.encode_value(unix_seconds))
-        self.assertEqual(len(model.frames), 1)
-        x0, y0, width, height = bitc.geometry(model.frames[0])
-        self.assertTrue(np.all(model.frames[0][y0 : y0 + height, x0 : x0 + width, :] == 0))
-
-
-class BitcRoundTripInvariantTests(unittest.TestCase):
-    """check_detection_round_trip: resolve(media->BITC(detection)) must land on a
-    usable asset whose BITC time equals the detection's, within EPS. The invariant
-    is on BITC time, not offset (a boundary-duplicate instant resolves to the
-    adjacent segment at a different offset and is still correct)."""
+class RoundTripInvariantTests(unittest.TestCase):
+    """check_detection_round_trip: resolve(media->clock(detection)) must land on
+    a usable asset whose clock time equals the detection's, within EPS. The
+    invariant is on clock time, not offset (a boundary-duplicate instant
+    resolves to the adjacent segment at a different offset and is still correct)."""
 
     def _conn(self, media_epoch: float, abs_ts: float) -> sqlite3.Connection:
         conn = sqlite3.connect(":memory:")
@@ -526,12 +408,12 @@ class BitcRoundTripInvariantTests(unittest.TestCase):
     def _loc(epoch: float, media_offset: float):
         return types.SimpleNamespace(
             provider="mp4",
-            anchor=types.SimpleNamespace(media_to_bitc=lambda off: epoch + off),
+            anchor=types.SimpleNamespace(media_to_clock=lambda off: epoch + off),
             media_offset=media_offset,
             reason="ok",
         )
 
-    def test_ok_when_resolved_bitc_matches(self) -> None:
+    def test_ok_when_resolved_clock_matches(self) -> None:
         conn = self._conn(media_epoch=1000.0, abs_ts=1005.0)   # expected offset 5.0
         with mock.patch.object(media_time, "resolve", return_value=self._loc(1000.0, 5.0)):
             rt = media_time.check_detection_round_trip(conn, Path("/x"), 1)
@@ -541,14 +423,14 @@ class BitcRoundTripInvariantTests(unittest.TestCase):
         self.assertLess(rt.world_delta, media_time.EPS)
 
     def test_alternate_segment_same_instant_is_ok(self) -> None:
-        # boundary duplicate: adjacent segment (epoch 1002, offset 3) -> same BITC
+        # boundary duplicate: adjacent segment (epoch 1002, offset 3) -> same clock
         conn = self._conn(media_epoch=1000.0, abs_ts=1005.0)   # expected offset 5.0
         with mock.patch.object(media_time, "resolve", return_value=self._loc(1002.0, 3.0)):
             rt = media_time.check_detection_round_trip(conn, Path("/x"), 1)
         self.assertTrue(rt.ok)
-        self.assertTrue(rt.alternate)                          # offset differs, BITC matches
+        self.assertTrue(rt.alternate)                          # offset differs, clock matches
 
-    def test_world_mismatch_when_resolved_bitc_drifts(self) -> None:
+    def test_world_mismatch_when_resolved_clock_drifts(self) -> None:
         conn = self._conn(media_epoch=1000.0, abs_ts=1005.0)
         with mock.patch.object(media_time, "resolve", return_value=self._loc(1000.0, 9.0)):
             rt = media_time.check_detection_round_trip(conn, Path("/x"), 1)

@@ -15,8 +15,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from wanyard.stamper import (
-    _BitcEpochDiscontinuity,
-    _BitcMediaTimeline,
+    _ClockEpochDiscontinuity,
+    _MediaTimeline,
     _InputMetadataNotReady,
     _StampAnchor,
     _StamperSupervisor,
@@ -25,9 +25,9 @@ from wanyard.stamper import (
 from wanyard.db import SourceDB
 
 
-class StamperBitcTimelineTests(unittest.TestCase):
-    def test_media_pts_are_derived_from_bitc(self) -> None:
-        timeline = _BitcMediaTimeline(max_gap_seconds=2.0)
+class StamperClockTimelineTests(unittest.TestCase):
+    def test_media_pts_are_derived_from_clock(self) -> None:
+        timeline = _MediaTimeline(max_gap_seconds=2.0)
 
         self.assertEqual(timeline.pts(1_000.0), 0)
         self.assertEqual(timeline.pts(1_000.1), 9_000)
@@ -35,7 +35,7 @@ class StamperBitcTimelineTests(unittest.TestCase):
 
     def test_rtp_jump_reanchors_without_corrupting_media_cadence(self) -> None:
         anchor = _StampAnchor("garden")
-        timeline = _BitcMediaTimeline(max_gap_seconds=2.0)
+        timeline = _MediaTimeline(max_gap_seconds=2.0)
 
         first = anchor.observe(100.0, 1_000.0)
         second = anchor.observe(100.1, 1_000.1)
@@ -47,18 +47,18 @@ class StamperBitcTimelineTests(unittest.TestCase):
         self.assertEqual(timeline.pts(after_forward_jump), 18_000)
         self.assertEqual(timeline.pts(after_backward_jump), 27_000)
 
-    def test_non_increasing_bitc_frame_is_discarded(self) -> None:
-        timeline = _BitcMediaTimeline(max_gap_seconds=2.0)
+    def test_non_increasing_clock_frame_is_discarded(self) -> None:
+        timeline = _MediaTimeline(max_gap_seconds=2.0)
 
         self.assertEqual(timeline.pts(1_000.0), 0)
         self.assertIsNone(timeline.pts(999.9))
         self.assertEqual(timeline.pts(1_000.1), 9_000)
 
-    def test_real_bitc_gap_requires_a_new_media_epoch(self) -> None:
-        timeline = _BitcMediaTimeline(max_gap_seconds=2.0)
+    def test_real_clock_gap_requires_a_new_media_epoch(self) -> None:
+        timeline = _MediaTimeline(max_gap_seconds=2.0)
 
         self.assertEqual(timeline.pts(1_000.0), 0)
-        with self.assertRaises(_BitcEpochDiscontinuity) as raised:
+        with self.assertRaises(_ClockEpochDiscontinuity) as raised:
             timeline.pts(1_183.0)
 
         self.assertEqual(raised.exception.gap_seconds, 183.0)
@@ -74,7 +74,7 @@ class StamperBitcTimelineTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             if calls == 1:
-                raise _BitcEpochDiscontinuity(183.0)
+                raise _ClockEpochDiscontinuity(183.0)
             worker.local_stop.set()
 
         with (
@@ -87,7 +87,7 @@ class StamperBitcTimelineTests(unittest.TestCase):
         self.assertEqual(worker._reconnect_count, 0)
         self.assertEqual(worker._fallback_count, 0)
         gap_events = [
-            call for call in store.event.call_args_list if call.args[3] == "bitc_gap"
+            call for call in store.event.call_args_list if call.args[3] == "clock_gap"
         ]
         self.assertEqual(len(gap_events), 1)
 

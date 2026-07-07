@@ -230,7 +230,7 @@ class RecorderFaultIntegrationTests(unittest.TestCase):
         self.stack.enter_context(
             mock.patch.object(
                 video,
-                "_decode_bitc_media_epoch",
+                "_decode_media_epoch",
                 side_effect=lambda *_args, **_kwargs: time.time(),
             )
         )

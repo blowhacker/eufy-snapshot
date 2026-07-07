@@ -1,8 +1,8 @@
-"""BITC-over-SEI: the burned-in timecode value carried as an H.264 SEI NAL.
+"""Frame clock over SEI: the timecode value carried as an H.264 SEI NAL.
 
-Same clock and payload semantics as :mod:`bitc` (Unix centiseconds + CRC8),
-but carried as an unregistered user-data SEI inside each access unit instead
-of burned into pixels. Injection is packet-level — no decode, no encode — so
+The clock is Unix centiseconds + CRC8, carried as an unregistered user-data
+SEI inside each access unit (the pixel-burned carrier it replaced is gone).
+Injection is packet-level — no decode, no encode — so
 the stamped stream keeps the camera's original bits: zero generation loss,
 archive size = camera native, and no NVENC session.
 
@@ -18,8 +18,28 @@ variant is needed; a non-H.264 input falls back to the re-encode stamper.
 from __future__ import annotations
 
 import uuid as _uuid
+import zlib
 
-from .bitc import _MAX_VALUE, _crc8, encode_value
+# ── Value codec (Unix centiseconds + CRC8) ───────────────────────────────────
+# Formerly bitc._MAX_VALUE/_crc8/encode_value: the payload semantics, now that
+# the pixel carrier is gone and the SEI NAL is the only carrier.
+_NPAY = 38
+_MAX_VALUE = 1 << _NPAY
+
+
+def encode_value(unix_seconds: float) -> int:
+    """Return Unix centiseconds for ``unix_seconds`` (the 38-bit payload)."""
+    value = int(round(float(unix_seconds) * 100.0))
+    if value < 0:
+        raise ValueError("clock value must be non-negative")
+    if value >= _MAX_VALUE:
+        raise ValueError(f"clock value exceeds {_NPAY}-bit payload")
+    return value
+
+
+def _crc8(value: int) -> int:
+    return zlib.crc32(value.to_bytes(8, "little", signed=False)) & 0xFF
+
 
 # Application identity for the unregistered SEI (ITU-T H.264 D.1.7 / D.2.7).
 # Consumers ignore any unregistered SEI whose UUID differs.
@@ -76,7 +96,7 @@ def stamp_mode(settings, source_id: str, default: str = STAMP_MODE_SEI_COPY) -> 
 def build_payload(value: int) -> bytes:
     """uuid + centisecond value + CRC8 — the unregistered SEI body."""
     if not isinstance(value, int) or value < 0 or value >= _MAX_VALUE:
-        raise ValueError("SEI BITC value out of range")
+        raise ValueError("SEI clock value out of range")
     return PAYLOAD_UUID + value.to_bytes(8, "little") + bytes([_crc8(value)])
 
 
@@ -269,11 +289,7 @@ def decode_value_frame(frame) -> int | None:
 
 
 def decode_frame(frame) -> tuple[float | None, bool]:
-    """(unix_seconds, True) from frame side data, else (None, False).
-
-    Mirrors :func:`bitc.decode` so consumers can try SEI first and fall back
-    to the pixel marker for legacy streams/archives.
-    """
+    """(unix_seconds, True) from frame side data, else (None, False)."""
     value = decode_value_frame(frame)
     if value is None:
         return None, False

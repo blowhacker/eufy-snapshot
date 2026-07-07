@@ -12,9 +12,6 @@ class V2Player {
   #rate = 1;
   #intendedTs = null;  // display target while async seek/load is in flight
   #presentedMediaTime = null;
-  #bitcEpoch = null;       // recorded clock re-anchored to the burned marker (ground truth)
-  #bitcEpochSeg = null;    // seg id the #bitcEpoch was learned for (reset on seg change)
-  #lastBitcMs = 0;         // throttle for the per-frame marker decode
   #frameClock = null;      // finalized MP4 PTS -> exact SEI timestamp
   #frameClockUrl = null;
   #clockSource = null;
@@ -232,11 +229,11 @@ class V2Player {
       this.#clockSource = "sei";
       return frameTs;
     }
-    // Prefer the marker-anchored epoch (ground truth) over the cached media_epoch
-    // (seg start_ts); PDT still wins for live HLS.
-    this.#clockSource = this.#bitcEpoch != null ? "pixel" : "mapped";
+    // No SEI frame clock for this file: map through the segment's
+    // server-anchored media_epoch (seg start_ts). PDT still wins for live HLS.
+    this.#clockSource = "mapped";
     return this.#programDateTimeForMediaTime(mediaTime)
-      ?? ((this.#bitcEpoch ?? this.#activeSeg.start_ts) + mediaTime);
+      ?? (this.#activeSeg.start_ts + mediaTime);
   }
 
   get frameClockStatus() {
@@ -278,7 +275,7 @@ class V2Player {
       if (cand && Math.abs(cand.timestamp - ts) <= 2.0) mediaTime = cand.pts;
     }
     if (mediaTime == null) {
-      mediaTime = ts - (this.#bitcEpoch ?? seg.start_ts);
+      mediaTime = ts - seg.start_ts;
     }
     if (!Number.isFinite(mediaTime)) return false;
     const dur = Number.isFinite(this.#v.duration) ? this.#v.duration : null;
@@ -308,34 +305,11 @@ class V2Player {
       const mediaTime = Number(metadata?.mediaTime);
       if (Number.isFinite(mediaTime)) {
         this.#presentedMediaTime = mediaTime;
-        this.#syncBitcEpoch(mediaTime, now);   // re-anchor the clock to the marker
         this.#emit("frame");
       }
       this.#v.requestVideoFrameCallback(tick);
     };
     this.#v.requestVideoFrameCallback(tick);
-  }
-
-  // Re-anchor the recorded clock to the displayed frame's burned bitc marker.
-  // segments.media_epoch is a per-segment cache that can be wrong (a bad anchor
-  // poisons the whole segment, e.g. seg 42's 0.214s drift); the marker is ground
-  // truth. effectiveEpoch = marker - mediaTime keeps currentTs (and everything
-  // off it: overlay, timeline, the on-screen clock) on bitc. Throttled — the
-  // offset is ~constant per segment, so this is cheap, not per-frame work.
-  #syncBitcEpoch(mediaTime, nowMs) {
-    const seg = this.#activeSeg;
-    if (!seg || !Number.isFinite(seg.start_ts)) return;
-    if (this.#frameClock?.timestampForMediaTime(mediaTime) != null) return;
-    if (seg.id !== this.#bitcEpochSeg) {       // new segment → relearn from scratch
-      this.#bitcEpoch = null; this.#bitcEpochSeg = seg.id; this.#lastBitcMs = 0;
-    }
-    if (nowMs - this.#lastBitcMs < 500) return;
-    this.#lastBitcMs = nowMs;
-    const marker = decodeLiveMarker(this.#v);
-    if (marker == null) return;                // undecodable frame → keep last epoch
-    const epoch = marker - mediaTime;
-    if (Math.abs(epoch - seg.start_ts) > 5) return;  // reject a wild/garbled decode
-    this.#bitcEpoch = epoch;
   }
 
   #currentMediaTime() {
@@ -1393,7 +1367,7 @@ const liveTail = {
   _tracklets: null,
   _trackletsSeq: -1,
   window: null,
-  bitcTimeOffset: null,
+  clockTimeOffset: null,
   targetTs: null,
   mode: null,                 // LIVE_M | PAUSED_M | DVR_M — the one source of truth
   nativeDelay: LIVE_NATIVE_DEFAULT_DELAY_SECONDS,
@@ -1427,7 +1401,7 @@ window.wanyardLiveClockStatus = () => ({
 function urlTimestamp(ts) {
   const n = Number(ts);
   // Reject null/undefined (Number(null)===0) and any non-positive value: a URL ts
-  // is an absolute BITC/Unix time, never 0. Prevents ?ts=0 from a live click.
+  // is an absolute clock/Unix time, never 0. Prevents ?ts=0 from a live click.
   if (ts == null || !Number.isFinite(n) || n <= 0) return null;
   return n.toFixed(3).replace(/\.?0+$/, "");
 }
@@ -1582,7 +1556,7 @@ class LiveDelayStats {
         overlay: overlaySamples,
       },
       detectorLagKind: "firstSeenAt - abs_ts",
-      wallLatencyKind: "browserNow - decodedBITC",
+      wallLatencyKind: "browserNow - decodedClock",
       detectorLag,
       wallLatency,
       latestDetLead,
@@ -1996,7 +1970,7 @@ function seekLiveVideoToTs(ts, win) {
   }
   liveTail.window = win;
   liveTail.targetTs = ts;
-  liveTail.bitcTimeOffset = ts - target;
+  liveTail.clockTimeOffset = ts - target;
   return true;
 }
 
@@ -2024,19 +1998,12 @@ function liveTailCurrentTs(mediaTime = null) {
     liveTail.clockSource = "sei";
     return seiTs;
   }
-  // A copy stream has real scene pixels where the old marker strip lived.
-  // Random imagery passes the marker's 8-bit CRC often enough to create
-  // periodic false timestamps, so SEI must win whenever this frame has one.
-  // The wall-time guard also prevents a false pixel decode from poisoning the
-  // detection query during the brief interval before hls.js delivers SEI.
-  const markerTs = decodeLiveMarker(el.liveVideo);
-  if (markerTs != null && Math.abs(markerTs - Date.now() / 1000) <= LIVE_OPEN_MAX_AGE) {
-    liveTail.clockSource = "pixel";
-    return markerTs;
-  }
-  if (liveTail.bitcTimeOffset != null) {
+  // No SEI yet (brief interval before hls.js delivers the first stamped
+  // fragment): fall back to the server-mapped offset, then a recent detection,
+  // then wall time. The clock only ever rides as SEI now — no pixel carrier.
+  if (liveTail.clockTimeOffset != null) {
     liveTail.clockSource = "mapped";
-    return liveTail.bitcTimeOffset + (el.liveVideo.currentTime || 0);
+    return liveTail.clockTimeOffset + (el.liveVideo.currentTime || 0);
   }
   if (liveTail.latestDet?.abs_ts != null) {
     liveTail.clockSource = "detection";
@@ -2063,7 +2030,7 @@ function updateLivePlaybackRate(ts = liveTailCurrentTs()) {
   let rate = selected;
   if (selected > 1) {
     const lag = Date.now() / 1000 - ts;
-    const isDvrCatchup = liveTail.bitcTimeOffset != null && lag > LIVE_EDGE_RATE_RESET_SECONDS;
+    const isDvrCatchup = liveTail.clockTimeOffset != null && lag > LIVE_EDGE_RATE_RESET_SECONDS;
     rate = isDvrCatchup ? selected : 1;
   }
   setLivePlaybackRate(rate);
@@ -2087,9 +2054,9 @@ function replaceProvisionalEvents(events, srcId = null) {
   mergeEvents(events);
 }
 
-// The server sends each segment's honest recorder-open start_ts plus the BITC
-// anchor media_epoch. The timeline and player index everything by BITC time, so
-// here we set start_ts/end_ts to the segment's BITC coverage
+// The server sends each segment's honest recorder-open start_ts plus the
+// SEI-anchor media_epoch. The timeline and player index everything by clock
+// time, so here we set start_ts/end_ts to the segment's clock coverage
 // [media_epoch, media_epoch + duration]. One value (media_epoch) places the file
 // in the universe; offsets into it are derived, never stored.
 function worldizeSeg(s) {
@@ -3905,7 +3872,7 @@ async function startLiveTail(srcId = null, options = {}) {
   liveTail.presentedMediaTime = null;
   liveTail.clockSource = null;
   liveTail.window = liveWindow;
-  liveTail.bitcTimeOffset = null;
+  liveTail.clockTimeOffset = null;
   liveTail.targetTs = seekTs;
   mode.enterLive();
   player.pause();
@@ -4047,7 +4014,7 @@ function stopLiveTail(updateMode = true, invalidate = true) {
   liveTail.recentSeq++;
   liveTail._tracklets = null;
   liveTail.window = null;
-  liveTail.bitcTimeOffset = null;
+  liveTail.clockTimeOffset = null;
   liveTail.targetTs = null;
   liveTail.mode = null;
   liveTail.nativeDelay = LIVE_NATIVE_DEFAULT_DELAY_SECONDS;
@@ -4762,66 +4729,6 @@ function boxesAtOverlayTime(ts) {
   return _filterBoxes(boxesFromTracklets(overlayTracklets(), ts));   // class/zone filter at draw
 }
 
-// ── BITC marker: read the world-time burned into the displayed frame ──────────
-// JS port of wanyard.bitc.decode. The marker is a bottom-flush, bottom-left strip
-// of 46 8px black/white cells: 38 payload bits (unix centiseconds, LSB first) +
-// 8 CRC bits. Read at NATIVE resolution so the fixed-pixel strip is exact.
-const _BITC_CELL = 8, _BITC_NCELLS = 46, _BITC_NPAY = 38, _BITC_W = _BITC_CELL * _BITC_NCELLS;
-let _bitcCrcTable = null, _bitcCanvas = null;
-function _bitcCrc32(bytes) {
-  if (!_bitcCrcTable) {
-    _bitcCrcTable = new Uint32Array(256);
-    for (let n = 0; n < 256; n++) {
-      let c = n;
-      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-      _bitcCrcTable[n] = c >>> 0;
-    }
-  }
-  let crc = 0xFFFFFFFF;
-  for (let i = 0; i < bytes.length; i++) crc = (_bitcCrcTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8)) >>> 0;
-  return (crc ^ 0xFFFFFFFF) >>> 0;
-}
-function decodeLiveMarker(v) {
-  const iw = v.videoWidth, ih = v.videoHeight;
-  if (!iw || !ih || ih < _BITC_CELL || iw < _BITC_W) return null;
-  if (!_bitcCanvas) { _bitcCanvas = document.createElement("canvas"); _bitcCanvas.width = _BITC_W; _bitcCanvas.height = _BITC_CELL; }
-  const ctx = _bitcCanvas.getContext("2d", { willReadFrequently: true });
-  let data;
-  try {
-    ctx.drawImage(v, 0, ih - _BITC_CELL, _BITC_W, _BITC_CELL, 0, 0, _BITC_W, _BITC_CELL);
-    data = ctx.getImageData(0, 0, _BITC_W, _BITC_CELL).data;
-  } catch (e) { return null; }                 // not yet decoded / tainted
-  const pad = (_BITC_CELL / 4) | 0;            // inner-50% sampling
-  const bits = new Array(_BITC_NCELLS);
-  for (let i = 0; i < _BITC_NCELLS; i++) {
-    let sum = 0, cnt = 0;
-    for (let y = pad; y < _BITC_CELL - pad; y++)
-      for (let x = i * _BITC_CELL + pad; x < i * _BITC_CELL + _BITC_CELL - pad; x++) {
-        const idx = (y * _BITC_W + x) * 4;
-        sum += data[idx] + data[idx + 1] + data[idx + 2]; cnt += 3;
-      }
-    bits[i] = (sum / cnt) > 128 ? 1 : 0;
-  }
-  let value = 0;                                // 38 bits: arithmetic (>32-bit)
-  for (let i = 0; i < _BITC_NPAY; i++) if (bits[i]) value += Math.pow(2, i);
-  let crc = 0;
-  for (let i = 0; i < 8; i++) if (bits[_BITC_NPAY + i]) crc += (1 << i);
-  const vb = new Array(8); let vv = value;
-  for (let j = 0; j < 8; j++) { vb[j] = vv % 256; vv = Math.floor(vv / 256); }
-  if ((_bitcCrc32(vb) & 0xFF) !== crc) return null;
-  return value / 100;                          // unix seconds
-}
-function _maskBitcStrip(ctx, c, v) {
-  const iw = v.videoWidth, ih = v.videoHeight;
-  if (!iw || !ih) return;
-  const scale = Math.min(c.width / iw, c.height / ih);
-  const rw = iw * scale, rh = ih * scale, ox = (c.width - rw) / 2, oy = (c.height - rh) / 2;
-  const sx = ox, sy = oy + (1 - _BITC_CELL / ih) * rh;
-  const sw = (_BITC_W / iw) * rw, sh = (_BITC_CELL / ih) * rh;
-  ctx.fillStyle = "#0b0e12";
-  ctx.fillRect(sx, sy - 1, sw + 1, sh + 2);    // small pad to fully cover
-}
-
 function drawBoxes(ts) {
   if (liveTail.active) return;
   const v = el.video;
@@ -4841,9 +4748,8 @@ function drawBoxes(ts) {
 }
 
 function drawLiveBoxes(mediaTime = null) {
-  // Pixel-BITC streams read the displayed frame directly; SEI-copy streams
-  // use the server-anchored HLS media-time mapping. Both paths are owned by
-  // liveTailCurrentTs(), so overlays must not require a pixel marker here.
+  // Live time is owned by liveTailCurrentTs() (SEI, then the server-anchored
+  // HLS media-time mapping) — overlays never read pixels.
   const markerTs = liveTailCurrentTs(mediaTime);
   if (!Number.isFinite(markerTs)) { drawBoxList(el.liveVideo, []); return; }
   const sample = liveTail.recentDets.length
@@ -4908,7 +4814,6 @@ function drawBoxList(v, boxes) {
   const ctx = c.getContext("2d");
   ctx.clearRect(0, 0, c.width, c.height);
   if (!v.videoWidth) return;
-  _maskBitcStrip(ctx, c, v);              // hide the burned timecode strip (always)
   if (!st.showBoxes) return;
   if (!boxes.length) return;
   const cw = c.width, ch = c.height;

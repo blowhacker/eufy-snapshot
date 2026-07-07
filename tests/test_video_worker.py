@@ -18,7 +18,7 @@ if str(SRC) not in sys.path:
 
 from wanyard.config import SourceConfig
 from wanyard import sei, video
-from wanyard.bitc import encode_value
+from wanyard.sei import encode_value
 from wanyard.video import VideoWorker
 
 

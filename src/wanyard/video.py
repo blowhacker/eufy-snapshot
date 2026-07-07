@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 import urllib.request
 
-from . import bitc, sei
+from . import sei
 
 LOG = logging.getLogger(__name__)
 
@@ -52,10 +52,10 @@ _NOTIFICATION_CONFIRMATION_STRATEGY = "yolo1280-crop640-960-v1"
 _NOTIFICATION_CONFIRMATION_RETRY_SECONDS = 30.0
 _NOTIFICATION_CONFIRMATION_TIMEOUT_SECONDS = 8.0
 _PROVISIONAL_TRACKLET_CACHE_TTL_SECONDS = 3.0
-_BITC_ANCHOR_SCAN_SECONDS = 5.0
-_BITC_ANCHOR_SCAN_FRAMES = 150
-_BITC_ZERO_CONTAINER_PTS = "container_pts"
-_BITC_ZERO_FIRST_FRAME = "first_frame"
+_CLOCK_ANCHOR_SCAN_SECONDS = 5.0
+_CLOCK_ANCHOR_SCAN_FRAMES = 150
+_CLOCK_ZERO_CONTAINER_PTS = "container_pts"
+_CLOCK_ZERO_FIRST_FRAME = "first_frame"
 _FRAME_CLOCK_VERSION = 1
 _RECORD_RELAY_WAIT_SECONDS = 180.0
 _RECORD_POLL_SECONDS = 5.0
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS segments (
     path            TEXT    NOT NULL UNIQUE,
     start_ts        REAL    NOT NULL,
     end_ts          REAL,
-    media_epoch     REAL,        -- BITC/Unix time at player media offset 0; the one anchor
+    media_epoch     REAL,        -- clock/Unix time at player media offset 0; the one anchor
     duration_sec    REAL,        -- playable media duration; private media metadata
     scanned_at      REAL,        -- wall time the detector finished scanning (NULL = pending)
     spritesheet     TEXT,
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS video_detections (
     id          INTEGER PRIMARY KEY,
     segment_id  INTEGER REFERENCES segments(id) ON DELETE CASCADE,
     source_id   TEXT    NOT NULL,
-    abs_ts      REAL    NOT NULL,   -- decoded BITC time of the tagged frame; the only time
+    abs_ts      REAL    NOT NULL,   -- decoded clock time of the tagged frame; the only time
     has_human   INTEGER NOT NULL DEFAULT 0,
     confidence  REAL    NOT NULL DEFAULT 0,
     boxes_json  TEXT,
@@ -270,8 +270,8 @@ def _dominant_class(classes: list[str]) -> str:
     return classes[0] if classes else "unknown"
 
 
-# ── BITC time basis (see docs/media-time-architecture.md) ───────────────────
-# Public media state uses one clock: decoded BITC/Unix seconds. Historical
+# ── clock time basis (see docs/media-time-architecture.md) ───────────────────
+# Public media state uses one clock: decoded clock/Unix seconds. Historical
 # recorder-open time (`start_ts`) and media offsets are private storage metadata.
 
 def _row_value(row, key: str, default=None):
@@ -338,7 +338,7 @@ class VideoSegmentDB:
         with self._connect() as conn:
             # _DDL is the single source of truth: one pure schema, no migrations,
             # no backfill. A point in time is a point on video; media_epoch is the
-            # single BITC->player anchor and abs_ts the only public time.
+            # single clock->player anchor and abs_ts the only public time.
             conn.executescript(_DDL)
 
     @contextmanager
@@ -390,7 +390,7 @@ class VideoSegmentDB:
             )
 
     def set_segment_media_start(self, segment_id: int, media_epoch: float) -> None:
-        """Attach the marker-derived world-time anchor for one segment."""
+        """Attach the SEI-derived world-time anchor for one segment."""
         with self._connect() as conn:
             conn.execute(
                 "UPDATE segments SET media_epoch=? WHERE id=?",
@@ -459,7 +459,7 @@ class VideoSegmentDB:
         return len(detections)
 
     def replace_detections(self, segment_id: int, detections: list[dict]) -> None:
-        """Store detections in BITC time. Each carries abs_ts; nothing else times them."""
+        """Store detections in clock time. Each carries abs_ts; nothing else times them."""
         with self._connect() as conn:
             seg = conn.execute(
                 "SELECT source_id, media_epoch FROM segments WHERE id=?",
@@ -1935,23 +1935,19 @@ def _yolo_tag_video(
     db: VideoSegmentDB,
     predict_lock=None,
 ) -> int:
-    """Read video file at ~1fps, run YOLO, store detections in BITC time.
+    """Read video file at ~1fps, run YOLO, store detections in clock time.
 
-    Frame time comes from the frame itself: SEI side data first, pixel marker
-    as fallback (re-encode segments and legacy archives). This reads via PyAV
-    because cv2 discards side data — it was structurally blind to the clock on
-    sei_copy segments even though the archive carries it on every frame, and
-    its pixel decoder then ran on real scene content (where the strip used to
-    live), whose occasional CRC-8 false accepts stored detections at garbage
-    timestamps. A plausibility clamp on the segment's own span keeps any
-    surviving false decode from ever writing an out-of-sync row.
+    Frame time comes from the frame itself: the clock rides as SEI side data,
+    read via PyAV (cv2 discards side data). A plausibility clamp on the
+    segment's own span keeps any stray SEI CRC-8 false accept from ever writing
+    an out-of-sync row.
     """
     import av
 
     seg_row = db.get_segment(seg_id) or {}
     media_epoch = _seg_media_start(seg_row)
     if media_epoch is None:
-        return 0   # unanchored segment: cannot place frames in BITC time
+        return 0   # unanchored segment: cannot place frames in clock time
 
     duration = seg_row.get("duration_sec")
     if not isinstance(duration, (int, float)) or duration <= 0:
@@ -1986,13 +1982,9 @@ def _yolo_tag_video(
             next_sample_pts = fpts + 1.0   # ~1fps on the container timeline
 
             abs_ts, crc_ok = sei.decode_frame(frame)
-            sei_timed = crc_ok
-            frame_bgr = None
-            if not crc_ok:
-                frame_bgr = frame.to_ndarray(format="bgr24")
-                abs_ts, crc_ok = bitc.decode(frame_bgr)
             if not crc_ok or abs_ts is None:
                 continue
+            # Clamp guards a stray SEI CRC hit to the segment's own span.
             if not (ts_lo <= abs_ts <= ts_hi):
                 LOG.warning(
                     "yolo tag rejected implausible clock %.3f at pts %.1fs "
@@ -2000,11 +1992,7 @@ def _yolo_tag_video(
                     abs_ts, fpts, seg_path.name, ts_lo, ts_hi,
                 )
                 continue
-            if frame_bgr is None:
-                frame_bgr = frame.to_ndarray(format="bgr24")
-            if not sei_timed:
-                # Only pixel-marked streams have a strip to hide from YOLO.
-                bitc.mask(frame_bgr)
+            frame_bgr = frame.to_ndarray(format="bgr24")
             try:
                 if predict_lock is None:
                     results = model.predict(
@@ -3195,7 +3183,7 @@ class VideoWorker:
                 continue
             try:
                 finalized = _finalize_segment_file(path)
-                media_epoch = _decode_bitc_media_epoch(path)
+                media_epoch = _decode_media_epoch(path)
                 if media_epoch is not None:
                     self.db.set_segment_media_start(row["id"], media_epoch)
                     _write_mp4_frame_clock(path)
@@ -3361,9 +3349,9 @@ class VideoWorker:
                  # Preserve the stamper's rtp-based pts as the MP4/HLS container
                  # timeline. -use_wallclock_as_timestamps would overwrite it with
                  # bursty recorder arrival time, compressing the early frames so
-                 # the player's currentTime no longer maps to the burned marker
+                 # the player's currentTime no longer maps to the frame clock
                  # (the box-lead bug). The stamper already supplies clean
-                 # monotonic pts that track the markers.
+                 # monotonic pts that track the SEI clock.
                  "-rtsp_transport", self.source.rtsp_transport,
                  "-i", url,
                  # Archive: fragmented MP4 while recording — moov up front,
@@ -3425,7 +3413,7 @@ class VideoWorker:
             return
         media_epoch = None
         if self._seg_path is not None:
-            media_epoch = _decode_bitc_media_epoch(self._seg_path)
+            media_epoch = _decode_media_epoch(self._seg_path)
         if media_epoch is None:
             try:
                 fragments = sorted(
@@ -3437,9 +3425,9 @@ class VideoWorker:
                 return
             if not fragments:
                 return
-            media_epoch = _decode_bitc_media_epoch(
+            media_epoch = _decode_media_epoch(
                 fragments[0],
-                playback_zero=_BITC_ZERO_FIRST_FRAME,
+                playback_zero=_CLOCK_ZERO_FIRST_FRAME,
             )
         if media_epoch is None:
             return
@@ -3449,7 +3437,7 @@ class VideoWorker:
             LOG.exception("early anchor set failed for %s", self.source.id)
             return
         self._anchor_set = True
-        LOG.info("BITC-ANCHOR-EARLY seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
+        LOG.info("CLOCK-ANCHOR-EARLY seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
                  seg_id, self.source.id, media_epoch, media_epoch - seg_start)
 
     def _stop_segment(self, ts: float) -> bool:
@@ -3494,17 +3482,17 @@ class VideoWorker:
                     return False
 
                 _finalize_segment_file(seg_path)
-                media_epoch = _decode_bitc_media_epoch(seg_path)
+                media_epoch = _decode_media_epoch(seg_path)
                 if media_epoch is not None:
                     self.db.set_segment_media_start(seg_id, media_epoch)
                     _write_mp4_frame_clock(seg_path)
                     LOG.info(
-                        "BITC-ANCHOR seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
+                        "CLOCK-ANCHOR seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
                         seg_id, self.source.id, media_epoch, media_epoch - seg_start,
                     )
                 else:
                     LOG.warning(
-                        "BITC-ANCHOR seg=%d src=%s no readable frame-0 marker; "
+                        "CLOCK-ANCHOR seg=%d src=%s no readable frame-0 clock; "
                         "marking invalid so backfill does not queue it",
                         seg_id, self.source.id,
                     )
@@ -3604,7 +3592,7 @@ def _frame_clock_path(path: Path) -> Path:
 
 
 def _write_mp4_frame_clock(path: Path) -> Path | None:
-    """Persist finalized-MP4 presentation PTS -> SEI BITC mappings.
+    """Persist finalized-MP4 presentation PTS -> SEI clock mappings.
 
     Packet scanning is compressed-domain work: no video decode or re-encode.
     The browser matches requestVideoFrameCallback.mediaTime against these exact
@@ -3667,30 +3655,30 @@ def _write_mp4_frame_clock(path: Path) -> Path | None:
                 pass
 
 
-def _decode_bitc_media_epoch(
+def _decode_media_epoch(
     path: Path | str,
     *,
-    playback_zero: str = _BITC_ZERO_CONTAINER_PTS,
+    playback_zero: str = _CLOCK_ZERO_CONTAINER_PTS,
 ) -> float | None:
-    """Decode early BITC frames and return the segment's media_epoch.
+    """Decode early clock frames and return the segment's media_epoch.
 
-    BITC is the only absolute time. This function never treats container PTS,
-    filenames, or wall clock as truth; it decodes the BITC marker from the
+    clock is the only absolute time. This function never treats container PTS,
+    filenames, or wall clock as truth; it reads the clock SEI from the
     pixels, then subtracts the player-relative offset where that exact frame is
-    shown. The result is the BITC/Unix time for player currentTime == 0.
+    shown. The result is the clock/Unix time for player currentTime == 0.
 
     Closed MP4 files are played directly by the browser, and browser
     currentTime follows the MP4 container PTS. If the first readable sample
     starts at a positive PTS, preserving that offset is required so
-    media_epoch + currentTime equals the visible BITC marker.
+    media_epoch + currentTime equals the frame's clock SEI.
 
     The open live HLS anchor is provisional only: before the MP4 exists there is
     no final MP4 player origin to calibrate against. It uses the first readable
     frame as temporary offset zero to unblock live detection rows; the sealed
-    MP4 replaces it with the authoritative BITC->player anchor.
+    MP4 replaces it with the authoritative clock->player anchor.
     """
-    if playback_zero not in {_BITC_ZERO_CONTAINER_PTS, _BITC_ZERO_FIRST_FRAME}:
-        raise ValueError(f"unknown BITC playback zero: {playback_zero}")
+    if playback_zero not in {_CLOCK_ZERO_CONTAINER_PTS, _CLOCK_ZERO_FIRST_FRAME}:
+        raise ValueError(f"unknown clock playback zero: {playback_zero}")
     try:
         import av
         import statistics
@@ -3711,29 +3699,25 @@ def _decode_bitc_media_epoch(
                     frame_pts = _frame_pts_seconds(frame)
                     if first_pts is None and frame_pts is not None:
                         first_pts = frame_pts
-                    # SEI side data first (sei_copy segments), pixel marker as
-                    # fallback (re-encode segments and legacy archives). Both
-                    # carry the same clock; only the carrier differs.
-                    bitc_ts, crc_ok = sei.decode_frame(frame)
-                    if not crc_ok:
-                        bitc_ts, crc_ok = bitc.decode(
-                            frame.to_ndarray(format="bgr24"))
-                    if crc_ok and bitc_ts is not None:
+                    # The clock rides as SEI side data for every stamped
+                    # segment (sei_copy and reencode alike).
+                    clock_ts, crc_ok = sei.decode_frame(frame)
+                    if crc_ok and clock_ts is not None:
                         if frame_pts is None:
                             if samples:
                                 continue
                             player_offset = 0.0
-                        elif playback_zero == _BITC_ZERO_CONTAINER_PTS:
+                        elif playback_zero == _CLOCK_ZERO_CONTAINER_PTS:
                             player_offset = frame_pts
                         elif first_pts is not None:
                             player_offset = frame_pts - first_pts
                         else:
                             continue
-                        samples.append(bitc_ts - player_offset)
+                        samples.append(clock_ts - player_offset)
                     scanned += 1
-                    if scanned >= _BITC_ANCHOR_SCAN_FRAMES or (
+                    if scanned >= _CLOCK_ANCHOR_SCAN_FRAMES or (
                         first_pts is not None and frame_pts is not None
-                        and frame_pts - first_pts >= _BITC_ANCHOR_SCAN_SECONDS
+                        and frame_pts - first_pts >= _CLOCK_ANCHOR_SCAN_SECONDS
                     ):
                         done = True
                         break
@@ -3741,7 +3725,7 @@ def _decode_bitc_media_epoch(
         finally:
             container.close()
     except Exception:
-        LOG.debug("failed to decode first-frame BITC marker from %s", path, exc_info=True)
+        LOG.debug("failed to read first-frame clock SEI from %s", path, exc_info=True)
         return None
 
 

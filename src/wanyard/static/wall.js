@@ -33,7 +33,7 @@ function loadHlsJs() {
   return _hlsPromise;
 }
 
-// Raw camera ingest path off mediamtx — NOT the "-stamped" (BITC) stream the
+// Raw camera ingest path off mediamtx — NOT the "-stamped" (SEI clock) stream the
 // viewer uses. The wall shows no boxes/timecode, so it skips the stamper
 // re-encode: lower latency, and the camera's native codec (H.264) plays where
 // the stamped HEVC can't (cheap Android). Same mediamtx, just the un-suffixed

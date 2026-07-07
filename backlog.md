@@ -1,12 +1,13 @@
 # Future Features
 
 ## Realtime live view
-mediamtx->bitc ->to file only has subsecond latency
+mediamtx->stamper ->to file only has subsecond latency
 
-however:
-new Date()/1000 - decodeLiveMarker(el.liveVideo)
+however, the browser-visible live edge lagged ~10s (measured before the
+SEI cutover via the now-retired pixel decoder):
+new Date()/1000 - liveTailCurrentTs()
 10.736999988555908
-new Date()/1000 - decodeLiveMarker(el.liveVideo)
+new Date()/1000 - liveTailCurrentTs()
 10.817000150680542
 
 - quick hacky win is to tune hls
@@ -85,11 +86,11 @@ Options (trade-offs):
 
 ## Tests for the go2rtc-ingest re-architecture (low priority)
 The ingest flip (camera → go2rtc → mediamtx → stamper) was verified by hand
-(recording flowed, BITC anchor sane) but has no automated coverage. Lock in:
-- BITC anchor accuracy survives the extra go2rtc hop (media_epoch decoded from
-  pixels still matches, recorded ts resolves within frame tolerance).
+(recording flowed, clock anchor sane) but has no automated coverage. Lock in:
+- Clock anchor accuracy survives the extra go2rtc hop (media_epoch decoded from
+  the frame's SEI still matches, recorded ts resolves within frame tolerance).
 - gen-mediamtx sources from `rtsp://go2rtc:8554/<id>` (not the camera).
 - gen-go2rtc reads each camera's configured URL directly + emits `stun:<port>`
   candidates (no hostname dependency).
 - Wall WHEP proxy → go2rtc; HLS-first → WebRTC-swap fallback path.
-See docs/media-time-architecture.md "Tests" for the existing BITC regressions.
+See docs/media-time-architecture.md "Tests" for the existing frame-clock regressions.

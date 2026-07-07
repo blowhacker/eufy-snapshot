@@ -164,8 +164,8 @@ body {
 .tile.rtc .tile-rtc { opacity: 1; }
 .tile.rtc .tile-hls { opacity: 0; }
 
-/* Bottom bar: holds the camera name + status dot, and its opaque foot covers
-   the burned BITC strip (bottom-left, ~8px tall) so no overlay canvas needed. */
+/* Bottom bar: holds the camera name + status dot. Its opaque foot along the
+   bottom edge is a deliberate framing element for the live tile. */
 .tile-bar {
   position: absolute;
   left: 0; right: 0; bottom: 0;

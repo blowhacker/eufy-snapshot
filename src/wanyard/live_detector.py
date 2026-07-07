@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.request
 
-from . import bitc, sei
+from . import sei
 
 LOG = logging.getLogger(__name__)
 
@@ -146,7 +146,7 @@ class _SourceWorker:
                 stream.time_base,
             )
             # Reader/worker split: this thread only demuxes, decodes and parks
-            # the freshest frame. BITC decode and YOLO stay in the worker so
+            # the freshest frame. Clock (SEI) decode and YOLO stay in the worker so
             # frames that miss the FPS gate avoid a native-frame ndarray copy.
             latest_lock = threading.Lock()
             latest: list = [None]   # [(frame, wall)] slot
@@ -194,16 +194,13 @@ class _SourceWorker:
 
         from .video import _CCTV_CLASS_IDS, _CONF_THRESHOLD, _parse_results
 
-        # SEI first (sei_copy streams carry the clock as frame side data),
-        # pixel marker as fallback (re-encode streams and legacy archives).
+        # The clock rides as frame side data (SEI); reencode streams emit the
+        # same SEI, so there is no pixel carrier to fall back to.
         abs_ts, crc_ok = sei.decode_frame(frame)
-        sei_timed = crc_ok
         frame_bgr = frame.to_ndarray(format="bgr24")
-        if not crc_ok:
-            abs_ts, crc_ok = bitc.decode(frame_bgr)
         if not crc_ok or abs_ts is None:
             if wall - self.last_marker_fail_log_wall >= _MARKER_FAIL_LOG_SECONDS:
-                LOG.info("live detector %s skip frame unreadable BITC marker",
+                LOG.info("live detector %s skip frame unreadable clock SEI",
                          self.source_id)
                 self.last_marker_fail_log_wall = wall
             return
@@ -225,10 +222,6 @@ class _SourceWorker:
                 self.last_stale_log_wall = wall
             return
 
-        if not sei_timed:
-            # Only pixel-marked streams have a strip to hide from YOLO; on a
-            # SEI stream the bottom-left pixels are real scene content.
-            bitc.mask(frame_bgr)
         with self.predict_lock:
             results = self.model.predict(
                 frame_bgr,

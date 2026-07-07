@@ -318,15 +318,13 @@ def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
     """Find the live HLS fragment frame whose clock is closest to ``ts`` and
     crop ``box`` from it. Returns JPEG bytes or None.
 
-    The frame clock is read SEI-first (sei_copy streams have no pixel marker;
-    cv2 discarded side data, which left this returning None for every frame),
-    pixel marker as fallback for re-encode streams. Every returned frame is
-    verified against its own clock, so a false pixel CRC outside ``max_drift``
+    The frame clock is read from SEI side data. Every returned frame is
+    verified against its own clock, so a stray decode outside ``max_drift``
     can never produce a wrong-moment thumb.
     """
     import av
 
-    from . import bitc, media_time, sei
+    from . import media_time, sei
     from .yolo_server import _crop_thumb
 
     live_dir = (video_dir / "live" / source_id).resolve()
@@ -356,7 +354,6 @@ def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
         return None
 
     best_frame = None       # bgr ndarray
-    best_sei_timed = True
     best_diff = max_drift
     for p in candidates[:4]:
         try:
@@ -366,19 +363,12 @@ def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
         try:
             for frame in container.decode(video=0):
                 marker, crc_ok = sei.decode_frame(frame)
-                sei_timed = crc_ok
-                frame_bgr = None
-                if not crc_ok:
-                    frame_bgr = frame.to_ndarray(format="bgr24")
-                    marker, crc_ok = bitc.decode(frame_bgr)
                 if not crc_ok or marker is None:
                     continue
                 diff = abs(marker - ts)
                 if diff < best_diff:
                     best_diff = diff
-                    best_frame = (frame_bgr if frame_bgr is not None
-                                  else frame.to_ndarray(format="bgr24"))
-                    best_sei_timed = sei_timed
+                    best_frame = frame.to_ndarray(format="bgr24")
                     if diff < 0.02:
                         break
         except Exception:
@@ -394,9 +384,6 @@ def _extract_live_thumb(video_dir: Path, source_id: str, ts: float,
     if best_frame is None:
         return None
 
-    if not best_sei_timed:
-        # Only pixel-marked streams have a strip to hide from the crop.
-        bitc.mask(best_frame)
     cls = str(box.get("cls") or "")
     return _crop_thumb(best_frame, [box], cls)
 
@@ -667,7 +654,7 @@ def make_app(
 
     async def api_video_live_thumb(request: Request) -> Response:
         """Crop a thumbnail for a provisional (open-segment) event from the
-        live HLS .ts fragments, using the burned-in BITC timecode to find the
+        live HLS .ts fragments, using the frame's SEI clock to find the
         frame closest to the event's time."""
         if not video_dir:
             return Response(status_code=404)
@@ -740,8 +727,8 @@ def make_app(
         media_epoch = loc.anchor.media_epoch if loc.anchor else None
 
         # Recorded media plays the MP4 file directly: currentTime = t - media_epoch.
-        # Both t and media_epoch are decoded BITC/Unix time; currentTime is only
-        # the private player coordinate needed to show that BITC frame.
+        # Both t and media_epoch are decoded clock/Unix time; currentTime is only
+        # the private player coordinate needed to show that frame.
         return JSONResponse({
             "provider": loc.provider,
             "storage_provider": loc.provider,

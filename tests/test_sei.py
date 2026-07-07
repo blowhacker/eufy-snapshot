@@ -14,7 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from wanyard import sei
-from wanyard.bitc import encode_value
+from wanyard.sei import encode_value
 from wanyard.db import SourceDB, RtspSourceRow
 
 
@@ -159,9 +159,9 @@ class StampModeTests(unittest.TestCase):
 
 class TimelineNudgeTests(unittest.TestCase):
     def test_nudge_emits_monotonic_pts_for_stale_samples(self) -> None:
-        from wanyard.stamper import _BitcMediaTimeline
+        from wanyard.stamper import _MediaTimeline
 
-        tl = _BitcMediaTimeline(max_gap_seconds=2.0)
+        tl = _MediaTimeline(max_gap_seconds=2.0)
         self.assertEqual(tl.pts(1_000.0, nudge=True), 0)
         self.assertEqual(tl.pts(1_000.1, nudge=True), 9_000)
         # stale / repeated clock: +1 tick, never None, never backwards
@@ -171,17 +171,17 @@ class TimelineNudgeTests(unittest.TestCase):
         self.assertEqual(tl.pts(1_000.2, nudge=True), 18_000)
 
     def test_nudge_still_raises_on_real_gap(self) -> None:
-        from wanyard.stamper import _BitcEpochDiscontinuity, _BitcMediaTimeline
+        from wanyard.stamper import _ClockEpochDiscontinuity, _MediaTimeline
 
-        tl = _BitcMediaTimeline(max_gap_seconds=2.0)
+        tl = _MediaTimeline(max_gap_seconds=2.0)
         tl.pts(1_000.0, nudge=True)
-        with self.assertRaises(_BitcEpochDiscontinuity):
+        with self.assertRaises(_ClockEpochDiscontinuity):
             tl.pts(1_003.0, nudge=True)
 
     def test_default_mode_unchanged(self) -> None:
-        from wanyard.stamper import _BitcMediaTimeline
+        from wanyard.stamper import _MediaTimeline
 
-        tl = _BitcMediaTimeline(max_gap_seconds=2.0)
+        tl = _MediaTimeline(max_gap_seconds=2.0)
         self.assertEqual(tl.pts(1_000.0), 0)
         self.assertIsNone(tl.pts(1_000.0))
         self.assertIsNone(tl.pts(999.9))
@@ -273,11 +273,11 @@ class EndToEndTests(unittest.TestCase):
     def test_recorder_anchor_reads_sei(self) -> None:
         import av
 
-        from wanyard.video import _decode_bitc_media_epoch
+        from wanyard.video import _decode_media_epoch
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mp4_path, _ = self._build_mp4(Path(tmpdir))
-            epoch = _decode_bitc_media_epoch(mp4_path)
+            epoch = _decode_media_epoch(mp4_path)
             self.assertIsNotNone(epoch)
             # media_epoch + first frame pts must equal the first frame's SEI
             # time — the anchor invariant, independent of muxer pts offsets.
@@ -311,8 +311,8 @@ class _NoBoxModel:
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
 class YoloTagTests(EndToEndTests):
-    """Backfill (_yolo_tag_video) must time frames from the frame itself:
-    SEI first, pixel fallback, and never store an implausible clock."""
+    """Backfill (_yolo_tag_video) times frames from the frame's own SEI clock
+    and never stores an implausible clock."""
 
     def _db_with_segment(self, tmpdir: Path, mp4_path: Path,
                          media_epoch: float, duration: float):
@@ -330,29 +330,6 @@ class YoloTagTests(EndToEndTests):
             return [r[0] for r in conn.execute(
                 "SELECT abs_ts FROM video_detections WHERE segment_id=?"
                 " ORDER BY abs_ts", (seg_id,)).fetchall()]
-
-    def _build_pixel_mp4(self, tmpdir: Path, marker_epoch: float) -> Path:
-        """Segment with the legacy burned pixel marker and no SEI."""
-        import av
-        import numpy as np
-
-        from wanyard import bitc
-
-        path = tmpdir / "pixel.mp4"
-        out = av.open(str(path), "w", format="mp4")
-        vs = out.add_stream("libx264", rate=self.FPS)
-        vs.width, vs.height, vs.pix_fmt = 640, 360, "yuv420p"
-        vs.options = {"bf": "0", "g": "5", "crf": "18"}
-        for i in range(12):
-            img = np.full((360, 640, 3), 128, dtype=np.uint8)
-            bitc.render_time(img, marker_epoch + i / self.FPS)
-            frame = av.VideoFrame.from_ndarray(img, format="bgr24")
-            for p in vs.encode(frame):
-                out.mux(p)
-        for p in vs.encode(None):
-            out.mux(p)
-        out.close()
-        return path
 
     def test_sei_segment_is_timed_from_sei(self) -> None:
         from wanyard.video import _yolo_tag_video
@@ -375,35 +352,18 @@ class YoloTagTests(EndToEndTests):
                 self.assertIn(round(ts, 2), {round(t, 2) for t in sei_times})
             self.assertEqual(model.calls, len(stored))
 
-    def test_pixel_fallback_still_works_within_span(self) -> None:
-        from wanyard.video import _yolo_tag_video
-
-        with tempfile.TemporaryDirectory() as tmp:
-            tmpdir = Path(tmp)
-            mp4_path = self._build_pixel_mp4(tmpdir, self.EPOCH)
-            db, seg_id = self._db_with_segment(
-                tmpdir, mp4_path, self.EPOCH, 1.2)
-
-            n = _yolo_tag_video(_NoBoxModel(), mp4_path, seg_id, db)
-
-            stored = self._stored_ts(db, seg_id)
-            self.assertEqual(n, len(stored))
-            self.assertGreaterEqual(len(stored), 1)
-            for ts in stored:
-                self.assertGreaterEqual(ts, self.EPOCH - 0.01)
-                self.assertLessEqual(ts, self.EPOCH + 1.3)
-
     def test_implausible_clock_is_rejected(self) -> None:
-        """A decoded time far outside the segment span (e.g. a CRC-8 false
-        accept on scene pixels) must never be stored."""
+        """A decoded SEI time far outside the segment span (e.g. a CRC-8 false
+        accept) must never be stored. The file's SEI sits at EPOCH; the segment
+        is registered ~6 days away, so every frame fails the plausibility clamp.
+        """
         from wanyard.video import _yolo_tag_video
 
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
-            # marker carries a time 6 days away from the segment's epoch
-            mp4_path = self._build_pixel_mp4(tmpdir, self.EPOCH + 500_000)
+            mp4_path, _ = self._build_mp4(tmpdir)   # SEI at self.EPOCH
             db, seg_id = self._db_with_segment(
-                tmpdir, mp4_path, self.EPOCH, 1.2)
+                tmpdir, mp4_path, self.EPOCH + 500_000, 1.2)
 
             n = _yolo_tag_video(_NoBoxModel(), mp4_path, seg_id, db)
 

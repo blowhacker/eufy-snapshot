@@ -1,10 +1,13 @@
-"""BITC stamper.
+"""Frame-clock stamper.
 
-Reads a relay path, computes the BITC/Unix time per frame (the ONE clock —
-rolling-min of wall-minus-rtp), burns the BITC marker into every video frame,
-re-encodes, and republishes to ``<src>-stamped``. Audio is remuxed (copied)
-through. Downstream consumers (recorder, detector) read the time from the
-pixels instead of running their own clock — no cross-consumer reconciliation.
+Reads a relay path, computes the Unix time per frame (the ONE clock —
+rolling-min of wall-minus-rtp), and attaches it to every video frame as an
+H.264 SEI NAL, republishing to ``<src>-stamped``. Default ``sei_copy`` injects
+the SEI packet-level with no re-encode (zero generation loss); ``reencode`` is
+the non-H.264 fallback and emits the same SEI on its encoded packets. Audio is
+remuxed (copied) through. Downstream consumers (recorder, detector) read the
+time from the frame's SEI instead of running their own clock — no
+cross-consumer reconciliation.
 
 Reads from the relay (free fan-out), never the camera directly.
 """
@@ -42,19 +45,19 @@ class _InputMetadataNotReady(RuntimeError):
     """The RTSP stream opened before codec dimensions were available."""
 
 
-class _BitcEpochDiscontinuity(RuntimeError):
-    """Trusted BITC advanced too far to remain in one media timeline."""
+class _ClockEpochDiscontinuity(RuntimeError):
+    """Trusted clock advanced too far to remain in one media timeline."""
 
     def __init__(self, gap_seconds: float) -> None:
         self.gap_seconds = float(gap_seconds)
         super().__init__(f"trusted clock gap of {self.gap_seconds:.3f}s")
 
 
-class _BitcMediaTimeline:
-    """Map authoritative BITC time onto one monotonic media epoch.
+class _MediaTimeline:
+    """Map authoritative clock time onto one monotonic media epoch.
 
-    BITC is the clock. Camera RTP is only an input to the BITC estimator and
-    must not independently shape playback time. Non-increasing BITC samples are
+    The clock is authoritative. Camera RTP is only an input to the estimator and
+    must not independently shape playback time. Non-increasing clock samples are
     stale and are discarded. A real gap closes this epoch so downstream media
     represents missing camera coverage as a gap between assets.
     """
@@ -63,44 +66,44 @@ class _BitcMediaTimeline:
         self.max_gap_seconds = float(max_gap_seconds)
         self.ticks_per_second = int(ticks_per_second)
         self.epoch: float | None = None
-        self.last_bitc: float | None = None
+        self.last_clock: float | None = None
         self.last_pts = -1
 
-    def pts(self, bitc_ts: float, *, nudge: bool = False) -> int | None:
-        """Media pts for ``bitc_ts``; None for unusable (stale) samples.
+    def pts(self, clock_ts: float, *, nudge: bool = False) -> int | None:
+        """Media pts for ``clock_ts``; None for unusable (stale) samples.
 
         ``nudge=True`` is for codec-copy mode, where a packet can never be
         dropped (dropping a reference frame corrupts the GOP downstream): a
         non-advancing clock sample yields ``last_pts + 1`` — one 90kHz tick,
         11µs of timeline — instead of None. Real gaps still raise
-        :class:`_BitcEpochDiscontinuity` in both modes.
+        :class:`_ClockEpochDiscontinuity` in both modes.
         """
-        if not np.isfinite(bitc_ts):
+        if not np.isfinite(clock_ts):
             return None
         if self.epoch is None:
-            self.epoch = bitc_ts
-            self.last_bitc = bitc_ts
+            self.epoch = clock_ts
+            self.last_clock = clock_ts
             self.last_pts = 0
             return 0
 
-        assert self.last_bitc is not None
-        step = bitc_ts - self.last_bitc
+        assert self.last_clock is not None
+        step = clock_ts - self.last_clock
         if step <= 0:
             if not nudge:
                 return None
-            # Clock did not advance: keep last_bitc (the estimator's truth),
+            # Clock did not advance: keep last_clock (the estimator's truth),
             # emit the next representable pts so the container stays monotonic.
             self.last_pts += 1
             return self.last_pts
         if step > self.max_gap_seconds:
-            raise _BitcEpochDiscontinuity(step)
+            raise _ClockEpochDiscontinuity(step)
 
-        pts = int(round((bitc_ts - self.epoch) * self.ticks_per_second))
+        pts = int(round((clock_ts - self.epoch) * self.ticks_per_second))
         if pts <= self.last_pts:
             if not nudge:
                 return None
             pts = self.last_pts + 1
-        self.last_bitc = bitc_ts
+        self.last_clock = clock_ts
         self.last_pts = pts
         return pts
 
@@ -196,8 +199,7 @@ class _StamperWorker:
         # VBV cap above camera native (re-encoding compressed video needs
         # headroom to match the original's look). crf/cq keep the average near
         # native; maxrate just bounds motion peaks for predictable retention.
-        # BITC marker is bitrate-independent (solid 8px luma cells decode ~99%
-        # even at 0.85 Mbps).
+        # The SEI clock is a NAL, so it is bitrate-independent regardless of cap.
         self.maxrate = self._src_env("MAXRATE")
         self.bufsize = self._src_env("BUFSIZE")
         # Runtime encoder fallback. The startup NVENC probe can pass (it grabs a
@@ -252,11 +254,11 @@ class _StamperWorker:
             try:
                 self._stream()
                 backoff = 1.0
-            except _BitcEpochDiscontinuity as exc:
+            except _ClockEpochDiscontinuity as exc:
                 self._health_state("restarting_after_clock_gap", last_error=str(exc))
                 self._health_event(
                     "warning",
-                    "bitc_gap",
+                    "clock_gap",
                     (
                         f"trusted clock gap of {exc.gap_seconds:.3f}s; "
                         "starting a new recording epoch"
@@ -426,7 +428,7 @@ class _StamperWorker:
 
         sei_copy is the default everywhere; reencode survives as the
         automatic fallback for non-h264 input and as an explicit per-source
-        escape hatch (visible burned timecode).
+        escape hatch (it re-encodes and re-attaches the same SEI clock).
         """
         mode = None
         if self._source_db_path is not None:
@@ -537,8 +539,8 @@ class _StamperWorker:
             vout.height = height
             vout.pix_fmt = "yuv420p"
             # Fixed 90kHz output timebase. PTS is derived below from the exact
-            # BITC value burned into each frame, so visible time and playback
-            # time have one authoritative clock.
+            # clock value carried on each frame's SEI, so stamp time and
+            # playback time have one authoritative clock.
             out_tb = Fraction(1, 90000)
             vout.codec_context.time_base = out_tb
             # Keyframe interval. HLS segments can only break on keyframes, so the
@@ -576,7 +578,7 @@ class _StamperWorker:
             aout = self._add_audio_stream(out, ain) if ain is not None else None
 
             anchor = _StampAnchor(self.source_id)
-            timeline = _BitcMediaTimeline(max_gap_seconds=self.epoch_gap_seconds)
+            timeline = _MediaTimeline(max_gap_seconds=self.epoch_gap_seconds)
             # Clock values for frames submitted to the encoder, keyed by the
             # pts we assigned. The encoder may hold frames briefly (startup
             # delay), so the value is re-attached to the packet that carries
@@ -684,9 +686,9 @@ class _StamperWorker:
 
         The camera bitstream passes through bit-identical (zero generation
         loss, archive size = camera native, no NVENC session); each video
-        packet gains an unregistered SEI NAL carrying the same BITC
-        centisecond value + CRC the pixel marker would have burned, and its
-        pts is rewritten on the same BITC media timeline. Packets are never
+        packet gains an unregistered SEI NAL carrying the clock's centisecond
+        value + CRC, and its pts is rewritten on the same clock media timeline.
+        Packets are never
         dropped mid-GOP (that would corrupt downstream decode): the timeline
         runs in nudge mode, and startup waits for a keyframe so the copy
         starts on a clean GOP. ``inp`` is closed by the caller's finally.
@@ -712,7 +714,7 @@ class _StamperWorker:
             aout = self._add_audio_stream(out, ain) if ain is not None else None
 
             anchor = _StampAnchor(self.source_id)
-            timeline = _BitcMediaTimeline(max_gap_seconds=self.epoch_gap_seconds)
+            timeline = _MediaTimeline(max_gap_seconds=self.epoch_gap_seconds)
             wait_key = True
             inject_fail_logged = False
             last_health_update = 0.0
