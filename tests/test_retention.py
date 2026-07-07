@@ -209,6 +209,17 @@ class CleanupLoopTests(unittest.TestCase):
                  "person", "t", "b"),
             )
 
+    def _confirmation(self, video_db, source_id, age_days) -> None:
+        now = time.time()
+        with video_db._connect() as conn:
+            conn.execute(
+                "INSERT INTO notification_confirmations"
+                " (strategy_version, event_ref, source_id, event_ts, class, status)"
+                " VALUES(?,?,?,?,?,?)",
+                ("test", f"{source_id}-{age_days}", source_id,
+                 now - age_days * 86400, "person", "confirmed"),
+            )
+
     def _notif_ages(self, video_db) -> dict[str, list[float]]:
         now = time.time()
         with video_db._connect() as conn:
@@ -315,6 +326,64 @@ class CleanupLoopTests(unittest.TestCase):
 
             self.assertEqual(video_db.prune_orphan_notifications()["events"], 1)
             self.assertEqual(video_db.unread_notification_count(), 0)
+
+    def test_manual_global_cleanup_uses_shared_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            _, front_old = self._seg(video_db, video_dir, "front", 10, "old")
+            _, front_new = self._seg(video_db, video_dir, "front", 1, "new")
+            _, garden_old = self._seg(video_db, video_dir, "garden", 10, "old")
+            _, garden_new = self._seg(video_db, video_dir, "garden", 1, "new")
+            sidecar = front_old.with_name(front_old.name + ".clock.json")
+            sidecar.write_bytes(b"clock")
+            sprite = front_old.with_suffix("")
+            sprite.mkdir()
+            (sprite / "sheet.jpg").write_bytes(b"sprite")
+            for source_id in ("front", "garden"):
+                self._notif(video_db, source_id, 10)
+                self._notif(video_db, source_id, 1)
+                self._confirmation(video_db, source_id, 10)
+                self._confirmation(video_db, source_id, 1)
+
+            result = retention.delete_before(
+                video_db, video_dir, time.time() - 5 * 86400
+            )
+
+            self.assertEqual(result["deleted_segments"], 2)
+            self.assertEqual(result["deleted_notifications"], 2)
+            self.assertEqual(result["deleted_confirmations"], 2)
+            self.assertFalse(front_old.exists())
+            self.assertFalse(garden_old.exists())
+            self.assertFalse(sidecar.exists())
+            self.assertFalse(sprite.exists())
+            self.assertTrue(front_new.exists())
+            self.assertTrue(garden_new.exists())
+            ages = self._notif_ages(video_db)
+            self.assertEqual(set(ages), {"front", "garden"})
+            self.assertEqual(len(ages["front"]), 1)
+            self.assertEqual(len(ages["garden"]), 1)
+
+    def test_manual_source_cleanup_does_not_touch_other_camera(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            _, front_old = self._seg(video_db, video_dir, "front", 10, "old")
+            _, garden_old = self._seg(video_db, video_dir, "garden", 10, "old")
+            self._notif(video_db, "front", 10)
+            self._notif(video_db, "garden", 10)
+
+            result = retention.delete_before(
+                video_db, video_dir, time.time() - 5 * 86400, "garden"
+            )
+
+            self.assertEqual(result["deleted_segments"], 1)
+            self.assertEqual(result["deleted_notifications"], 1)
+            self.assertTrue(front_old.exists())
+            self.assertFalse(garden_old.exists())
+            self.assertEqual(set(self._notif_ages(video_db)), {"front"})
 
 
 if __name__ == "__main__":

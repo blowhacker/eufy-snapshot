@@ -459,8 +459,7 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
     are re-read every cycle, so the loop must keep running even when none are
     set yet (settings can appear at runtime).
     """
-    from .retention import normalize_days, source_cleanup_days
-    from .video import _frame_clock_path
+    from .retention import delete_segments, normalize_days, source_cleanup_days
 
     def _get_thresholds():
         # DB overrides env vars
@@ -538,51 +537,17 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
                             notif_cutoffs.get(sid, 0.0), float(seg["end_ts"])
                         )
 
-            freed = 0
-            for seg in segs:
-                p = video_dir / seg["path"]
-                try:
-                    if p.exists():
-                        freed += p.stat().st_size
-                        p.unlink()
-                    clock = _frame_clock_path(p)
-                    if clock.exists():
-                        freed += clock.stat().st_size
-                        clock.unlink()
-                    sprite = p.with_suffix("")
-                    if sprite.is_dir():
-                        import shutil as _sh; _sh.rmtree(sprite, ignore_errors=True)
-                except Exception:
-                    pass
-
-            if segs or notif_cutoffs:
-                with video_db._connect() as conn:
-                    if segs:
-                        ids = [s["id"] for s in segs]
-                        pl  = ",".join("?" * len(ids))
-                        conn.execute(f"DELETE FROM video_events WHERE segment_id IN ({pl})", ids)
-                        conn.execute(f"DELETE FROM object_events WHERE segment_id IN ({pl})", ids)
-                        conn.execute(f"DELETE FROM video_detections WHERE segment_id IN ({pl})", ids)
-                        conn.execute(f"DELETE FROM segments WHERE id IN ({pl})", ids)
-                    for sid, cutoff in notif_cutoffs.items():
-                        conn.execute(
-                            "DELETE FROM notification_events"
-                            " WHERE source_id = ? AND event_ts < ?",
-                            (sid, cutoff),
-                        )
-                        conn.execute(
-                            "DELETE FROM notification_confirmations"
-                            " WHERE source_id = ? AND event_ts < ?",
-                            (sid, cutoff),
-                        )
-            if segs:
-                LOG.info("auto-cleanup: deleted %d segments, freed %.1f GB",
-                         len(segs), freed / 1e9)
-            pruned = video_db.prune_orphan_notifications()
-            if pruned["events"] or pruned["confirmations"]:
+            result = delete_segments(video_db, video_dir, segs, notif_cutoffs)
+            if result["deleted_segments"]:
                 LOG.info(
-                    "auto-cleanup: pruned orphan notifications=%d confirmations=%d",
-                    pruned["events"], pruned["confirmations"],
+                    "auto-cleanup: deleted %d segments, freed %.1f GB",
+                    result["deleted_segments"], result["freed_bytes"] / 1e9,
+                )
+            if result["deleted_notifications"] or result["deleted_confirmations"]:
+                LOG.info(
+                    "auto-cleanup: deleted notifications=%d confirmations=%d",
+                    result["deleted_notifications"],
+                    result["deleted_confirmations"],
                 )
         except Exception:
             LOG.exception("auto-cleanup error")

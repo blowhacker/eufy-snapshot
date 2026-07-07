@@ -17,6 +17,8 @@ Two per-source knobs, each stored where its consumer already reads settings:
 from __future__ import annotations
 
 import math
+import shutil
+from pathlib import Path
 
 RECORD_MODE_CONTINUOUS = "continuous"
 RECORD_MODE_LIVE_ONLY = "live_only"
@@ -114,3 +116,116 @@ def retention_settings_payload(source_db, video_db, sources: list[dict]) -> dict
         "effective_days": effective_days,
         "sources": sources,
     }
+
+
+def delete_segments(
+    video_db,
+    video_dir: Path,
+    segments: list[dict],
+    notification_cutoffs: dict[str, float] | None = None,
+) -> dict[str, int]:
+    """Delete selected media and every database object that depends on it.
+
+    Selection policy stays with the caller; this is the single destructive
+    executor used by scheduled retention and the settings-page manual action.
+    Notification cutoffs are source-scoped because cameras may have different
+    retention horizons. A final coverage pass catches holes left by maintenance
+    or storage-pressure deletion.
+    """
+    unique = {int(segment["id"]): segment for segment in segments}
+    selected = list(unique.values())
+    deleted_files = 0
+    freed_bytes = 0
+
+    for segment in selected:
+        media = video_dir / segment["path"]
+        sidecar = media.with_name(media.name + ".clock.json")
+        for path in (media, sidecar):
+            try:
+                if path.exists():
+                    freed_bytes += path.stat().st_size
+                    path.unlink()
+                    deleted_files += 1
+            except OSError:
+                pass
+        sprite_dir = media.with_suffix("")
+        if sprite_dir.is_dir():
+            shutil.rmtree(sprite_dir, ignore_errors=True)
+
+    deleted_notifications = 0
+    deleted_confirmations = 0
+    cutoffs = notification_cutoffs or {}
+    if selected or cutoffs:
+        with video_db._connect() as conn:
+            if selected:
+                ids = list(unique)
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"DELETE FROM video_events WHERE segment_id IN ({placeholders})",
+                    ids,
+                )
+                conn.execute(
+                    f"DELETE FROM object_events WHERE segment_id IN ({placeholders})",
+                    ids,
+                )
+                conn.execute(
+                    f"DELETE FROM video_detections WHERE segment_id IN ({placeholders})",
+                    ids,
+                )
+                conn.execute(
+                    f"DELETE FROM segments WHERE id IN ({placeholders})", ids
+                )
+            for source_id, cutoff in cutoffs.items():
+                deleted_notifications += conn.execute(
+                    "DELETE FROM notification_events"
+                    " WHERE source_id = ? AND event_ts < ?",
+                    (source_id, cutoff),
+                ).rowcount
+                deleted_confirmations += conn.execute(
+                    "DELETE FROM notification_confirmations"
+                    " WHERE source_id = ? AND event_ts < ?",
+                    (source_id, cutoff),
+                ).rowcount
+
+    orphaned = video_db.prune_orphan_notifications()
+    deleted_notifications += orphaned["events"]
+    deleted_confirmations += orphaned["confirmations"]
+    return {
+        "deleted_segments": len(selected),
+        "deleted_files": deleted_files,
+        "freed_bytes": freed_bytes,
+        "deleted_notifications": deleted_notifications,
+        "deleted_confirmations": deleted_confirmations,
+    }
+
+
+def delete_before(
+    video_db,
+    video_dir: Path,
+    cutoff: float,
+    source_id: str | None = None,
+) -> dict[str, int]:
+    """Manual cleanup policy: delete footage and notifications before cutoff."""
+    with video_db._connect() as conn:
+        where = "end_ts IS NOT NULL AND end_ts < ?"
+        params: list = [cutoff]
+        if source_id:
+            where += " AND source_id = ?"
+            params.append(source_id)
+        segments = [dict(row) for row in conn.execute(
+            "SELECT id, path, end_ts, source_id FROM segments WHERE " + where,
+            params,
+        ).fetchall()]
+        if source_id:
+            notification_sources = [source_id]
+        else:
+            notification_sources = [row[0] for row in conn.execute(
+                "SELECT source_id FROM notification_events"
+                " UNION SELECT source_id FROM notification_confirmations"
+            ).fetchall()]
+    return delete_segments(
+        video_db,
+        video_dir,
+        segments,
+        {sid: cutoff for sid in notification_sources},
+    )

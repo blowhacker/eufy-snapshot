@@ -30,6 +30,7 @@ from .media_health import MediaHealthCollector, MediaHealthStore, default_db_pat
 from .retention import (
     RECORD_MODE_CONTINUOUS,
     cleanup_days_key,
+    delete_before,
     normalize_days as retention_normalize_days,
     record_mode as retention_record_mode,
     record_mode_key,
@@ -1761,7 +1762,7 @@ def make_app(
         return JSONResponse(_payload())
 
     async def api_settings_cleanup(request: Request) -> JSONResponse:
-        """Delete segments (and their data) older than N days."""
+        """Delete footage and notifications older than N days."""
         if not video_db or not video_dir:
             return JSONResponse({"error": "video not configured"}, status_code=501)
         try:
@@ -1770,50 +1771,11 @@ def make_app(
             src   = body.get("source_id") or None
         except Exception:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
-        cutoff = __import__("time").time() - days * 86400
-        with video_db._connect() as conn:
-            where = "end_ts IS NOT NULL AND end_ts < ?"
-            params: list = [cutoff]
-            if src:
-                where += " AND source_id = ?"
-                params.append(src)
-            segs = [dict(r) for r in conn.execute(
-                f"SELECT id, path FROM segments WHERE {where}", params
-            ).fetchall()]
-        deleted_files = deleted_bytes = 0
-        seg_ids = []
-        for seg in segs:
-            seg_ids.append(seg["id"])
-            p = video_dir / seg["path"]
-            try:
-                if p.exists():
-                    deleted_bytes += p.stat().st_size
-                    p.unlink()
-                    deleted_files += 1
-                clock = p.with_name(p.name + ".clock.json")
-                if clock.exists():
-                    deleted_bytes += clock.stat().st_size
-                    clock.unlink()
-                    deleted_files += 1
-                # Remove spritesheet dir
-                sprite_dir = p.with_suffix("")
-                if sprite_dir.is_dir():
-                    import shutil as _sh
-                    _sh.rmtree(sprite_dir, ignore_errors=True)
-            except Exception:
-                pass
-        if seg_ids:
-            with video_db._connect() as conn:
-                placeholders = ",".join("?" * len(seg_ids))
-                conn.execute(f"DELETE FROM video_events WHERE segment_id IN ({placeholders})", seg_ids)
-                conn.execute(f"DELETE FROM object_events WHERE segment_id IN ({placeholders})", seg_ids)
-                conn.execute(f"DELETE FROM video_detections WHERE segment_id IN ({placeholders})", seg_ids)
-                conn.execute(f"DELETE FROM segments WHERE id IN ({placeholders})", seg_ids)
-        return JSONResponse({
-            "deleted_segments": len(seg_ids),
-            "deleted_files": deleted_files,
-            "freed_bytes": deleted_bytes,
-        })
+        cutoff = time.time() - days * 86400
+        result = await asyncio.to_thread(
+            delete_before, video_db, video_dir, cutoff, src
+        )
+        return JSONResponse(result)
 
     async def serve_live_hls(request: Request) -> Response:
         source_id = request.path_params.get("source_id", "")

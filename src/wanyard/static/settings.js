@@ -880,7 +880,7 @@ document.getElementById('cleanupBtn').addEventListener('click', async () => {
   const r = await fetch('/api/settings/cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days,source_id:src})});
   const d = await r.json();
   if (r.ok) {
-    msg.textContent = `Deleted ${d.deleted_segments} clips, freed ${fmt.bytes(d.freed_bytes)}`;
+    msg.textContent = `Deleted ${d.deleted_segments} clips and ${d.deleted_notifications || 0} notifications, freed ${fmt.bytes(d.freed_bytes)}`;
     msg.className = 's-save-msg ok';
     loadStatus();
   } else {
