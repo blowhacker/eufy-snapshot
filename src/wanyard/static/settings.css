@@ -18,9 +18,10 @@
   display: flex; align-items: center; justify-content: center;
   width: 22px; height: 22px; flex: 0 0 auto;
   border-radius: var(--r-sm);
-  background: linear-gradient(135deg, var(--amber), #c47a3a);
-  color: #1a1408; font: 600 11px var(--font-mono);
+  overflow: hidden;
+  text-decoration: none;
 }
+.ab-logo img { width: 100%; height: 100%; display: block; }
 .ab-title { color: var(--txt); font-size: 14px; font-weight: 500; letter-spacing: -0.005em; }
 .ab-sep { width: 1px; height: 18px; flex: 0 0 auto; background: var(--line); }
 
