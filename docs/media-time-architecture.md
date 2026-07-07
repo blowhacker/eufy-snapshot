@@ -1,6 +1,6 @@
 # Media-Time Architecture
 
-Status: accepted; SEI frame clock 2026-07-07 (BITC pixel carrier retired)
+Status: accepted; SEI frame clock active since 2026-07-07
 Owner: video pipeline
 
 ## Rule

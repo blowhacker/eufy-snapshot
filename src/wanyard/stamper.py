@@ -109,7 +109,7 @@ class _MediaTimeline:
 
 
 def _nvenc_available(codec: str = "h264_nvenc") -> bool:
-    """True if ``codec`` (h264_nvenc/hevc_nvenc) can actually open + encode here.
+    """True if the H.264 NVENC codec can actually open and encode here.
 
     Cached per codec: the codec is compiled into ffmpeg regardless of hardware
     (and a container started without gpu.yml has no GPU at all), so presence is
@@ -375,9 +375,7 @@ class _StamperWorker:
         The clock rides as an H.264 SEI NAL on the encoded packets, so the
         fallback emits h264: h264_nvenc when the GPU probe succeeds, else
         libx264 (a GPU-less box — the default `docker compose up` — lands on
-        libx264, no crash loop). HEVC output is gone with the pixel marker:
-        its only justification was re-encode storage efficiency, and it cost
-        an hvc1-tagging dance plus playback holes on cheap Android.
+        libx264, no crash loop).
         """
         if self._codec_override:
             return self._codec_override   # runtime fallback after an open failure
@@ -632,7 +630,7 @@ class _StamperWorker:
                             continue
                         # The clock rides as an SEI NAL on the encoded packet
                         # (injected in _mux_encoded) — the re-encode fallback
-                        # emits the same carrier as sei_copy, no pixel marker.
+                        # emits the same SEI carrier as sei_copy.
                         try:
                             pending_values[pts] = sei.encode_value(abs_ts)
                         except ValueError:

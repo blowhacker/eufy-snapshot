@@ -293,15 +293,15 @@
         <pre class="flow">  <span class="cam">+--------+</span>  rtsp   <span class="core">+---------------------+</span>  stamped  <span class="core">+----------+</span>  mp4   <span class="core">+--------+</span>
   <span class="cam">| camera |</span> <span class="arrow">------&gt;</span>  <span class="core">|  mediamtx + stamper |</span> <span class="arrow">--------&gt;</span>  <span class="core">| recorder |</span> <span class="arrow">-----&gt;</span> <span class="core">|  disk  |</span>
   <span class="cam">+--------+</span>         <span class="core">+---------------------+</span>           <span class="core">+----+-----+</span>         <span class="core">+--------+</span>
-                      burns BITC timecode +                 <span class="arrow">|</span> hls
-                      HEVC, fans out one pull              <span class="arrow">v</span>
+                      injects SEI frame clock,              <span class="arrow">|</span> hls
+                      fans out one pull                    <span class="arrow">v</span>
                                                       <span class="core">+----+-----+</span>          <span class="yolo">+--------+</span>
                                              you <span class="arrow">---&gt;</span> <span class="core">|  viewer  |</span> <span class="arrow">&lt;-events-</span> <span class="yolo">|  yolo  |</span>
                                                       <span class="core">+----------+</span>          <span class="yolo">+--------+</span></pre>
 
         <div class="flow-side">
           <h3>Decoupled by design.</h3>
-          <p>An ingest relay (<b>mediamtx + stamper</b>) pulls each camera once, burns a frame-accurate timecode into every frame and re-encodes to HEVC. The recorder turns that stamped stream into <b>MP4</b>; the YOLO worker <b>tags segments with detections</b>. Any stage can restart without the others noticing.</p>
+          <p>An ingest relay (<b>mediamtx + stamper</b>) pulls each camera once. The stamper carries a frame-accurate clock in <b>SEI metadata</b>—codec-copy for H.264, with an H.264 re-encode fallback for other codecs. The recorder turns that stamped stream into <b>MP4</b>; the YOLO worker <b>tags segments with detections</b>. Any stage can restart without the others noticing.</p>
           <ul>
             <li><span class="tick">→</span><span><b>Relay</b> pulls each camera once, fans the stamped stream out</span></li>
             <li><span class="tick">→</span><span><b>Recorder</b> never blocks on inference</span></li>

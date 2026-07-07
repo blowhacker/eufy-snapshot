@@ -155,7 +155,7 @@ services:
       - ./data:/app/data
 
   # go2rtc is the camera ingest + the wall's INSTANT WebRTC. It reads each camera
-  # directly, serves RTSP to mediamtx (recording/BITC) and WebRTC to the wall.
+  # directly, serves RTSP to mediamtx (recording/SEI clock) and WebRTC to the wall.
   # WebRTC candidates use STUN auto-discovery, so a plain `docker compose up`
   # works with no hostname config. Config generated from the source DB at boot.
   go2rtc-conf:

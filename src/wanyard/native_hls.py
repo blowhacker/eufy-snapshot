@@ -31,12 +31,9 @@ def rewrite_host_candidates(sdp: str, address: str) -> str:
     # load the page is, by definition.
     return _HOST_CAND_RE.sub(lambda m: m.group(1) + address + m.group(3), sdp)
 
-# Master (multivariant) playlist, NOT the bare media playlist
-# (video1_stream.m3u8). iOS Safari needs the master's #EXT-X-STREAM-INF CODECS
-# ="hvc1…" to start the HEVC decoder; a media playlist alone plays H.264 but
-# not HEVC on iOS (live showed blank on iPhone after the H.264→HEVC switch).
-# The master references the media playlist (relative) → still LL-HLS through
-# the same proxy. hls.js (desktop) handles a master playlist fine too.
+# Use the master (multivariant) playlist rather than the bare media playlist.
+# It carries explicit codec metadata, references the LL-HLS media playlist
+# relatively through the same proxy, and works with both Safari and hls.js.
 MANIFEST_NAME = "index.m3u8"
 DEFAULT_PORT = 8888
 CONTROL_API_PORT = 9997

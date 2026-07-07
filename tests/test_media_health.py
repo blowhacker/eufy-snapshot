@@ -44,7 +44,7 @@ class MediaHealthTests(unittest.TestCase):
             store.update_stamper_state(
                 "garden",
                 status="live",
-                active_encoder="hevc_nvenc",
+                active_encoder="h264_nvenc",
                 maxrate="2.5M",
             )
             readings = iter(
@@ -73,7 +73,7 @@ class MediaHealthTests(unittest.TestCase):
             recorder = {
                 "garden": {
                     "thread_alive": True,
-                    "codec": "hevc",
+                    "codec": "h264",
                     "consecutive_failures": 0,
                 }
             }
@@ -83,7 +83,7 @@ class MediaHealthTests(unittest.TestCase):
             self.assertIsNone(first["raw_bitrate_bps"])
             self.assertEqual(second["raw_bitrate_bps"], 1600)
             self.assertEqual(second["stamped_bitrate_bps"], 2400)
-            self.assertEqual(second["active_encoder"], "hevc_nvenc")
+            self.assertEqual(second["active_encoder"], "h264_nvenc")
 
     def test_store_records_health_transitions_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,7 +92,7 @@ class MediaHealthTests(unittest.TestCase):
             store.update_stamper_state(
                 "garden",
                 status="live",
-                active_encoder="hevc_nvenc",
+                active_encoder="h264_nvenc",
                 width=2560,
                 height=1440,
                 fps=15,
@@ -103,11 +103,11 @@ class MediaHealthTests(unittest.TestCase):
                 "source_id": "garden",
                 "raw_bitrate_bps": 1_600_000,
                 "stamped_bitrate_bps": 2_400_000,
-                "recorder_codec": "hevc",
+                "recorder_codec": "h264",
                 "segment_started_ts": now - 10,
                 "segment_completed_ts": None,
                 "last_failure_kind": None,
-                "active_encoder": "hevc_nvenc",
+                "active_encoder": "h264_nvenc",
             }
             store.record_samples(
                 [
@@ -139,7 +139,7 @@ class MediaHealthTests(unittest.TestCase):
             )
             self.assertEqual(
                 snapshot["current"]["garden"]["stamper"]["active_encoder"],
-                "hevc_nvenc",
+                "h264_nvenc",
             )
             self.assertEqual(snapshot["current"]["garden"]["maxrate_bps"], 2_500_000)
             kinds = {event["kind"] for event in snapshot["events"]}

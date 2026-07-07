@@ -153,7 +153,7 @@ class StampModeTests(unittest.TestCase):
     def test_normalize_aliases(self) -> None:
         self.assertEqual(sei.normalize_stamp_mode("SEI"), "sei_copy")
         self.assertEqual(sei.normalize_stamp_mode("copy"), "sei_copy")
-        self.assertEqual(sei.normalize_stamp_mode("pixel"), "reencode")
+        self.assertIsNone(sei.normalize_stamp_mode("pixel"))
         self.assertIsNone(sei.normalize_stamp_mode("banana"))
 
 
@@ -383,7 +383,7 @@ if __name__ == "__main__":
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
 class ReencodeSeiInjectionTests(unittest.TestCase):
     """The re-encode fallback carries the clock as SEI on its encoded packets
-    (no pixel marker). Mirrors the stamper's pending_values pattern: value
+    Mirrors the stamper's pending_values pattern: value
     keyed by assigned pts, re-attached to the encoder packet with that pts."""
 
     def test_values_bind_through_a_real_encoder(self) -> None:

@@ -1,11 +1,13 @@
 # Banishing BITC and its acolytes
 
-Status: **Phase 2 done (2026-07-07)** — gate cleared (pre-flip pixel archives
+Status: **Complete (2026-07-07)** — gate cleared (pre-flip pixel archives
 purged), then the readers were killed: no consumer decodes pixels, `bitc.py`
 is deleted (value codec folded into `sei.py`), the viewer's per-frame canvas
 decode is gone, and the acolytes are renamed to clock/SEI vocabulary. Clock
 chains are `sei -> mapped`. Full test suite green (102 tests, av/ffmpeg E2E
-included). Branch: `bitc-banish-p2`.
+included). Final cleanup removed the recorder codec probe and legacy setting
+aliases, corrected the public site and internal documentation, and closed the
+obsolete codec backlog item. Branch: `bitc-banish-p2`.
 
 Phase 1 done (2026-07-05) — no process writes pixels; the reencode fallback
 injects SEI on its encoded packets, output is h264-only, the recorder's hvc1

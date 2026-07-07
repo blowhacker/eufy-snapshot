@@ -1474,7 +1474,7 @@ def make_app(
         return response
 
     # Frame-clock builds are full-file packet scans (seconds for a legacy
-    # 500MB HEVC file). Scrubbing across old segments can request many at
+    # large media file). Scrubbing across old segments can request many at
     # once, and an aborted HTTP fetch does NOT stop a to_thread scan — a
     # short drag once queued a dozen parallel scans that pinned the disk and
     # starved every other request. Dedup per path (concurrent requesters

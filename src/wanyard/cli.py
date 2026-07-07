@@ -157,7 +157,7 @@ def cmd_gen_mediamtx(args, config: AppConfig) -> int:
     config_lines.append("metricsAddress: :9998")
     config_lines.append("")
     # Low-latency HLS (fMP4 partial segments) for live view — sub-2s vs the
-    # recorder's ~1-4s .ts HLS, and HEVC plays more robustly in fMP4 than TS.
+    # recorder's ~1-4s .ts HLS.
     config_lines.append("hls: yes")
     config_lines.append(f"hlsAddress: :{hls_port()}")
     config_lines.append("hlsVariant: lowLatency")

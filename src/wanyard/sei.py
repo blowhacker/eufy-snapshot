@@ -1,15 +1,15 @@
 """Frame clock over SEI: the timecode value carried as an H.264 SEI NAL.
 
 The clock is Unix centiseconds + CRC8, carried as an unregistered user-data
-SEI inside each access unit (the pixel-burned carrier it replaced is gone).
+SEI inside each access unit.
 Injection is packet-level — no decode, no encode — so
 the stamped stream keeps the camera's original bits: zero generation loss,
 archive size = camera native, and no NVENC session.
 
 Binding is structural: the SEI NAL lives inside its access unit, so through
 any remux/copy the value stays attached to exactly its own frame — it can be
-stripped (by a transcode), never misattached. Trust-or-discard like the pixel
-marker: wrong UUID or bad CRC reads as absent, never as a wrong time.
+stripped (by a transcode), never misattached. Trust-or-discard: a wrong UUID
+or bad CRC reads as absent, never as a wrong time.
 
 H.264 only. Cameras emit H.264 and sei_copy never re-encodes, so no HEVC
 variant is needed; a non-H.264 input falls back to the re-encode stamper.
@@ -21,8 +21,7 @@ import uuid as _uuid
 import zlib
 
 # ── Value codec (Unix centiseconds + CRC8) ───────────────────────────────────
-# Formerly bitc._MAX_VALUE/_crc8/encode_value: the payload semantics, now that
-# the pixel carrier is gone and the SEI NAL is the only carrier.
+# Unix-centisecond payload semantics shared by SEI producers and consumers.
 _NPAY = 38
 _MAX_VALUE = 1 << _NPAY
 
@@ -69,8 +68,7 @@ def normalize_stamp_mode(value, default: str | None = None) -> str | None:
     if value is None:
         return default
     mode = str(value).strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {"sei": STAMP_MODE_SEI_COPY, "copy": STAMP_MODE_SEI_COPY,
-               "pixel": STAMP_MODE_REENCODE, "bitc": STAMP_MODE_REENCODE}
+    aliases = {"sei": STAMP_MODE_SEI_COPY, "copy": STAMP_MODE_SEI_COPY}
     mode = aliases.get(mode, mode)
     return mode if mode in STAMP_MODES else default
 
@@ -81,7 +79,7 @@ def stamp_mode(settings, source_id: str, default: str = STAMP_MODE_SEI_COPY) -> 
     Default is sei_copy — codec-copy with the clock as SEI: zero generation
     loss, archive = camera bits, no GPU. The stamper still falls back to
     reencode automatically for non-h264 input, and reencode remains settable
-    per source (DB/env) as the forensic visible-timecode mode.
+    per source when codec-copy is not desired.
     """
     override = normalize_stamp_mode(settings.get_setting(stamp_mode_key(source_id)))
     if override:

@@ -107,24 +107,10 @@ class VideoWorkerTests(unittest.TestCase):
                 again = video._write_mp4_frame_clock(path)
             self.assertEqual(again, sidecar)
 
-    def test_stamped_codec_is_reprobed_after_early_exit_invalidation(self) -> None:
+    def test_status_reports_h264_stream_contract_without_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             worker = self._worker(Path(tmpdir))
-            results = [
-                subprocess.CompletedProcess([], 0, stdout="hevc\n", stderr=""),
-                subprocess.CompletedProcess([], 0, stdout="h264\n", stderr=""),
-            ]
-            with mock.patch("wanyard.video.shutil.which", return_value="/usr/bin/ffprobe"), \
-                 mock.patch("wanyard.video.subprocess.run", side_effect=results) as run:
-                self.assertEqual(worker._stamped_codec("rtsp://relay/camera"), "hevc")
-                self.assertEqual(worker._stamped_codec("rtsp://relay/camera"), "hevc")
-                worker._invalidate_stamped_codec()
-                self.assertEqual(worker._stamped_codec("rtsp://relay/camera"), "h264")
-
-            self.assertEqual(run.call_count, 2)
-            status = worker.status()
-            self.assertEqual(status["codec"], "h264")
-            self.assertIsNotNone(status["codec_probe_ts"])
+            self.assertEqual(worker.status()["codec"], "h264")
 
     def test_clean_early_exit_completes_epoch_without_failure_or_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -154,9 +140,7 @@ class VideoWorkerTests(unittest.TestCase):
             record_failure.assert_not_called()
             wait.assert_not_called()
 
-    def test_start_segment_never_tags_hvc1(self) -> None:
-        """Stamped streams are always H.264 now (sei_copy or the h264-only
-        re-encode fallback); the HEVC hvc1-tagging dance is gone."""
+    def test_start_segment_copies_stamped_h264(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = mock.Mock()
             db.open_segment.return_value = 7
@@ -166,12 +150,12 @@ class VideoWorkerTests(unittest.TestCase):
                             return_value="rtsp://relay/camera"), \
                  mock.patch("wanyard.video.shutil.which", return_value="/usr/bin/ffmpeg"), \
                  mock.patch.object(worker, "_wait_for_relay_path", return_value=True), \
-                 mock.patch.object(worker, "_stamped_codec", return_value="h264"), \
                  mock.patch("wanyard.video.subprocess.Popen", return_value=proc) as popen:
                 worker._start_segment(1_781_600_000.0)
 
             command = popen.call_args.args[0]
-            self.assertNotIn("hvc1", command)
+            self.assertIn("-c:v", command)
+            self.assertIn("copy", command)
 
     def test_stop_segment_removes_only_empty_failed_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

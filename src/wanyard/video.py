@@ -3101,22 +3101,20 @@ class VideoWorker:
         self._live_dir  = video_dir / "live" / source.id
         self._live_dir.mkdir(parents=True, exist_ok=True)
         self._status_lock = threading.Lock()
-        self._last_codec: str | None = None
-        self._last_codec_probe_ts: float | None = None
         self._last_segment_started_ts: float | None = None
         self._last_segment_completed_ts: float | None = None
         self._last_failure_ts: float | None = None
         self._last_failure_kind: str | None = None
         self._consecutive_failures = 0
         self._completed_segments = 0
-        self._codec_cache_valid = False
-        self._codec_cache: str | None = None
 
     def status(self) -> dict:
         with self._status_lock:
             return {
-                "codec": self._last_codec,
-                "codec_probe_ts": self._last_codec_probe_ts,
+                # The stamped stream contract is H.264 for both codec-copy and
+                # re-encode modes. Reporting the invariant keeps media health
+                # useful without opening a second RTSP connection to ffprobe.
+                "codec": "h264",
                 "segment_started_ts": self._last_segment_started_ts,
                 "segment_completed_ts": self._last_segment_completed_ts,
                 "last_failure_ts": self._last_failure_ts,
@@ -3265,7 +3263,6 @@ class VideoWorker:
                     segment_ok = self._stop_segment(stopped_ts)
                     clean_epoch_end = returncode == 0 and segment_ok
                     if returncode is not None:
-                        self._invalidate_stamped_codec()
                         if clean_epoch_end:
                             LOG.info(
                                 "recording epoch ended cleanly for %s; "
@@ -3282,7 +3279,6 @@ class VideoWorker:
                     elif segment_ok:
                         self._record_segment_completed(stopped_ts)
                     else:
-                        self._invalidate_stamped_codec()
                         self._record_failure("empty_segment")
                     # Reset backoff after a segment ran long enough to be healthy.
                     backoff = (
@@ -3316,42 +3312,6 @@ class VideoWorker:
         if self._seg_id or self._proc:
             self._stop_segment(time.time())
 
-    def _invalidate_stamped_codec(self) -> None:
-        with self._status_lock:
-            self._codec_cache_valid = False
-            self._codec_cache = None
-
-    def _stamped_codec(self, url: str) -> str | None:
-        """Video codec of the stamped stream (hevc/h264/...).
-
-        Healthy segment rotations reuse the observation to avoid an RTSP probe
-        gap. Any early FFmpeg exit invalidates it because the stamper may have
-        reconnected with a different fallback encoder.
-        """
-        with self._status_lock:
-            if self._codec_cache_valid:
-                return self._codec_cache
-        ffprobe = shutil.which("ffprobe")
-        codec = None
-        if ffprobe:
-            try:
-                out = subprocess.run(
-                    [ffprobe, "-v", "error", "-rtsp_transport",
-                     self.source.rtsp_transport, "-select_streams", "v:0",
-                     "-show_entries", "stream=codec_name",
-                     "-of", "default=nw=1:nk=1", url],
-                    capture_output=True, text=True, timeout=10,
-                )
-                codec = (out.stdout or "").strip().lower() or None
-            except Exception:
-                codec = None
-        with self._status_lock:
-            self._last_codec = codec
-            self._last_codec_probe_ts = time.time()
-            self._codec_cache = codec
-            self._codec_cache_valid = codec is not None
-        return codec
-
     def _start_segment(self, ts: float) -> None:
         from .capture import resolve_rtsp_url
         url    = resolve_rtsp_url(self.source)
@@ -3368,10 +3328,6 @@ class VideoWorker:
         self._prune_live_dir()
         seg_path = date_dir / dt.strftime("%Y-%m-%d_%H-%M-%S.mp4")
         rel_path = seg_path.relative_to(self.video_dir).as_posix()
-        # The stamped stream is always H.264 now (sei_copy passthrough, or the
-        # h264-only re-encode fallback), so the old HEVC hvc1-tagging dance is
-        # gone. The codec probe stays for health display.
-        self._stamped_codec(url)
         try:
             self._proc = subprocess.Popen(
                 [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
