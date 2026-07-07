@@ -283,6 +283,39 @@ class CleanupLoopTests(unittest.TestCase):
             self.assertTrue(front_old.exists())
             self.assertFalse(garden_old.exists())
 
+    def test_orphan_notifications_are_pruned_after_manual_segment_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            now = time.time()
+            seg_id, _ = self._seg(video_db, video_dir, "front", 1, "kept")
+            with video_db._connect() as conn:
+                rule_id = conn.execute(
+                    "INSERT INTO notification_rules(name, source_id) VALUES(?,?)",
+                    ("rule-front", "front"),
+                ).lastrowid
+                for ref, event_ts in (("kept", now - 86400), ("orphan", now - 172800)):
+                    conn.execute(
+                        "INSERT INTO notification_events"
+                        " (rule_id, rule_name, source_id, zone_ref, event_ref,"
+                        "  event_ts, class, title, body) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (rule_id, "r", "front", "whole_frame", ref,
+                         event_ts, "person", "t", "b"),
+                    )
+
+            self.assertEqual(video_db.prune_orphan_notifications()["events"], 1)
+            with video_db._connect() as conn:
+                self.assertEqual(
+                    [r[0] for r in conn.execute(
+                        "SELECT event_ref FROM notification_events ORDER BY id")],
+                    ["kept"],
+                )
+                conn.execute("DELETE FROM segments WHERE id=?", (seg_id,))
+
+            self.assertEqual(video_db.prune_orphan_notifications()["events"], 1)
+            self.assertEqual(video_db.unread_notification_count(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

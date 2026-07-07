@@ -578,6 +578,12 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
             if segs:
                 LOG.info("auto-cleanup: deleted %d segments, freed %.1f GB",
                          len(segs), freed / 1e9)
+            pruned = video_db.prune_orphan_notifications()
+            if pruned["events"] or pruned["confirmations"]:
+                LOG.info(
+                    "auto-cleanup: pruned orphan notifications=%d confirmations=%d",
+                    pruned["events"], pruned["confirmations"],
+                )
         except Exception:
             LOG.exception("auto-cleanup error")
 

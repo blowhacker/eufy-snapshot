@@ -2371,8 +2371,28 @@ async function openNotification(notification) {
       return;
     }
     if (ts != null) {
-      load();
-      await seekToTimestamp(st.source !== "all" ? st.source : null, ts, { scroll: true });
+      const loading = load();
+      const landed = await seekToTimestamp(
+        st.source !== "all" ? st.source : null,
+        ts,
+        { scroll: true },
+      );
+      if (!landed) {
+        // The notification panel may have been loaded just before retention or
+        // a maintenance migration removed its MP4. Never leave the previous
+        // camera visible as if it matched the newly selected source.
+        await loading;
+        stopLiveTail(false);
+        player.pause();
+        el.video.style.display = "none";
+        el.liveVideo.style.display = "none";
+        drawBoxList(el.video, []);
+        el.empty.style.display = "flex";
+        if (el.emptyText) el.emptyText.textContent =
+          "Footage for this notification is no longer available.";
+        if (el.emptyCta) el.emptyCta.hidden = true;
+        setStatus("NONE");
+      }
       return;
     }
   }
@@ -3943,6 +3963,10 @@ async function startLiveTail(srcId = null, options = {}) {
 
   el.liveVideo.onerror = null;  // clear before re-wiring
   el.liveVideo.onerror = e => {
+    // Clearing an old source during a switch can queue MEDIA_ERR_SRC_NOT_SUPPORTED
+    // after the replacement handler is installed. It describes the intentional
+    // empty src, not a failure of the new HLS URL.
+    if (token !== liveTail.token || !el.liveVideo.currentSrc) return;
     const err = el.liveVideo.error;
     console.error("liveVideo error:", err?.code, err?.message, hlsUrl);
     setStatus("OFFLINE");

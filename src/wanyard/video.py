@@ -941,6 +941,35 @@ class VideoSegmentDB:
             ).fetchone()
         return bytes(row["thumb_jpeg"]) if row and row["thumb_jpeg"] else None
 
+    def prune_orphan_notifications(self) -> dict[str, int]:
+        """Remove notifications whose referenced clock time has no footage.
+
+        Retention normally removes notifications alongside their segments, but
+        maintenance migrations can delete historical segment rows directly.
+        Those leftovers have dead thumbnails and targets that cannot resolve.
+        Coverage deliberately uses the segment row rather than detection ids:
+        backfill can replace detection ids while the MP4 remains playable.
+        """
+        coverage = (
+            "SELECT 1 FROM segments s"
+            " WHERE s.source_id={table}.source_id"
+            " AND {table}.event_ts >= COALESCE(s.media_epoch, s.start_ts)"
+            " AND (s.end_ts IS NULL OR {table}.event_ts <= CASE"
+            "   WHEN s.media_epoch IS NOT NULL AND s.duration_sec IS NOT NULL"
+            "     THEN s.media_epoch + s.duration_sec + 0.5"
+            "   ELSE s.end_ts + 0.5 END)"
+        )
+        with self._connect() as conn:
+            events = conn.execute(
+                "DELETE FROM notification_events"
+                f" WHERE NOT EXISTS ({coverage.format(table='notification_events')})"
+            ).rowcount
+            confirmations = conn.execute(
+                "DELETE FROM notification_confirmations"
+                f" WHERE NOT EXISTS ({coverage.format(table='notification_confirmations')})"
+            ).rowcount
+        return {"events": events, "confirmations": confirmations}
+
     def activity_areas(self, source_id: str) -> list[list[dict]]:
         return [
             z["polygon"] for z in self.list_zones(source_id)
