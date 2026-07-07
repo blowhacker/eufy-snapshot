@@ -2325,7 +2325,40 @@ async function openNotification(notification) {
   const target = notification.target_url || "/";
   const url = new URL(target, location.href);
   if (url.origin === location.origin && url.pathname === location.pathname) {
+    const previousSource = st.source;
     const { ts, live } = applyQueryState(url.searchParams);
+    if (st.source !== previousSource) {
+      // A notification is also a camera switch. Invalidate every operation
+      // that can still land media from the previous camera; changing only the
+      // filters lets an old/in-flight seek remain visible beneath the new
+      // source label and detection overlay.
+      absoluteSeekSeq += 1;
+      clearTimeout(_clickTimer);
+      _clickTimer = null;
+      cancelPlayheadScrub();
+      unfreezeStageFrame();
+      stageZoom.reset();
+      cancelZoneEditor();
+      cancelClipSelection();
+      stopLiveTail(false);
+      mode.stop();
+      player.pause();
+      el.video.style.display = "none";
+      drawBoxList(el.video, []);
+      st.events = [];
+      st.segmentBounds = null;
+      st.zones = [];
+      st.zonesSource = null;
+      st.overlays = {
+        sourceId: null,
+        from: 0,
+        to: 0,
+        detections: [],
+        loadingKey: null,
+        seq: st.overlays.seq + 1,
+      };
+      _eventsRangesClear();
+    }
     st.initDone = true;
     renderSrcCtrl();
     renderClsCtrl();
@@ -2456,17 +2489,26 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
       const duration = Number(resolved.duration);
       const maxPosition = Number.isFinite(duration) ? Math.max(0, duration - 0.25) : Infinity;
       const startPosition = Math.max(0, Math.min(maxPosition, desiredTs - mediaEpoch));
+      const resolvedSource = resolved.source_id ?? srcId;
+      const changingSource = Boolean(
+        player.currentSeg?.source_id &&
+        resolvedSource &&
+        player.currentSeg.source_id !== resolvedSource
+      );
       stopLiveTail(false);
       mode.stop();
       el.liveVideo.style.display = "none";
       el.empty.style.display = "none";
-      el.video.style.display = "block";
+      // Do not show the previously decoded camera while the replacement file
+      // is loading. The box canvas is source-scoped and can update first,
+      // producing a convincing but incorrect old-video/new-box combination.
+      el.video.style.display = changingSource ? "none" : "block";
       const landing = await player.seekRecorded({
         url: resolved.url,
         mediaEpoch,
         duration,
         startPosition,
-        sourceId: resolved.source_id ?? srcId,
+        sourceId: resolvedSource,
         segmentId: resolved.segment_id,
         requestedTs: desiredTs,
         autoplay,
@@ -2474,6 +2516,7 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
       });
       if (seq !== absoluteSeekSeq) return false;
       if (landing) {
+        el.video.style.display = "block";
         if (!options.quiet) setStatus("REPLAY");
         if (autoplay) player.play();
         if (updateHistory) pushState();
