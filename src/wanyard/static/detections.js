@@ -426,9 +426,10 @@ function makeCard(event, cameraName, showCamera = false) {
 }
 
 function cameraViewerUrl(camera, live = false) {
+  const classes = selectedClasses();
   const params = new URLSearchParams({
     source: camera.id,
-    cls: selectedClasses()[0] || "person",
+    cls: classes.length ? classes.join(",") : "person",
     zone: "none",
   });
   if (live) params.set("live", "1");
