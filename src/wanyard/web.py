@@ -14,7 +14,7 @@ import urllib.error
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlencode
 
 from starlette.background import BackgroundTask
 from starlette.applications import Starlette
@@ -87,6 +87,92 @@ def _optional_float_query(request: Request, name: str) -> float | None:
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
     return value
+
+
+def _detection_wall_camera(
+    video_db,
+    source: dict,
+    classes: list[str],
+    limit: int,
+    before: float | None,
+) -> dict:
+    """Return one camera's newest detection episodes for the thumbnail wall.
+
+    Keep pagination source-local: a quiet camera must not drag a busy camera's
+    cursor backwards and make the busy camera skip events.
+    """
+    fetch_limit = limit + 1
+    recorded = video_db.list_detection_events(
+        source["id"], classes, fetch_limit, before
+    )
+
+    provisional = video_db.provisional_events(source["id"])
+    wanted = set(classes)
+    candidates: dict[str, dict] = {}
+    for event in [*provisional, *recorded]:
+        event_ts = event.get("display_ts", event.get("abs_ts"))
+        try:
+            event_ts = float(event_ts)
+        except (TypeError, ValueError):
+            continue
+        if before is not None and event_ts >= before:
+            continue
+        if wanted and event.get("class") not in wanted:
+            continue
+        # Object permanence emits a matching "disappeared" row. The wall is a
+        # wall of detections, so show the appearance/legacy detection episode.
+        if event.get("event_type") == "disappeared":
+            continue
+        event_id = str(event.get("id", ""))
+        if not event_id:
+            continue
+        candidates[event_id] = event
+
+    events = sorted(
+        candidates.values(),
+        key=lambda event: (
+            float(event.get("display_ts", event.get("abs_ts", 0))),
+            str(event.get("id", "")),
+        ),
+        reverse=True,
+    )
+    has_more = len(events) > limit
+    events = events[:limit]
+
+    public_events = []
+    for event in events:
+        event_id = str(event["id"])
+        event_ts = float(event.get("display_ts", event["abs_ts"]))
+        cls = str(event.get("class") or "motion")
+        public_events.append({
+            "id": event_id,
+            "source_id": source["id"],
+            "abs_ts": float(event["abs_ts"]),
+            "display_ts": event_ts,
+            "class": cls,
+            "start_off": float(event.get("start_off") or 0),
+            "end_off": float(event.get("end_off") or 0),
+            "confidence": float(event.get("confidence") or 0),
+            "provisional": bool(event.get("provisional")),
+            "thumb_url": f"/api/video/event-thumb/{quote(event_id, safe='')}",
+            "target_url": (
+                f"/?{urlencode({'source': source['id'], 'ts': f'{event_ts:.3f}', 'cls': cls, 'zone': 'none'})}"
+            ),
+        })
+
+    return {
+        "id": source["id"],
+        "name": source.get("name") or source["id"],
+        "record_mode": source.get("record_mode", RECORD_MODE_CONTINUOUS),
+        "events": public_events,
+        # The next request is exclusive of this time. Event episode timestamps
+        # are frame-clock values, so subtracting a microsecond preserves the
+        # immediately preceding frame without returning the last row again.
+        "next_before": (
+            public_events[-1]["display_ts"] - 0.000001
+            if has_more and public_events else None
+        ),
+    }
 
 
 # Overlay association — kept in lockstep with the browser overlay
@@ -532,6 +618,63 @@ def make_app(
                 "mutable": True,
             }
         }, status_code=201)
+
+    async def api_detection_wall(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({
+                "classes": {},
+                "cameras": [],
+                "generated_at": time.time(),
+            })
+
+        sources = _sources_list(config, source_db)
+        source_id = request.query_params.get("source") or None
+        if source_id:
+            sources = [source for source in sources if source["id"] == source_id]
+            if not sources:
+                return JSONResponse({"error": "source not found"}, status_code=404)
+
+        raw_classes = request.query_params.get("classes") or ""
+        classes = list(dict.fromkeys(
+            cls.strip()
+            for cls in raw_classes.split(",")
+            if cls.strip()
+        ))
+        if len(classes) > 16 or any(len(cls) > 80 for cls in classes):
+            return JSONResponse({"error": "invalid classes"}, status_code=400)
+
+        try:
+            limit = int(request.query_params.get("limit", "24"))
+            before = _optional_float_query(request, "before")
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        limit = min(60, max(8, limit))
+
+        def _payload() -> dict:
+            # Counts populate the sticky filter bar on the initial grouped
+            # request. Source-local pagination does not need to repeat the
+            # comparatively broad aggregation query.
+            counts = (
+                {}
+                if source_id
+                else video_db.class_counts(None, True, None)
+            )
+            cameras = [
+                _detection_wall_camera(
+                    video_db, source, classes, limit, before
+                )
+                for source in sources
+            ]
+            return {
+                "classes": counts,
+                "cameras": cameras,
+                "generated_at": time.time(),
+            }
+
+        return JSONResponse(
+            await asyncio.to_thread(_payload),
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def api_delete_source(request: Request) -> JSONResponse:
         source_id = request.path_params["source_id"]
@@ -1879,6 +2022,7 @@ def make_app(
                           if r.query_params.get("source") and r.query_params.get("view") != "wall"
                           else "wall.html"),
             headers={"Cache-Control": "no-cache"})),
+        Route("/detections",               lambda r: FileResponse(static_dir / "detections.html", headers={"Cache-Control": "no-cache"})),
         Route("/settings",                  lambda r: FileResponse(static_dir / "settings.html", headers={"Cache-Control": "no-cache"})),
         Route("/api/health",                api_health),
         Route("/api/thumb",                 api_thumb),
@@ -1890,6 +2034,7 @@ def make_app(
         Route("/api/video/events",          api_video_events),
         Route("/api/video/classes",         api_video_class_counts),
         Route("/api/video/activity-summary", api_video_activity_summary),
+        Route("/api/detections/wall",       api_detection_wall),
         Route("/api/video/zones",           api_video_zones, methods=["GET", "PUT"]),
         Route("/api/notifications",         api_notifications),
         Route("/api/notifications/unread-count", api_notifications_unread_count),

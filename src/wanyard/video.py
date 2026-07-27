@@ -1371,6 +1371,50 @@ class VideoSegmentDB:
         return _filter_with_polygons(
             [_worldize_event_row(dict(r)) for r in rows], polygons)[:limit]
 
+    def list_detection_events(
+        self,
+        source_id: str,
+        classes: list[str] | None = None,
+        limit: int = 25,
+        before: float | None = None,
+    ) -> list[dict]:
+        """Newest appearance/detection episodes for the thumbnail wall.
+
+        Unlike ``list_events``, this deliberately excludes object-permanence
+        ``disappeared`` rows and accepts several classes in one indexed query.
+        """
+        use_objects = self.object_events_available(
+            source_id, None, before
+        )
+        table = "object_events" if use_objects else "video_events"
+        clock = "e.display_ts" if use_objects else "e.abs_ts"
+        join = "LEFT JOIN" if use_objects else "JOIN"
+        where, params = ["e.source_id=?"], [source_id]
+        if use_objects:
+            where.append("e.event_type='appeared'")
+        else:
+            where.append("e.event_type!='disappeared'")
+        if classes:
+            placeholders = ",".join("?" for _ in classes)
+            where.append(f"e.class IN ({placeholders})")
+            params.extend(classes)
+        if before is not None:
+            where.append(f"{clock}<?")
+            params.append(before)
+        params.append(max(1, int(limit)))
+        sql = (
+            "SELECT e.*, s.path as seg_path, s.spritesheet,"
+            " s.media_epoch as seg_media_epoch"
+            f" FROM {table} e {join} segments s ON s.id=e.segment_id"
+            f" WHERE {' AND '.join(where)}"
+            f" ORDER BY {clock} DESC, e.id DESC LIMIT ?"
+        )
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+        if use_objects:
+            return [_public_object_event(_worldize_event_row(row)) for row in rows]
+        return [_worldize_event_row(row) for row in rows]
+
     def nearest_events(self, around: float, source_id: str | None = None,
                        classes: list[str] | None = None,
                        limit: int = 20, zone_id=None) -> list[dict]:
