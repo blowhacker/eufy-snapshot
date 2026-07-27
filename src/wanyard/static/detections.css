@@ -78,15 +78,18 @@ button, a { -webkit-tap-highlight-color: transparent; }
 }
 .dw-icon.loading svg { animation: dw-spin 800ms linear infinite; }
 
+.dw-filters {
+  padding: 4px 20px 9px;
+}
 .dw-filter {
   display: flex;
   align-items: center;
   gap: 12px;
-  min-height: 48px;
-  padding: 7px 20px 10px;
+  min-height: 37px;
 }
 .dw-filter-label {
-  flex: 0 0 auto;
+  width: 58px;
+  flex: 0 0 58px;
   color: var(--txt-3);
   font: 500 10px/1 var(--font-mono);
   letter-spacing: .08em;
@@ -264,6 +267,20 @@ button, a { -webkit-tap-highlight-color: transparent; }
   height: 38px;
   padding: 0 10px;
 }
+.dw-card-camera {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--txt-2);
+  font-size: 11px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dw-card-camera::after {
+  margin: 0 2px 0 7px;
+  color: var(--txt-3);
+  content: "·";
+}
 .dw-time {
   min-width: 0;
   overflow: hidden;
@@ -360,8 +377,9 @@ button, a { -webkit-tap-highlight-color: transparent; }
 @media (max-width: 720px) {
   .dw-head { padding: 0 12px; gap: 10px; }
   .dw-summary { display: none; }
-  .dw-filter { align-items: flex-start; gap: 9px; padding: 7px 12px 9px; }
-  .dw-filter-label { padding-top: 9px; }
+  .dw-filters { padding: 4px 12px 8px; }
+  .dw-filter { align-items: flex-start; gap: 9px; min-height: 36px; }
+  .dw-filter-label { width: 50px; flex-basis: 50px; padding-top: 9px; }
   .dw-main { padding: 16px 10px 44px; }
   .dw-camera { padding-bottom: 24px; }
   .dw-camera + .dw-camera { padding-top: 22px; }

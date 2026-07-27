@@ -2,6 +2,7 @@ const PAGE_SIZE = 24;
 
 const dom = {
   main: document.getElementById("dwMain"),
+  cameras: document.getElementById("dwCameras"),
   tags: document.getElementById("dwTags"),
   summary: document.getElementById("dwSummary"),
   refresh: document.getElementById("dwRefresh"),
@@ -9,6 +10,7 @@ const dom = {
 };
 
 const state = {
+  camera: new URLSearchParams(location.search).get("camera") || "all",
   classes: new Set(
     (new URLSearchParams(location.search).get("classes") || "")
       .split(",")
@@ -16,6 +18,7 @@ const state = {
       .filter(Boolean)
   ),
   classCounts: {},
+  sources: [],
   cameras: new Map(),
   request: 0,
   loading: false,
@@ -73,17 +76,22 @@ function selectedClasses() {
 
 function syncUrl() {
   const url = new URL(location.href);
+  if (state.camera && state.camera !== "all") {
+    url.searchParams.set("camera", state.camera);
+  } else {
+    url.searchParams.delete("camera");
+  }
   const classes = selectedClasses();
   if (classes.length) url.searchParams.set("classes", classes.join(","));
   else url.searchParams.delete("classes");
   history.replaceState(null, "", url);
 }
 
-function apiUrl({ source = null, before = null } = {}) {
+function apiUrl({ source = state.camera, before = null } = {}) {
   const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
   const classes = selectedClasses();
   if (classes.length) params.set("classes", classes.join(","));
-  if (source) params.set("source", source);
+  params.set("source", source || "all");
   if (Number.isFinite(before)) params.set("before", String(before));
   return `/api/detections/wall?${params}`;
 }
@@ -123,6 +131,30 @@ function makeTag(value, label, count, active) {
   return button;
 }
 
+function makeCameraTag(value, label) {
+  const button = document.createElement("button");
+  button.type = "button";
+  const active = state.camera === value;
+  button.className = `dw-tag${active ? " active" : ""}`;
+  button.setAttribute("aria-pressed", String(active));
+  button.textContent = label;
+  button.addEventListener("click", () => {
+    if (state.camera === value) return;
+    state.camera = value;
+    syncUrl();
+    loadInitial();
+  });
+  return button;
+}
+
+function renderCameraTags() {
+  dom.cameras.innerHTML = "";
+  dom.cameras.append(makeCameraTag("all", "All"));
+  for (const source of state.sources) {
+    dom.cameras.append(makeCameraTag(source.id, source.name || source.id));
+  }
+}
+
 function renderTags() {
   dom.tags.innerHTML = "";
   const entries = Object.entries(state.classCounts)
@@ -135,14 +167,17 @@ function renderTags() {
   }
 }
 
-function makeCard(event, cameraName) {
+function makeCard(event, cameraName, showCamera = false) {
+  const eventCameraName = showCamera
+    ? (event.source_name || event.source_id)
+    : cameraName;
   const link = document.createElement("a");
   link.className = "dw-card";
   link.href = event.target_url;
   link.dataset.eventId = String(event.id);
   link.setAttribute(
     "aria-label",
-    `Open ${classLabel(event.class)} detection from ${cameraName} at ${eventTime(event.display_ts)}`
+    `Open ${classLabel(event.class)} detection from ${eventCameraName} at ${eventTime(event.display_ts)}`
   );
 
   const thumb = document.createElement("div");
@@ -169,6 +204,12 @@ function makeCard(event, cameraName) {
     provisional.className = "dw-provisional";
     provisional.title = "Recent detection";
     meta.append(provisional);
+  }
+  if (showCamera) {
+    const source = document.createElement("span");
+    source.className = "dw-card-camera";
+    source.textContent = event.source_name || event.source_id;
+    meta.append(source);
   }
   const time = document.createElement("time");
   time.className = "dw-time";
@@ -233,18 +274,24 @@ function makeCameraSection(camera) {
     : camera.record_mode === "live_only" ? "live only" : "";
   const live = document.createElement("a");
   live.className = "dw-live-link";
-  live.href = cameraViewerUrl(camera, true);
+  live.href = camera.id === "all"
+    ? "/?view=wall"
+    : cameraViewerUrl(camera, true);
   live.innerHTML = `<svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><circle cx="6.5" cy="6.5" r="2" fill="currentColor"/><circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor"/></svg><span>Live</span>`;
   head.append(title, meta, live);
 
   const grid = document.createElement("div");
   grid.className = "dw-grid";
-  for (const event of camera.events) grid.append(makeCard(event, camera.name));
+  for (const event of camera.events) {
+    grid.append(makeCard(event, camera.name, camera.id === "all"));
+  }
 
   if (!camera.events.length) {
     const empty = document.createElement("div");
     empty.className = "dw-camera-empty";
-    empty.textContent = camera.record_mode === "live_only"
+    empty.textContent = camera.id === "all"
+      ? "No matching detections across any camera."
+      : camera.record_mode === "live_only"
       ? "This camera is live-only, so it does not create detection thumbnails."
       : state.classes.size
         ? "No matching detections for this camera."
@@ -261,14 +308,20 @@ function renderCameras() {
   dom.main.innerHTML = "";
   const cameras = [...state.cameras.values()];
   const visible = cameras.reduce((sum, camera) => sum + camera.events.length, 0);
-  dom.summary.textContent = `${plural(cameras.length, "camera")} · ${plural(visible, "detection")} shown`;
+  const cameraCount = state.camera === "all" ? state.sources.length : cameras.length;
+  dom.summary.textContent = `${plural(cameraCount, "camera")} · ${plural(visible, "detection")} shown`;
 
-  if (!cameras.length) {
+  if (!state.sources.length) {
     const empty = dom.emptyTemplate.content.cloneNode(true);
     const strong = empty.querySelector("strong");
     const text = empty.querySelector("span");
     strong.textContent = "No cameras";
     text.innerHTML = `Add a camera in <a href="/settings">Settings</a> to start collecting detections.`;
+    dom.main.append(empty);
+    return;
+  }
+  if (!cameras.length) {
+    const empty = dom.emptyTemplate.content.cloneNode(true);
     dom.main.append(empty);
     return;
   }
@@ -291,13 +344,18 @@ async function loadMore(cameraId, wrap, button) {
     const added = (page.events || []).filter(event => !known.has(String(event.id)));
     camera.events.push(...added);
     camera.next_before = page.next_before;
-    for (const event of added) grid?.append(makeCard(event, camera.name));
+    for (const event of added) {
+      grid?.append(makeCard(event, camera.name, camera.id === "all"));
+    }
     wrap.hidden = camera.next_before == null;
     if (wrap.hidden) moreObserver?.unobserve(wrap);
     updateCameraMeta(camera);
     const shown = [...state.cameras.values()]
       .reduce((sum, item) => sum + item.events.length, 0);
-    dom.summary.textContent = `${plural(state.cameras.size, "camera")} · ${plural(shown, "detection")} shown`;
+    const cameraCount = state.camera === "all"
+      ? state.sources.length
+      : state.cameras.size;
+    dom.summary.textContent = `${plural(cameraCount, "camera")} · ${plural(shown, "detection")} shown`;
   } catch (error) {
     button.textContent = "Try again";
     button.title = error.message;
@@ -330,9 +388,11 @@ async function loadInitial() {
     const data = await fetchWall();
     if (request !== state.request) return;
     state.classCounts = data.classes || {};
+    state.sources = data.sources || [];
     state.cameras = new Map(
       (data.cameras || []).map(camera => [camera.id, camera])
     );
+    renderCameraTags();
     renderTags();
     renderCameras();
   } catch (error) {

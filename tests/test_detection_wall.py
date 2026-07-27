@@ -10,7 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from wanyard.web import _detection_wall_camera
+from wanyard.web import _detection_wall_all, _detection_wall_camera
 from wanyard.video import VideoSegmentDB
 
 
@@ -19,12 +19,13 @@ def _event(
     ts: float,
     cls: str,
     *,
+    source_id: str = "front",
     event_type: str = "detection",
     provisional: bool = False,
 ) -> dict:
     return {
         "id": event_id,
-        "source_id": "front",
+        "source_id": source_id,
         "abs_ts": ts,
         "display_ts": ts,
         "class": cls,
@@ -51,7 +52,8 @@ class FakeVideoDB:
         })
         rows = [
             event for event in self.recorded
-            if (not classes or event["class"] in classes)
+            if event["source_id"] == source_id
+            and (not classes or event["class"] in classes)
             and event.get("event_type") != "disappeared"
             and (before is None or event["display_ts"] < before)
         ]
@@ -59,7 +61,10 @@ class FakeVideoDB:
 
     def provisional_events(self, source_id):
         self.calls.append({"provisional_source_id": source_id})
-        return list(self.provisional)
+        return [
+            event for event in self.provisional
+            if event["source_id"] == source_id
+        ]
 
 
 class DetectionWallCameraTests(unittest.TestCase):
@@ -221,6 +226,73 @@ class DetectionWallDatabaseTests(unittest.TestCase):
             )
 
             self.assertEqual([row["abs_ts"] for row in rows], [102.0, 101.0])
+
+
+class DetectionWallAllCameraTests(unittest.TestCase):
+    sources = [
+        {"id": "front", "name": "Front door", "record_mode": "continuous"},
+        {"id": "garden", "name": "Garden", "record_mode": "continuous"},
+    ]
+
+    def test_interleaves_cameras_in_global_time_order(self) -> None:
+        db = FakeVideoDB([
+            _event(1, 100.0, "person", source_id="front"),
+            _event(2, 104.0, "dog", source_id="garden"),
+            _event(3, 102.0, "car", source_id="front"),
+            _event(4, 101.0, "bird", source_id="garden"),
+        ])
+
+        camera = _detection_wall_all(
+            db, self.sources, [], limit=8, before=None
+        )
+
+        self.assertEqual(camera["id"], "all")
+        self.assertEqual(
+            [
+                (event["source_id"], event["display_ts"])
+                for event in camera["events"]
+            ],
+            [
+                ("garden", 104.0),
+                ("front", 102.0),
+                ("garden", 101.0),
+                ("front", 100.0),
+            ],
+        )
+        self.assertEqual(camera["events"][0]["source_name"], "Garden")
+
+    def test_global_cursor_pages_without_repeating_rows(self) -> None:
+        db = FakeVideoDB([
+            *[
+                _event(index, 200.0 - index * 2, "person", source_id="front")
+                for index in range(6)
+            ],
+            *[
+                _event(100 + index, 199.0 - index * 2, "person", source_id="garden")
+                for index in range(6)
+            ],
+        ])
+
+        first = _detection_wall_all(
+            db, self.sources, [], limit=5, before=None
+        )
+        second = _detection_wall_all(
+            db, self.sources, [], limit=5, before=first["next_before"]
+        )
+
+        self.assertEqual(len(first["events"]), 5)
+        self.assertEqual(len(second["events"]), 5)
+        first_ids = {
+            (event["source_id"], event["id"]) for event in first["events"]
+        }
+        second_ids = {
+            (event["source_id"], event["id"]) for event in second["events"]
+        }
+        self.assertFalse(first_ids & second_ids)
+        self.assertLess(
+            second["events"][0]["display_ts"],
+            first["events"][-1]["display_ts"],
+        )
 
 
 if __name__ == "__main__":

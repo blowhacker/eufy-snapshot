@@ -13,7 +13,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/detections.css?v=1">
+    <link rel="stylesheet" href="/detections.css?v=2">
   </head>
   <body>
     <div class="dw-sticky">
@@ -36,10 +36,16 @@
         </nav>
       </header>
 
-      <section class="dw-filter" aria-labelledby="dwFilterTitle">
-        <div id="dwFilterTitle" class="dw-filter-label">Objects</div>
-        <div id="dwTags" class="dw-tags" role="group" aria-label="Filter by detected object"></div>
-      </section>
+      <div class="dw-filters">
+        <section class="dw-filter" aria-labelledby="dwCameraFilterTitle">
+          <div id="dwCameraFilterTitle" class="dw-filter-label">Cameras</div>
+          <div id="dwCameras" class="dw-tags" role="group" aria-label="Filter by camera"></div>
+        </section>
+        <section class="dw-filter" aria-labelledby="dwFilterTitle">
+          <div id="dwFilterTitle" class="dw-filter-label">Objects</div>
+          <div id="dwTags" class="dw-tags" role="group" aria-label="Filter by detected object"></div>
+        </section>
+      </div>
     </div>
 
     <main id="dwMain" class="dw-main">
@@ -59,6 +65,6 @@
       </div>
     </template>
 
-    <script src="/detections.js?v=1"></script>
+    <script src="/detections.js?v=2"></script>
   </body>
 </html>

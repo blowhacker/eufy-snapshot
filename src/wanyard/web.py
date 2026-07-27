@@ -147,6 +147,7 @@ def _detection_wall_camera(
         public_events.append({
             "id": event_id,
             "source_id": source["id"],
+            "source_name": source.get("name") or source["id"],
             "abs_ts": float(event["abs_ts"]),
             "display_ts": event_ts,
             "class": cls,
@@ -171,6 +172,50 @@ def _detection_wall_camera(
         "next_before": (
             public_events[-1]["display_ts"] - 0.000001
             if has_more and public_events else None
+        ),
+    }
+
+
+def _detection_wall_all(
+    video_db,
+    sources: list[dict],
+    classes: list[str],
+    limit: int,
+    before: float | None,
+) -> dict:
+    """Interleave source-local pages into one newest-first camera feed."""
+    source_pages = [
+        _detection_wall_camera(
+            video_db, source, classes, limit + 1, before
+        )
+        for source in sources
+    ]
+    events = [
+        event
+        for page in source_pages
+        for event in page["events"]
+    ]
+    events.sort(
+        key=lambda event: (
+            float(event["display_ts"]),
+            event["source_id"],
+            str(event["id"]),
+        ),
+        reverse=True,
+    )
+    has_more = (
+        len(events) > limit
+        or any(page["next_before"] is not None for page in source_pages)
+    )
+    events = events[:limit]
+    return {
+        "id": "all",
+        "name": "All cameras",
+        "record_mode": RECORD_MODE_CONTINUOUS,
+        "events": events,
+        "next_before": (
+            events[-1]["display_ts"] - 0.000001
+            if has_more and events else None
         ),
     }
 
@@ -624,14 +669,27 @@ def make_app(
             return JSONResponse({
                 "classes": {},
                 "cameras": [],
+                "sources": [
+                    {
+                        "id": source["id"],
+                        "name": source.get("name") or source["id"],
+                        "record_mode": source.get(
+                            "record_mode", RECORD_MODE_CONTINUOUS
+                        ),
+                    }
+                    for source in _sources_list(config, source_db)
+                ],
                 "generated_at": time.time(),
             })
 
-        sources = _sources_list(config, source_db)
-        source_id = request.query_params.get("source") or None
-        if source_id:
-            sources = [source for source in sources if source["id"] == source_id]
-            if not sources:
+        all_sources = _sources_list(config, source_db)
+        source_id = request.query_params.get("source") or "all"
+        selected_sources = all_sources
+        if source_id != "all":
+            selected_sources = [
+                source for source in all_sources if source["id"] == source_id
+            ]
+            if not selected_sources:
                 return JSONResponse({"error": "source not found"}, status_code=404)
 
         raw_classes = request.query_params.get("classes") or ""
@@ -651,23 +709,39 @@ def make_app(
         limit = min(60, max(8, limit))
 
         def _payload() -> dict:
-            # Counts populate the sticky filter bar on the initial grouped
-            # request. Source-local pagination does not need to repeat the
-            # comparatively broad aggregation query.
+            # Counts populate the sticky object filter on an initial camera
+            # selection. Pagination does not repeat the aggregation.
             counts = (
                 {}
-                if source_id
-                else video_db.class_counts(None, True, None)
-            )
-            cameras = [
-                _detection_wall_camera(
-                    video_db, source, classes, limit, before
+                if before is not None
+                else video_db.class_counts(
+                    None if source_id == "all" else source_id,
+                    True,
+                    None,
                 )
-                for source in sources
-            ]
+            )
+            cameras = (
+                [_detection_wall_all(
+                    video_db, selected_sources, classes, limit, before
+                )]
+                if source_id == "all"
+                else [_detection_wall_camera(
+                    video_db, selected_sources[0], classes, limit, before
+                )]
+            )
             return {
                 "classes": counts,
                 "cameras": cameras,
+                "sources": [
+                    {
+                        "id": source["id"],
+                        "name": source.get("name") or source["id"],
+                        "record_mode": source.get(
+                            "record_mode", RECORD_MODE_CONTINUOUS
+                        ),
+                    }
+                    for source in all_sources
+                ],
                 "generated_at": time.time(),
             }
 
