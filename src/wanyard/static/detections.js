@@ -33,6 +33,12 @@ const state = {
   loading: false,
 };
 
+const canHoverPreview = window.matchMedia(
+  "(hover: hover) and (pointer: fine)"
+);
+let pendingPreview = null;
+let activePreview = null;
+
 const moreObserver = "IntersectionObserver" in window
   ? new IntersectionObserver(entries => {
       for (const entry of entries) {
@@ -42,6 +48,167 @@ const moreObserver = "IntersectionObserver" in window
       }
     }, { rootMargin: "320px 0px" })
   : null;
+
+function previewCrop(box, frameWidth, frameHeight, aspect = 4 / 3) {
+  const x1 = Math.max(0, Math.min(1, Number(box.x1))) * frameWidth;
+  const y1 = Math.max(0, Math.min(1, Number(box.y1))) * frameHeight;
+  const x2 = Math.max(0, Math.min(1, Number(box.x2))) * frameWidth;
+  const y2 = Math.max(0, Math.min(1, Number(box.y2))) * frameHeight;
+  if (![x1, y1, x2, y2].every(Number.isFinite) || x2 <= x1 || y2 <= y1) {
+    return null;
+  }
+  const boxWidth = x2 - x1;
+  const boxHeight = y2 - y1;
+  const centerX = (x1 + x2) / 2;
+  const centerY = (y1 + y2) / 2;
+  const padding = Math.max(24, Math.max(boxWidth, boxHeight) * .45);
+  let cropWidth = boxWidth + padding * 2;
+  let cropHeight = boxHeight + padding * 2;
+  if (cropWidth / cropHeight < aspect) cropWidth = cropHeight * aspect;
+  else cropHeight = cropWidth / aspect;
+  cropWidth = Math.min(frameWidth, Math.max(96, cropWidth));
+  cropHeight = Math.min(frameHeight, Math.max(72, cropHeight));
+  if (cropWidth / cropHeight < aspect) {
+    cropWidth = Math.min(frameWidth, cropHeight * aspect);
+  } else {
+    cropHeight = Math.min(frameHeight, cropWidth / aspect);
+  }
+  const width = Math.min(frameWidth, Math.max(2, Math.round(cropWidth)));
+  const height = Math.min(frameHeight, Math.max(2, Math.round(cropHeight)));
+  return {
+    x: Math.round(Math.max(0, Math.min(frameWidth - width, centerX - width / 2))),
+    y: Math.round(Math.max(0, Math.min(frameHeight - height, centerY - height / 2))),
+    width,
+    height,
+  };
+}
+
+function layoutActivePreview() {
+  if (!activePreview) return;
+  const { video, host, preview } = activePreview;
+  const frameWidth = video.videoWidth;
+  const frameHeight = video.videoHeight;
+  const hostWidth = host.clientWidth;
+  const hostHeight = host.clientHeight;
+  if (!frameWidth || !frameHeight || !hostWidth || !hostHeight) return;
+  const crop = previewCrop(preview.box, frameWidth, frameHeight);
+  if (!crop) return;
+  const scale = Math.max(hostWidth / crop.width, hostHeight / crop.height);
+  video.style.width = `${frameWidth * scale}px`;
+  video.style.height = `${frameHeight * scale}px`;
+  video.style.left = `${
+    -crop.x * scale + (hostWidth - crop.width * scale) / 2
+  }px`;
+  video.style.top = `${
+    -crop.y * scale + (hostHeight - crop.height * scale) / 2
+  }px`;
+}
+
+function cancelPendingPreview(card = null) {
+  if (!pendingPreview || (card && pendingPreview.card !== card)) return;
+  clearTimeout(pendingPreview.timer);
+  pendingPreview = null;
+}
+
+function stopPreview(card = null, failed = false) {
+  cancelPendingPreview(card);
+  if (!activePreview || (card && activePreview.card !== card)) return;
+  const { card: activeCard, video, resizeObserver } = activePreview;
+  activePreview = null;
+  resizeObserver?.disconnect();
+  activeCard.classList.remove("preview-playing");
+  if (failed) activeCard.dataset.previewFailed = "1";
+  try {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  } catch {}
+  video.remove();
+}
+
+function startPreview(card, preview) {
+  pendingPreview = null;
+  if (
+    !canHoverPreview.matches
+    || !card.isConnected
+    || card.dataset.previewFailed
+  ) return;
+  stopPreview();
+  const host = card.querySelector(".dw-thumb");
+  if (!host) return;
+  const video = document.createElement("video");
+  video.className = "dw-preview-video";
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "metadata";
+  video.setAttribute("muted", "");
+  video.setAttribute("playsinline", "");
+  const item = {
+    card,
+    host,
+    video,
+    preview,
+    start: Math.max(0, Number(preview.start) || 0),
+    end: Math.max(0, Number(preview.end) || 0),
+    resizeObserver: null,
+  };
+  activePreview = item;
+
+  const playPreview = () => {
+    if (activePreview !== item) return;
+    video.play().catch(() => stopPreview(card, true));
+  };
+  video.addEventListener("loadedmetadata", () => {
+    if (activePreview !== item || !Number.isFinite(video.duration)) return;
+    item.start = Math.min(item.start, Math.max(0, video.duration - .1));
+    item.end = Math.min(
+      video.duration,
+      Math.max(item.start + .25, item.end)
+    );
+    layoutActivePreview();
+    if (item.start > .01) {
+      video.addEventListener("seeked", playPreview, { once: true });
+      video.currentTime = item.start;
+    } else {
+      playPreview();
+    }
+  }, { once: true });
+  video.addEventListener("playing", () => {
+    if (activePreview === item) card.classList.add("preview-playing");
+  });
+  video.addEventListener("timeupdate", () => {
+    if (
+      activePreview === item
+      && video.currentTime >= item.end - .05
+    ) {
+      video.currentTime = item.start;
+      video.play().catch(() => {});
+    }
+  });
+  video.addEventListener("ended", () => {
+    if (activePreview !== item) return;
+    video.currentTime = item.start;
+    video.play().catch(() => {});
+  });
+  video.addEventListener("error", () => stopPreview(card, true), { once: true });
+  if ("ResizeObserver" in window) {
+    item.resizeObserver = new ResizeObserver(layoutActivePreview);
+    item.resizeObserver.observe(host);
+  }
+  host.append(video);
+  video.src = preview.url;
+  video.load();
+}
+
+function queuePreview(card, preview) {
+  if (!preview || !canHoverPreview.matches || card.dataset.previewFailed) return;
+  if (activePreview?.card === card) return;
+  cancelPendingPreview();
+  pendingPreview = {
+    card,
+    timer: setTimeout(() => startPreview(card, preview), 180),
+  };
+}
 
 function classLabel(value) {
   const text = String(value || "motion").replaceAll("_", " ");
@@ -216,6 +383,19 @@ function makeCard(event, cameraName, showCamera = false) {
   badge.className = "dw-badge";
   badge.textContent = classLabel(event.class);
   thumb.append(image, fallback, badge);
+  if (event.preview) {
+    link.classList.add("previewable");
+    const previewMark = document.createElement("span");
+    previewMark.className = "dw-preview-mark";
+    previewMark.title = "Hover to preview";
+    previewMark.setAttribute("aria-hidden", "true");
+    previewMark.innerHTML = `<svg width="8" height="8" viewBox="0 0 8 8"><path d="m2 1.25 4.5 2.75L2 6.75v-5.5Z" fill="currentColor"/></svg>`;
+    thumb.append(previewMark);
+    link.addEventListener("mouseenter", () => queuePreview(link, event.preview));
+    link.addEventListener("mouseleave", () => stopPreview(link));
+    link.addEventListener("focus", () => queuePreview(link, event.preview));
+    link.addEventListener("blur", () => stopPreview(link));
+  }
 
   const meta = document.createElement("div");
   meta.className = "dw-card-meta";
@@ -324,6 +504,7 @@ function makeCameraSection(camera) {
 }
 
 function renderCameras() {
+  stopPreview();
   moreObserver?.disconnect();
   dom.main.innerHTML = "";
   const cameras = [...state.cameras.values()];
@@ -399,6 +580,7 @@ function renderFailure(error) {
 }
 
 async function loadInitial() {
+  stopPreview();
   const request = ++state.request;
   state.loading = true;
   dom.refresh.classList.add("loading");
@@ -427,6 +609,10 @@ async function loadInitial() {
 }
 
 dom.refresh.addEventListener("click", loadInitial);
+window.addEventListener("scroll", () => stopPreview(), { passive: true });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopPreview();
+});
 window.addEventListener("popstate", () => {
   restoreFiltersFromUrl();
   loadInitial();

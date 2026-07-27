@@ -144,6 +144,7 @@ def _detection_wall_camera(
         event_id = str(event["id"])
         event_ts = float(event.get("display_ts", event["abs_ts"]))
         cls = str(event.get("class") or "motion")
+        preview = _detection_wall_preview(event, cls)
         public_events.append({
             "id": event_id,
             "source_id": source["id"],
@@ -159,6 +160,7 @@ def _detection_wall_camera(
             "target_url": (
                 f"/?{urlencode({'source': source['id'], 'ts': f'{event_ts:.3f}', 'cls': cls, 'zone': 'none'})}"
             ),
+            "preview": preview,
         })
 
     return {
@@ -173,6 +175,53 @@ def _detection_wall_camera(
             public_events[-1]["display_ts"] - 0.000001
             if has_more and public_events else None
         ),
+    }
+
+
+def _detection_wall_preview(event: dict, cls: str) -> dict | None:
+    """Direct-MP4 preview metadata; the browser performs the visual crop."""
+    if event.get("provisional"):
+        return None
+    seg_path = str(event.get("seg_path") or "")
+    if not seg_path or not seg_path.lower().endswith(".mp4"):
+        return None
+    try:
+        boxes = json.loads(event["boxes_json"]) if event.get("boxes_json") else []
+    except (TypeError, json.JSONDecodeError):
+        return None
+    box = _select_event_box(boxes, cls)
+    if not box:
+        return None
+    try:
+        coordinates = {
+            key: float(box[key])
+            for key in ("x1", "y1", "x2", "y2")
+        }
+        raw_start = float(event.get("start_off") or 0)
+        raw_end = float(event.get("end_off") or raw_start)
+    except (KeyError, TypeError, ValueError):
+        return None
+    numeric_values = (*coordinates.values(), raw_start, raw_end)
+    if not all(math.isfinite(value) for value in numeric_values):
+        return None
+    clean_box = {
+        key: max(0.0, min(1.0, value))
+        for key, value in coordinates.items()
+    }
+    start_off = max(0.0, raw_start)
+    end_off = max(start_off, raw_end)
+    if (
+        clean_box["x2"] <= clean_box["x1"]
+        or clean_box["y2"] <= clean_box["y1"]
+    ):
+        return None
+    start = max(0.0, start_off - 1.0)
+    end = min(start + 8.0, max(start + 3.0, end_off + 1.0))
+    return {
+        "url": f"/video/files/{quote(seg_path, safe='/')}",
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "box": clean_box,
     }
 
 

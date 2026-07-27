@@ -230,6 +230,17 @@ button, a { -webkit-tap-highlight-color: transparent; }
   transition: transform 180ms ease;
 }
 .dw-card:hover .dw-thumb img { transform: scale(1.018); }
+.dw-preview-video {
+  position: absolute;
+  z-index: 1;
+  max-width: none;
+  max-height: none;
+  opacity: 0;
+  pointer-events: none;
+  background: #090b0f;
+  transition: opacity 100ms ease;
+}
+.dw-card.preview-playing .dw-preview-video { opacity: 1; }
 .dw-thumb.missing img { display: none; }
 .dw-thumb-fallback {
   position: absolute;
@@ -246,6 +257,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
   position: absolute;
   top: 8px;
   left: 8px;
+  z-index: 2;
   max-width: calc(100% - 16px);
   overflow: hidden;
   padding: 4px 7px;
@@ -260,6 +272,24 @@ button, a { -webkit-tap-highlight-color: transparent; }
   white-space: nowrap;
   backdrop-filter: blur(7px);
 }
+.dw-preview-mark {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, .14);
+  border-radius: 50%;
+  background: rgba(6, 8, 11, .78);
+  color: rgba(255, 255, 255, .82);
+  backdrop-filter: blur(7px);
+  transition: opacity 100ms ease;
+}
+.dw-card.preview-playing .dw-preview-mark { opacity: 0; }
+.dw-card[data-preview-failed] .dw-preview-mark { display: none; }
 .dw-card-meta {
   display: flex;
   align-items: center;
@@ -390,11 +420,17 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .dw-badge { top: 6px; left: 6px; padding: 4px 6px; font-size: 9px; }
 }
 
+@media (hover: none), (pointer: coarse) {
+  .dw-preview-mark { display: none; }
+}
+
 @media (max-width: 380px) {
   .dw-grid { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .dw-icon.loading svg, .dw-skeleton { animation: none; }
-  .dw-card, .dw-thumb img { transition: none; }
+  .dw-card, .dw-thumb img, .dw-preview-video, .dw-preview-mark {
+    transition: none;
+  }
 }

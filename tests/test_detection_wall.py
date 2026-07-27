@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -10,7 +11,11 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from wanyard.web import _detection_wall_all, _detection_wall_camera
+from wanyard.web import (
+    _detection_wall_all,
+    _detection_wall_camera,
+    _detection_wall_preview,
+)
 from wanyard.video import VideoSegmentDB
 
 
@@ -22,6 +27,8 @@ def _event(
     source_id: str = "front",
     event_type: str = "detection",
     provisional: bool = False,
+    seg_path: str | None = None,
+    boxes: list[dict] | None = None,
 ) -> dict:
     return {
         "id": event_id,
@@ -34,6 +41,8 @@ def _event(
         "end_off": 4.0,
         "confidence": 0.87,
         "provisional": provisional,
+        "seg_path": seg_path,
+        "boxes_json": json.dumps(boxes) if boxes is not None else None,
     }
 
 
@@ -149,6 +158,75 @@ class DetectionWallCameraTests(unittest.TestCase):
         first_ids = {event["id"] for event in camera["events"]}
         next_ids = {event["id"] for event in next_camera["events"]}
         self.assertFalse(first_ids & next_ids)
+
+    def test_exposes_frontend_crop_preview_for_closed_mp4(self) -> None:
+        event = _event(
+            17,
+            100.0,
+            "person",
+            seg_path="front/segment one.mp4",
+            boxes=[
+                {
+                    "cls": "car",
+                    "conf": 0.99,
+                    "x1": 0.1,
+                    "y1": 0.1,
+                    "x2": 0.9,
+                    "y2": 0.9,
+                },
+                {
+                    "cls": "person",
+                    "conf": 0.85,
+                    "x1": 0.2,
+                    "y1": 0.25,
+                    "x2": 0.4,
+                    "y2": 0.75,
+                },
+            ],
+        )
+        event["start_off"] = 6.0
+        event["end_off"] = 10.0
+
+        db = FakeVideoDB([event])
+        camera = _detection_wall_camera(
+            db, self.source, ["person"], limit=8, before=None
+        )
+        preview = camera["events"][0]["preview"]
+
+        self.assertEqual(
+            preview,
+            {
+                "url": "/video/files/front/segment%20one.mp4",
+                "start": 5.0,
+                "end": 11.0,
+                "box": {
+                    "x1": 0.2,
+                    "y1": 0.25,
+                    "x2": 0.4,
+                    "y2": 0.75,
+                },
+            },
+        )
+
+    def test_omits_preview_for_provisional_or_unusable_event(self) -> None:
+        provisional = _event(
+            18,
+            100.0,
+            "person",
+            provisional=True,
+            seg_path="front/segment.mp4",
+            boxes=[{"cls": "person", "x1": 0.2, "y1": 0.2, "x2": 0.4, "y2": 0.5}],
+        )
+        malformed = _event(
+            19,
+            100.0,
+            "person",
+            seg_path="front/segment.mp4",
+            boxes=[{"cls": "person", "x1": 0.4, "y1": 0.2, "x2": 0.2, "y2": 0.5}],
+        )
+
+        self.assertIsNone(_detection_wall_preview(provisional, "person"))
+        self.assertIsNone(_detection_wall_preview(malformed, "person"))
 
 
 class DetectionWallDatabaseTests(unittest.TestCase):
