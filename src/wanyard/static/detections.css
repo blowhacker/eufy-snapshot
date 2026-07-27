@@ -288,7 +288,27 @@ button, a { -webkit-tap-highlight-color: transparent; }
   backdrop-filter: blur(7px);
   transition: opacity 100ms ease;
 }
+.dw-preview-mark svg { transition: opacity 100ms ease; }
+.dw-preview-mark::after {
+  position: absolute;
+  inset: 2px;
+  border: 1.5px solid transparent;
+  border-top-color: currentColor;
+  border-right-color: rgba(255, 255, 255, .26);
+  border-radius: 50%;
+  opacity: 0;
+  content: "";
+}
 .dw-card.preview-playing .dw-preview-mark { opacity: 0; }
+.dw-card.preview-loading .dw-preview-mark {
+  opacity: 1;
+  color: var(--amber);
+}
+.dw-card.preview-loading .dw-preview-mark svg { opacity: .24; }
+.dw-card.preview-loading .dw-preview-mark::after {
+  opacity: 1;
+  animation: dw-spin 700ms linear infinite;
+}
 .dw-card[data-preview-failed] .dw-preview-mark { display: none; }
 .dw-card-meta {
   display: flex;
@@ -429,8 +449,12 @@ button, a { -webkit-tap-highlight-color: transparent; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .dw-icon.loading svg, .dw-skeleton { animation: none; }
-  .dw-card, .dw-thumb img, .dw-preview-video, .dw-preview-mark {
+  .dw-icon.loading svg, .dw-skeleton,
+  .dw-card.preview-loading .dw-preview-mark::after {
+    animation: none;
+  }
+  .dw-card, .dw-thumb img, .dw-preview-video, .dw-preview-mark,
+  .dw-preview-mark svg {
     transition: none;
   }
 }

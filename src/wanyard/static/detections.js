@@ -106,8 +106,10 @@ function layoutActivePreview() {
 
 function cancelPendingPreview(card = null) {
   if (!pendingPreview || (card && pendingPreview.card !== card)) return;
+  const pendingCard = pendingPreview.card;
   clearTimeout(pendingPreview.timer);
   pendingPreview = null;
+  pendingCard.classList.remove("preview-loading");
 }
 
 function stopPreview(card = null, failed = false) {
@@ -116,7 +118,7 @@ function stopPreview(card = null, failed = false) {
   const { card: activeCard, video, resizeObserver } = activePreview;
   activePreview = null;
   resizeObserver?.disconnect();
-  activeCard.classList.remove("preview-playing");
+  activeCard.classList.remove("preview-loading", "preview-playing");
   if (failed) activeCard.dataset.previewFailed = "1";
   try {
     video.pause();
@@ -132,10 +134,16 @@ function startPreview(card, preview) {
     !canHoverPreview.matches
     || !card.isConnected
     || card.dataset.previewFailed
-  ) return;
+  ) {
+    card.classList.remove("preview-loading");
+    return;
+  }
   stopPreview();
   const host = card.querySelector(".dw-thumb");
-  if (!host) return;
+  if (!host) {
+    card.classList.remove("preview-loading");
+    return;
+  }
   const video = document.createElement("video");
   video.className = "dw-preview-video";
   video.muted = true;
@@ -174,7 +182,12 @@ function startPreview(card, preview) {
     }
   }, { once: true });
   video.addEventListener("playing", () => {
-    if (activePreview === item) card.classList.add("preview-playing");
+    if (activePreview !== item) return;
+    card.classList.remove("preview-loading");
+    card.classList.add("preview-playing");
+  });
+  video.addEventListener("waiting", () => {
+    if (activePreview === item) card.classList.add("preview-loading");
   });
   video.addEventListener("timeupdate", () => {
     if (
@@ -204,6 +217,7 @@ function queuePreview(card, preview) {
   if (!preview || !canHoverPreview.matches || card.dataset.previewFailed) return;
   if (activePreview?.card === card) return;
   cancelPendingPreview();
+  card.classList.add("preview-loading");
   pendingPreview = {
     card,
     timer: setTimeout(() => startPreview(card, preview), 180),
