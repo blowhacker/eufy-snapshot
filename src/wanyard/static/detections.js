@@ -1,5 +1,18 @@
 const PAGE_SIZE = 24;
 
+function filtersFromUrl() {
+  const params = new URLSearchParams(location.search);
+  return {
+    camera: params.get("camera") || "all",
+    classes: new Set(
+      (params.get("classes") || "")
+        .split(",")
+        .map(value => value.trim())
+        .filter(Boolean)
+    ),
+  };
+}
+
 const dom = {
   main: document.getElementById("dwMain"),
   cameras: document.getElementById("dwCameras"),
@@ -9,14 +22,10 @@ const dom = {
   emptyTemplate: document.getElementById("dwEmptyTemplate"),
 };
 
+const initialFilters = filtersFromUrl();
 const state = {
-  camera: new URLSearchParams(location.search).get("camera") || "all",
-  classes: new Set(
-    (new URLSearchParams(location.search).get("classes") || "")
-      .split(",")
-      .map(value => value.trim())
-      .filter(Boolean)
-  ),
+  camera: initialFilters.camera,
+  classes: initialFilters.classes,
   classCounts: {},
   sources: [],
   cameras: new Map(),
@@ -74,7 +83,7 @@ function selectedClasses() {
   return [...state.classes].sort();
 }
 
-function syncUrl() {
+function syncUrl({ replace = false } = {}) {
   const url = new URL(location.href);
   if (state.camera && state.camera !== "all") {
     url.searchParams.set("camera", state.camera);
@@ -84,7 +93,17 @@ function syncUrl() {
   const classes = selectedClasses();
   if (classes.length) url.searchParams.set("classes", classes.join(","));
   else url.searchParams.delete("classes");
-  history.replaceState(null, "", url);
+  history[replace ? "replaceState" : "pushState"](
+    { detectionWall: true },
+    "",
+    url
+  );
+}
+
+function restoreFiltersFromUrl() {
+  const filters = filtersFromUrl();
+  state.camera = filters.camera;
+  state.classes = filters.classes;
 }
 
 function apiUrl({ source = state.camera, before = null } = {}) {
@@ -119,6 +138,7 @@ function makeTag(value, label, count, active) {
 
   button.addEventListener("click", () => {
     if (!value) {
+      if (state.classes.size === 0) return;
       state.classes.clear();
     } else if (state.classes.has(value)) {
       state.classes.delete(value);
@@ -407,8 +427,15 @@ async function loadInitial() {
 }
 
 dom.refresh.addEventListener("click", loadInitial);
+window.addEventListener("popstate", () => {
+  restoreFiltersFromUrl();
+  loadInitial();
+});
 window.addEventListener("pageshow", event => {
-  if (event.persisted) loadInitial();
+  if (event.persisted) {
+    restoreFiltersFromUrl();
+    loadInitial();
+  }
 });
 
 loadInitial();
