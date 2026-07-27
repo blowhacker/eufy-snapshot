@@ -398,9 +398,14 @@ async function loadCameras() {
 
   list.querySelectorAll('[data-del]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      if (!confirm(`Remove ${btn.dataset.del}? This cannot be undone.`)) return;
-      await fetch('/api/sources/'+btn.dataset.del,{method:'DELETE'});
-      loadCameras().then(() => { loadNotificationRules(); });
+      if (!confirm(
+        `Remove ${btn.dataset.del}? Camera configuration and media health history will be deleted. Recorded footage is kept.`
+      )) return;
+      const response = await fetch('/api/sources/'+btn.dataset.del,{method:'DELETE'});
+      if (!response.ok) return;
+      await loadCameras();
+      loadNotificationRules();
+      loadMediaHealth();
     });
   });
 

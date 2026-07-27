@@ -214,6 +214,49 @@ class MediaHealthStore:
             rows = conn.execute("SELECT * FROM stamper_state").fetchall()
         return {row["source_id"]: dict(row) for row in rows}
 
+    def delete_source(self, source_id: str) -> None:
+        """Remove every Media Health reference for one deleted camera."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM media_health_events WHERE source_id=?",
+                (source_id,),
+            )
+            conn.execute(
+                "DELETE FROM media_health_samples WHERE source_id=?",
+                (source_id,),
+            )
+            conn.execute(
+                "DELETE FROM stamper_state WHERE source_id=?",
+                (source_id,),
+            )
+
+    def prune_sources(self, active_source_ids: list[str]) -> None:
+        """Purge telemetry left by cameras removed before delete cleanup existed."""
+        active = sorted(set(active_source_ids))
+        with self._connect() as conn:
+            if not active:
+                conn.execute(
+                    "DELETE FROM media_health_events WHERE source_id IS NOT NULL"
+                )
+                conn.execute("DELETE FROM media_health_samples")
+                conn.execute("DELETE FROM stamper_state")
+                return
+            placeholders = ",".join("?" for _ in active)
+            conn.execute(
+                "DELETE FROM media_health_events"
+                f" WHERE source_id IS NOT NULL AND source_id NOT IN ({placeholders})",
+                active,
+            )
+            conn.execute(
+                "DELETE FROM media_health_samples"
+                f" WHERE source_id NOT IN ({placeholders})",
+                active,
+            )
+            conn.execute(
+                f"DELETE FROM stamper_state WHERE source_id NOT IN ({placeholders})",
+                active,
+            )
+
     def record_samples(self, samples: list[dict]) -> None:
         if not samples:
             return
@@ -426,6 +469,10 @@ class MediaHealthCollector:
         self.fetch_text = fetch_text or self._fetch_text
         self.clock = clock
         self._previous_counters: dict[str, tuple[float, float]] = {}
+
+    def forget_source(self, source_id: str) -> None:
+        self._previous_counters.pop(source_id, None)
+        self._previous_counters.pop(f"{source_id}-stamped", None)
 
     @staticmethod
     def _fetch_text(url: str) -> str:

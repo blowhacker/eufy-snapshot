@@ -555,6 +555,9 @@ def make_app(
             try:
                 sources = _sources_list(config, source_db)
                 source_ids = [source["id"] for source in sources]
+                await asyncio.to_thread(
+                    health_store.prune_sources, source_ids
+                )
                 source_statuses = await asyncio.to_thread(_source_statuses)
                 recorder_statuses = (
                     capture_worker.recorder_status() if capture_worker else {}
@@ -754,8 +757,14 @@ def make_app(
         source_id = request.path_params["source_id"]
         if source_db is None:
             return JSONResponse({"error": "db_path not configured"}, status_code=501)
+        if source_id not in source_db.ids():
+            return JSONResponse({"error": "source not found"}, status_code=404)
+        if health_store is not None:
+            await asyncio.to_thread(health_store.delete_source, source_id)
         if not source_db.delete(source_id):
             return JSONResponse({"error": "source not found"}, status_code=404)
+        if health_collector is not None:
+            health_collector.forget_source(source_id)
         await asyncio.to_thread(native_hls.unregister_source_runtime, source_id)
         return JSONResponse({"ok": True})
 
@@ -1837,6 +1846,9 @@ def make_app(
         source_ids = {source["id"] for source in _sources_list(config, source_db)}
         if source_id and source_id not in source_ids:
             return JSONResponse({"error": "source not found"}, status_code=404)
+        await asyncio.to_thread(
+            health_store.prune_sources, list(source_ids)
+        )
         data = await asyncio.to_thread(
             health_store.snapshot,
             since=time.time() - hours * 3600,

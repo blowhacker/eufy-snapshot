@@ -20,6 +20,25 @@ from wanyard.media_health import (
 
 
 class MediaHealthTests(unittest.TestCase):
+    @staticmethod
+    def _sample(source_id: str, ts: float) -> dict:
+        return {
+            "ts": ts,
+            "source_id": source_id,
+            "raw_ready": 1,
+            "stamped_ready": 1,
+            "raw_bitrate_bps": 1_000_000,
+            "stamped_bitrate_bps": 900_000,
+            "hls_age_seconds": 0.5,
+            "recorder_thread_alive": 1,
+            "recorder_codec": "h264",
+            "segment_started_ts": ts - 10,
+            "segment_completed_ts": ts - 1,
+            "consecutive_failures": 0,
+            "last_failure_kind": None,
+            "active_encoder": "h264_nvenc",
+        }
+
     def test_parse_mediamtx_paths_and_rate(self) -> None:
         metrics = parse_mediamtx_metrics(
             '\n'.join(
@@ -147,6 +166,109 @@ class MediaHealthTests(unittest.TestCase):
             self.assertIn("hls_stale", kinds)
             self.assertIn("recorder_failure", kinds)
             self.assertGreaterEqual(len(snapshot["series"]), 1)
+
+    def test_delete_source_removes_all_health_references(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MediaHealthStore(Path(tmp) / "health.db")
+            now = time.time()
+            for source_id in ("front", "garden"):
+                store.update_stamper_state(
+                    source_id,
+                    status="live",
+                    active_encoder="h264_nvenc",
+                    ts=now,
+                )
+                store.event(
+                    source_id,
+                    "pipeline",
+                    "warning",
+                    "test",
+                    "test incident",
+                    ts=now,
+                )
+            store.event(
+                None,
+                "system",
+                "info",
+                "startup",
+                "service started",
+                ts=now,
+            )
+            store.record_samples([
+                self._sample("front", now),
+                self._sample("garden", now),
+            ])
+
+            store.delete_source("garden")
+
+            snapshot = store.snapshot(since=now - 60)
+            self.assertEqual(set(snapshot["current"]), {"front"})
+            self.assertEqual(
+                {row["source_id"] for row in snapshot["series"]},
+                {"front"},
+            )
+            self.assertNotIn(
+                "garden",
+                {event["source_id"] for event in snapshot["events"]},
+            )
+            self.assertIn(
+                None,
+                {event["source_id"] for event in snapshot["events"]},
+            )
+
+    def test_prune_sources_cleans_preexisting_removed_camera_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MediaHealthStore(Path(tmp) / "health.db")
+            now = time.time()
+            for source_id in ("front", "tapo-garden"):
+                store.update_stamper_state(
+                    source_id,
+                    status="live",
+                    ts=now,
+                )
+                store.event(
+                    source_id,
+                    "pipeline",
+                    "info",
+                    "test",
+                    "test incident",
+                    ts=now,
+                )
+            store.record_samples([
+                self._sample("front", now),
+                self._sample("tapo-garden", now),
+            ])
+
+            store.prune_sources(["front"])
+
+            snapshot = store.snapshot(since=now - 60)
+            self.assertEqual(set(snapshot["current"]), {"front"})
+            self.assertTrue(all(
+                row["source_id"] == "front" for row in snapshot["series"]
+            ))
+            self.assertTrue(all(
+                event["source_id"] == "front" for event in snapshot["events"]
+            ))
+
+    def test_collector_forgets_deleted_source_bitrate_counters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MediaHealthStore(Path(tmp) / "health.db")
+            collector = MediaHealthCollector(
+                store,
+                fetch_text=lambda _url: "",
+            )
+            collector._previous_counters = {
+                "garden": (10.0, 100.0),
+                "garden-stamped": (10.0, 200.0),
+                "front": (10.0, 300.0),
+            }
+
+            collector.forget_source("garden")
+
+            self.assertEqual(
+                collector._previous_counters,
+                {"front": (10.0, 300.0)},
+            )
 
 
 if __name__ == "__main__":
