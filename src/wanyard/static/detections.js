@@ -170,6 +170,11 @@ function updatePreviewPan(item, mediaTime) {
   };
   const currentMediaTime = Number(mediaTime);
   if (item.panMediaTime == null) {
+    // The stored event box can come from later in the episode, while previews
+    // include a second of pre-roll. Start at the track's box for the frame
+    // actually being shown; easing from the later event box makes fast movers
+    // pan backwards briefly before reversing into their true direction.
+    item.panCenter = target;
     item.panMediaTime = currentMediaTime;
   } else {
     item.panCenter = previewTracker.dampCenter(
