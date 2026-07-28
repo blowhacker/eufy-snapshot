@@ -44,6 +44,7 @@ _SPRITE_W            = 160
 _SPRITE_COLS         = 10
 _SPRITE_ROWS         = 6
 _EVENT_GAP_SECONDS   = 2.0    # detections within this gap = same event
+_TRACKED_EVENT_GAP_SECONDS = 6.0
 _PROVISIONAL_GRACE_SECONDS = 3600.0
 _OBJECT_TRACK_CENTER_DISTANCE = 0.045
 _OBJECT_TRACK_AREA_RATIO = 3.0
@@ -1202,6 +1203,7 @@ class VideoSegmentDB:
                 box = _event_box(tracklet)
                 if not box:
                     continue
+                tracker_id = _box_tracker_id(box)
                 cx, cy = _box_center(box)
                 area = _box_area(box)
                 best: dict | None = None
@@ -1210,6 +1212,12 @@ class VideoSegmentDB:
                     if int(track["id"]) in used_track_ids:
                         continue
                     if track["class"] != tracklet["class"]:
+                        continue
+                    previous_tracker_id = _event_tracker_id(track)
+                    if tracker_id and previous_tracker_id:
+                        if tracker_id == previous_tracker_id:
+                            best = track
+                            break
                         continue
                     if not _area_compatible(area, float(track["area"])):
                         continue
@@ -2379,11 +2387,19 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
         ]
         active_indices = [
             idx for idx in active_indices
-            if off - float(tracks[idx]["last"]) <= _EVENT_GAP_SECONDS
+            if (
+                off - float(tracks[idx]["last"])
+                <= (
+                    _TRACKED_EVENT_GAP_SECONDS
+                    if tracks[idx].get("tracker_id")
+                    else _EVENT_GAP_SECONDS
+                )
+            )
         ]
         used: set[int] = set()
         for box in sorted(boxes, key=lambda b: float(b.get("conf", 0.0)), reverse=True):
             cls = str(box.get("cls"))
+            tracker_id = _box_tracker_id(box)
             cx, cy = _box_center(box)
             area = _box_area(box)
             best_idx: int | None = None
@@ -2393,6 +2409,12 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
                 if idx in used:
                     continue
                 if track["class"] != cls:
+                    continue
+                previous_tracker_id = track.get("tracker_id")
+                if tracker_id and previous_tracker_id:
+                    if tracker_id == previous_tracker_id:
+                        best_idx = idx
+                        break
                     continue
                 if not _area_compatible(area, track["area"]):
                     continue
@@ -2404,6 +2426,7 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
             if best_idx is None:
                 tracks.append({
                     "class": cls,
+                    "tracker_id": tracker_id,
                     "first": off,
                     "last": off,
                     "first_abs_ts": det_abs_ts,
@@ -2425,6 +2448,9 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
             track["last"] = off
             track["last_abs_ts"] = det_abs_ts
             track["seen"] += 1
+            if tracker_id:
+                track["tracker_id"] = tracker_id
+                track["box"]["track_id"] = tracker_id
             track["cx"] = (track["cx"] * 0.7) + (cx * 0.3)
             track["cy"] = (track["cy"] * 0.7) + (cy * 0.3)
             track["area"] = (track["area"] * 0.7) + (area * 0.3)
@@ -2491,6 +2517,19 @@ def _event_box(event: dict) -> dict | None:
         if isinstance(box, dict):
             return box
     return None
+
+
+def _box_tracker_id(box: dict | None) -> str | None:
+    if not isinstance(box, dict):
+        return None
+    value = box.get("track_id")
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _event_tracker_id(event: dict) -> str | None:
+    return _box_tracker_id(_event_box(event))
 
 
 def _box_center(box: dict) -> tuple[float, float]:

@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from wanyard.object_association import ByteTrackAssociator
+
+
+class FakeDetections:
+    def __init__(self, classes):
+        self.cls = np.asarray(classes, dtype=np.float32)
+
+    def __len__(self):
+        return len(self.cls)
+
+    def __getitem__(self, indices):
+        return FakeDetections(self.cls[indices])
+
+
+class FakeTrack:
+    def __init__(self, track_id: int):
+        self.track_id = track_id
+        self.frame_id = 0
+        self.idx = 0
+
+
+class FakeTracker:
+    def __init__(self, _args):
+        self.frame_id = 0
+        self.tracked_stracks = []
+
+    def update(self, detections):
+        self.frame_id += 1
+        if len(detections):
+            if not self.tracked_stracks:
+                self.tracked_stracks = [FakeTrack(1)]
+            track = self.tracked_stracks[0]
+            track.frame_id = self.frame_id
+            track.idx = 0
+        return np.empty((0, 8), dtype=np.float32)
+
+    def reset(self):
+        self.tracked_stracks = []
+        self.frame_id = 0
+
+
+def box(cls: str, confidence: float = 0.8) -> dict:
+    return {
+        "cls": cls,
+        "conf": confidence,
+        "x1": 0.1,
+        "y1": 0.1,
+        "x2": 0.2,
+        "y2": 0.3,
+    }
+
+
+class ByteTrackAssociatorTests(unittest.TestCase):
+    def make_associator(self):
+        return ByteTrackAssociator(
+            "front",
+            2.0,
+            tracker_factory=FakeTracker,
+            session_id="test",
+        )
+
+    def test_keeps_ephemeral_identity_per_class(self) -> None:
+        associator = self.make_associator()
+        first = associator.annotate(
+            FakeDetections([0, 16]),
+            [box("person"), box("dog")],
+            abs_ts=100.0,
+        )
+        second = associator.annotate(
+            FakeDetections([0, 16]),
+            [box("person"), box("dog")],
+            abs_ts=100.5,
+        )
+
+        self.assertEqual(len(first), 2)
+        self.assertEqual(
+            [item["track_id"] for item in first],
+            [item["track_id"] for item in second],
+        )
+        self.assertNotEqual(first[0]["track_id"], first[1]["track_id"])
+
+    def test_resets_identity_after_a_long_input_gap(self) -> None:
+        associator = self.make_associator()
+        first = associator.annotate(
+            FakeDetections([0]), [box("person")], abs_ts=100.0
+        )
+        after_gap = associator.annotate(
+            FakeDetections([0]), [box("person")], abs_ts=107.0
+        )
+
+        self.assertNotEqual(first[0]["track_id"], after_gap[0]["track_id"])
+
+    def test_fallback_keeps_only_normal_confidence_boxes(self) -> None:
+        associator = self.make_associator()
+        kept = associator.annotate(
+            None,
+            [box("person", 0.7), box("dog", 0.2)],
+            abs_ts=100.0,
+        )
+
+        self.assertEqual([item["cls"] for item in kept], ["person"])
+
+
+if __name__ == "__main__":
+    unittest.main()

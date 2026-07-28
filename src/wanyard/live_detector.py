@@ -10,6 +10,7 @@ import time
 import urllib.request
 
 from . import sei
+from .object_association import ByteTrackAssociator
 
 LOG = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ class _SourceWorker:
             "WANYARD_LIVE_RECONNECT_COVERAGE_GRACE_SECONDS",
             _DEFAULT_RECONNECT_COVERAGE_GRACE_SECONDS,
         )
+        self.object_associator = ByteTrackAssociator(source_id, self.fps)
         self.thread = threading.Thread(
             target=self.run,
             daemon=True,
@@ -193,7 +195,7 @@ class _SourceWorker:
             return
         self.next_infer_wall = wall + (1.0 / self.fps)
 
-        from .video import _CONF_THRESHOLD, _parse_results
+        from .video import _parse_results
 
         # The clock rides as frame side data (SEI); reencode streams emit the
         # same SEI, so there is no pixel carrier to fall back to.
@@ -228,10 +230,25 @@ class _SourceWorker:
                 frame_bgr,
                 imgsz=640,
                 classes=self.class_selector.ids(),
-                conf=_CONF_THRESHOLD,
+                conf=self.object_associator.low_confidence,
                 verbose=False,
             )
-        has_human, confidence, boxes = _parse_results(results)
+        _, _, boxes = _parse_results(results)
+        result_boxes = (
+            results[0].boxes.cpu().numpy()
+            if results and results[0].boxes is not None
+            else None
+        )
+        boxes = self.object_associator.annotate(
+            result_boxes,
+            boxes,
+            abs_ts=abs_ts,
+        )
+        has_human = any(box["cls"] == "person" for box in boxes)
+        confidence = max(
+            (float(box["conf"]) for box in boxes if box["cls"] == "person"),
+            default=0.0,
+        )
         classes = list({b["cls"] for b in boxes}) if boxes else []
         self._store_or_queue(
             _DetectionRow(abs_ts, has_human, confidence, boxes, classes),
