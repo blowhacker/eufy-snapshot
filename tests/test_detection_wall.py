@@ -311,6 +311,7 @@ class DetectionWallCameraTests(unittest.TestCase):
                 "kind": "hls",
                 "url": "/video/live/front/live.m3u8",
                 "source_id": "front",
+                "event_ts": 100.0,
                 "start_ts": 99.0,
                 "end_ts": 104.0,
                 "box": {

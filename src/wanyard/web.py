@@ -314,6 +314,7 @@ def _detection_wall_preview(
                 f"/video/live/{quote(source_id, safe='')}/live.m3u8"
             ),
             "source_id": source_id,
+            "event_ts": round(event_ts, 3),
             "start_ts": round(start_ts, 3),
             "end_ts": round(end_ts, 3),
             "box": clean_box,

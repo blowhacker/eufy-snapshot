@@ -194,6 +194,98 @@ function stopPreview(card = null, failed = false) {
   video.remove();
 }
 
+function startMp4Preview(item, preview) {
+  const { card, video } = item;
+  item.mode = "mp4";
+  item.preview = preview;
+  item.start = Math.max(0, Number(preview.start) || 0);
+  item.end = Math.max(0, Number(preview.end) || 0);
+  video.addEventListener("loadedmetadata", () => {
+    if (
+      activePreview !== item
+      || item.mode !== "mp4"
+      || !Number.isFinite(video.duration)
+    ) return;
+    item.start = Math.min(item.start, Math.max(0, video.duration - .1));
+    item.end = Math.min(
+      video.duration,
+      Math.max(item.start + .25, item.end)
+    );
+    layoutActivePreview();
+    const play = () => {
+      if (activePreview === item && item.mode === "mp4") {
+        video.play().catch(() => stopPreview(card, true));
+      }
+    };
+    if (item.start > .01) {
+      video.addEventListener("seeked", play, { once: true });
+      video.currentTime = item.start;
+    } else {
+      play();
+    }
+  }, { once: true });
+  video.src = preview.url;
+  video.load();
+}
+
+async function fallbackToRecordedPreview(item) {
+  if (
+    activePreview !== item
+    || item.fallbackStarted
+    || !item.hlsPreview
+  ) return;
+  item.fallbackStarted = true;
+  item.mode = "resolving";
+  item.hls?.destroy();
+  item.hls = null;
+
+  const preview = item.hlsPreview;
+  const params = new URLSearchParams({
+    source: preview.source_id,
+    ts: String(preview.event_ts ?? preview.start_ts),
+  });
+  const resolved = await fetch(`/api/video/resolve?${params}`, {
+    cache: "no-store",
+  })
+    .then(response => response.ok ? response.json() : null)
+    .catch(() => null);
+  if (activePreview !== item) return;
+
+  const mediaEpoch = Number(resolved?.media_epoch);
+  const duration = Number(resolved?.duration);
+  if (
+    (resolved?.storage_provider !== "mp4" && resolved?.provider !== "mp4")
+    || !resolved?.url
+    || !Number.isFinite(mediaEpoch)
+  ) {
+    stopPreview(item.card);
+    return;
+  }
+  const maxPosition = Number.isFinite(duration)
+    ? Math.max(0, duration - .1)
+    : Infinity;
+  const eventTs = Number(preview.event_ts ?? preview.start_ts);
+  const desiredStartTs = eventTs - 1;
+  const desiredEndTs = Math.min(
+    desiredStartTs + 8,
+    Math.max(desiredStartTs + 3, Number(preview.end_ts))
+  );
+  const start = Math.max(
+    0,
+    Math.min(maxPosition, desiredStartTs - mediaEpoch)
+  );
+  const end = Math.max(
+    start + .25,
+    Math.min(maxPosition, desiredEndTs - mediaEpoch)
+  );
+  startMp4Preview(item, {
+    url: resolved.url,
+    start,
+    end,
+    box: preview.box,
+  });
+}
+
 async function startHlsPreview(item) {
   const { card, preview, video } = item;
   const window = await fetchLiveWindow(preview.source_id);
@@ -202,7 +294,7 @@ async function startHlsPreview(item) {
     !liveWindowContains(window, preview.start_ts)
     || !liveWindowContains(window, preview.end_ts)
   ) {
-    stopPreview(card, true);
+    fallbackToRecordedPreview(item);
     return;
   }
 
@@ -214,7 +306,7 @@ async function startHlsPreview(item) {
   }
 
   const ready = () => {
-    if (activePreview !== item) return;
+    if (activePreview !== item || item.mode !== "hls") return;
     item.start = liveSeekTarget(video, window, startTs);
     item.end = item.start + (endTs - startTs);
     if (video.seekable?.length) {
@@ -222,7 +314,7 @@ async function startHlsPreview(item) {
       item.end = Math.min(item.end, seekableEnd);
     }
     if (item.end - item.start < .25) {
-      stopPreview(card, true);
+      fallbackToRecordedPreview(item);
       return;
     }
     layoutActivePreview();
@@ -247,7 +339,7 @@ async function startHlsPreview(item) {
   const HlsCtor = await loadHlsJs().catch(() => null);
   if (activePreview !== item) return;
   if (!HlsCtor?.isSupported?.()) {
-    stopPreview(card, true);
+    fallbackToRecordedPreview(item);
     return;
   }
   const hls = new HlsCtor({
@@ -256,7 +348,9 @@ async function startHlsPreview(item) {
   });
   item.hls = hls;
   hls.on(HlsCtor.Events.ERROR, (_, data) => {
-    if (activePreview === item && data.fatal) stopPreview(card, true);
+    if (activePreview === item && data.fatal) {
+      fallbackToRecordedPreview(item);
+    }
   });
   hls.loadSource(preview.url);
   hls.attachMedia(video);
@@ -294,30 +388,12 @@ function startPreview(card, preview) {
     end: Math.max(0, Number(preview.end) || 0),
     resizeObserver: null,
     hls: null,
+    hlsPreview: preview.kind === "hls" ? preview : null,
+    fallbackStarted: false,
+    mode: preview.kind === "hls" ? "hls" : "mp4",
   };
   activePreview = item;
 
-  const playPreview = () => {
-    if (activePreview !== item) return;
-    video.play().catch(() => stopPreview(card, true));
-  };
-  if (preview.kind !== "hls") {
-    video.addEventListener("loadedmetadata", () => {
-      if (activePreview !== item || !Number.isFinite(video.duration)) return;
-      item.start = Math.min(item.start, Math.max(0, video.duration - .1));
-      item.end = Math.min(
-        video.duration,
-        Math.max(item.start + .25, item.end)
-      );
-      layoutActivePreview();
-      if (item.start > .01) {
-        video.addEventListener("seeked", playPreview, { once: true });
-        video.currentTime = item.start;
-      } else {
-        playPreview();
-      }
-    }, { once: true });
-  }
   video.addEventListener("playing", () => {
     if (activePreview !== item) return;
     card.classList.remove("preview-loading");
@@ -340,17 +416,18 @@ function startPreview(card, preview) {
     video.currentTime = item.start;
     video.play().catch(() => {});
   });
-  video.addEventListener("error", () => stopPreview(card, true), { once: true });
+  video.addEventListener("error", () => {
+    if (activePreview !== item) return;
+    if (item.mode === "hls") fallbackToRecordedPreview(item);
+    else if (item.mode === "mp4") stopPreview(card, true);
+  });
   if ("ResizeObserver" in window) {
     item.resizeObserver = new ResizeObserver(layoutActivePreview);
     item.resizeObserver.observe(host);
   }
   host.append(video);
   if (preview.kind === "hls") startHlsPreview(item);
-  else {
-    video.src = preview.url;
-    video.load();
-  }
+  else startMp4Preview(item, preview);
 }
 
 function queuePreview(card, preview) {
