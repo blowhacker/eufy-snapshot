@@ -101,6 +101,7 @@ def _detection_wall_camera(
     before: float | None,
     polygons: list[list[dict]] | None = None,
     zone_filter_active: bool = False,
+    live_window: dict | None = None,
 ) -> dict:
     """Return one camera's newest detection episodes for the thumbnail wall.
 
@@ -168,7 +169,7 @@ def _detection_wall_camera(
         event_id = str(event["id"])
         event_ts = float(event.get("display_ts", event["abs_ts"]))
         cls = str(event.get("class") or "motion")
-        preview = _detection_wall_preview(event, cls)
+        preview = _detection_wall_preview(event, cls, live_window)
         public_events.append({
             "id": event_id,
             "source_id": source["id"],
@@ -236,13 +237,12 @@ def _detection_wall_filtered_recorded(
     return matched[:limit]
 
 
-def _detection_wall_preview(event: dict, cls: str) -> dict | None:
-    """Direct-MP4 preview metadata; the browser performs the visual crop."""
-    if event.get("provisional"):
-        return None
-    seg_path = str(event.get("seg_path") or "")
-    if not seg_path or not seg_path.lower().endswith(".mp4"):
-        return None
+def _detection_wall_preview(
+    event: dict,
+    cls: str,
+    live_window: dict | None = None,
+) -> dict | None:
+    """Preview metadata for a recorded MP4 or provisional live-HLS event."""
     try:
         boxes = json.loads(event["boxes_json"]) if event.get("boxes_json") else []
     except (TypeError, json.JSONDecodeError):
@@ -273,6 +273,55 @@ def _detection_wall_preview(event: dict, cls: str) -> dict | None:
         or clean_box["y2"] <= clean_box["y1"]
     ):
         return None
+
+    if event.get("provisional"):
+        if not live_window:
+            return None
+        source_id = str(event.get("source_id") or "")
+        if not source_id:
+            return None
+        try:
+            event_ts = float(
+                event.get("display_ts", event.get("abs_ts"))
+            )
+            window_start = float(live_window["start_ts"])
+            window_end = float(live_window["end_ts"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (
+            event_ts, window_start, window_end
+        )):
+            return None
+        if (
+            window_end <= window_start
+            or event_ts < window_start - 1.0
+            or event_ts > window_end + 1.0
+        ):
+            return None
+        event_ts = max(window_start, min(window_end, event_ts))
+        duration = max(0.0, end_off - start_off)
+        start_ts = max(window_start, event_ts - 1.0)
+        end_ts = min(
+            window_end,
+            max(start_ts + 3.0, event_ts + duration + 1.0),
+        )
+        end_ts = min(end_ts, start_ts + 8.0)
+        if end_ts - start_ts < 0.25:
+            return None
+        return {
+            "kind": "hls",
+            "url": (
+                f"/video/live/{quote(source_id, safe='')}/live.m3u8"
+            ),
+            "source_id": source_id,
+            "start_ts": round(start_ts, 3),
+            "end_ts": round(end_ts, 3),
+            "box": clean_box,
+        }
+
+    seg_path = str(event.get("seg_path") or "")
+    if not seg_path or not seg_path.lower().endswith(".mp4"):
+        return None
     start = max(0.0, start_off - 1.0)
     end = min(start + 8.0, max(start + 3.0, end_off + 1.0))
     return {
@@ -290,6 +339,7 @@ def _detection_wall_all(
     limit: int,
     before: float | None,
     polygons_by_source: dict[str, list[list[dict]]] | None = None,
+    live_windows_by_source: dict[str, dict] | None = None,
 ) -> dict:
     """Interleave source-local pages into one newest-first camera feed."""
     source_pages = [
@@ -301,6 +351,7 @@ def _detection_wall_all(
             before,
             (polygons_by_source or {}).get(source["id"]),
             source["id"] in (polygons_by_source or {}),
+            (live_windows_by_source or {}).get(source["id"]),
         )
         for source in sources
     ]
@@ -875,6 +926,15 @@ def make_app(
                     str(zone["source_id"]), []
                 ).append(zone["polygon"])
 
+            live_windows_by_source: dict[str, dict] = {}
+            if before is None and video_dir:
+                for source in selected_sources:
+                    window = _read_live_hls_window(
+                        video_dir, source["id"]
+                    )
+                    if window:
+                        live_windows_by_source[source["id"]] = window
+
             # Counts populate the sticky object filter on an initial camera
             # selection. Pagination does not repeat the aggregation.
             counts: dict[str, int] = {}
@@ -900,6 +960,7 @@ def make_app(
                     limit,
                     before,
                     polygons_by_source,
+                    live_windows_by_source,
                 )]
                 if source_id == "all"
                 else [_detection_wall_camera(
@@ -910,6 +971,7 @@ def make_app(
                     before,
                     polygons_by_source.get(selected_sources[0]["id"]),
                     selected_sources[0]["id"] in polygons_by_source,
+                    live_windows_by_source.get(selected_sources[0]["id"]),
                 )]
             )
             return {

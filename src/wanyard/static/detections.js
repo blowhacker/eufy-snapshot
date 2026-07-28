@@ -48,6 +48,7 @@ const canHoverPreview = window.matchMedia(
 );
 let pendingPreview = null;
 let activePreview = null;
+const liveWindowCache = new Map();
 
 const moreObserver = "IntersectionObserver" in window
   ? new IntersectionObserver(entries => {
@@ -122,12 +123,67 @@ function cancelPendingPreview(card = null) {
   pendingCard.classList.remove("preview-loading");
 }
 
+function loadHlsJs() {
+  if (window.Hls) return Promise.resolve(window.Hls);
+  if (!window.__dwHlsPromise) {
+    window.__dwHlsPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "/hls.min.js";
+      script.onload = () => resolve(window.Hls);
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  }
+  return window.__dwHlsPromise;
+}
+
+async function fetchLiveWindow(sourceId) {
+  const cached = liveWindowCache.get(sourceId);
+  if (cached && Date.now() - cached.at < 3000) return cached.promise;
+  const params = new URLSearchParams({ source: sourceId });
+  const promise = fetch(`/api/video/live-window?${params}`, {
+    cache: "no-store",
+  })
+    .then(response => response.ok ? response.json() : null)
+    .then(data => data?.window || null)
+    .catch(() => null);
+  liveWindowCache.set(sourceId, { at: Date.now(), promise });
+  return promise;
+}
+
+function liveWindowContains(window, ts) {
+  return Boolean(
+    window
+    && Number(ts) >= Number(window.start_ts) - 1
+    && Number(ts) <= Number(window.end_ts) + 1
+  );
+}
+
+function liveSeekTarget(video, window, ts) {
+  const offset = Math.max(
+    0,
+    Math.min(
+      Math.max(0, Number(window.end_ts) - Number(window.start_ts) - .25),
+      Number(ts) - Number(window.start_ts)
+    )
+  );
+  const ranges = video.seekable;
+  if (!ranges?.length) return offset;
+  const start = ranges.start(0);
+  const end = ranges.end(ranges.length - 1);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return offset;
+  }
+  return Math.max(start, Math.min(Math.max(start, end - .25), start + offset));
+}
+
 function stopPreview(card = null, failed = false) {
   cancelPendingPreview(card);
   if (!activePreview || (card && activePreview.card !== card)) return;
-  const { card: activeCard, video, resizeObserver } = activePreview;
+  const { card: activeCard, video, resizeObserver, hls } = activePreview;
   activePreview = null;
   resizeObserver?.disconnect();
+  hls?.destroy();
   activeCard.classList.remove("preview-loading", "preview-playing");
   if (failed) activeCard.dataset.previewFailed = "1";
   try {
@@ -136,6 +192,74 @@ function stopPreview(card = null, failed = false) {
     video.load();
   } catch {}
   video.remove();
+}
+
+async function startHlsPreview(item) {
+  const { card, preview, video } = item;
+  const window = await fetchLiveWindow(preview.source_id);
+  if (activePreview !== item) return;
+  if (
+    !liveWindowContains(window, preview.start_ts)
+    || !liveWindowContains(window, preview.end_ts)
+  ) {
+    stopPreview(card, true);
+    return;
+  }
+
+  const startTs = Math.max(Number(window.start_ts), Number(preview.start_ts));
+  const endTs = Math.min(Number(window.end_ts), Number(preview.end_ts));
+  if (!Number.isFinite(startTs) || !Number.isFinite(endTs) || endTs - startTs < .25) {
+    stopPreview(card, true);
+    return;
+  }
+
+  const ready = () => {
+    if (activePreview !== item) return;
+    item.start = liveSeekTarget(video, window, startTs);
+    item.end = item.start + (endTs - startTs);
+    if (video.seekable?.length) {
+      const seekableEnd = video.seekable.end(video.seekable.length - 1);
+      item.end = Math.min(item.end, seekableEnd);
+    }
+    if (item.end - item.start < .25) {
+      stopPreview(card, true);
+      return;
+    }
+    layoutActivePreview();
+    try {
+      video.currentTime = item.start;
+      video.play().catch(() => stopPreview(card, true));
+    } catch {
+      stopPreview(card, true);
+    }
+  };
+  video.addEventListener("loadedmetadata", ready, { once: true });
+
+  const canPlayNative = Boolean(
+    video.canPlayType("application/vnd.apple.mpegurl")
+  );
+  if (canPlayNative) {
+    video.src = preview.url;
+    video.load();
+    return;
+  }
+
+  const HlsCtor = await loadHlsJs().catch(() => null);
+  if (activePreview !== item) return;
+  if (!HlsCtor?.isSupported?.()) {
+    stopPreview(card, true);
+    return;
+  }
+  const hls = new HlsCtor({
+    lowLatencyMode: false,
+    startPosition: Math.max(0, startTs - Number(window.start_ts)),
+  });
+  item.hls = hls;
+  hls.on(HlsCtor.Events.ERROR, (_, data) => {
+    if (activePreview === item && data.fatal) stopPreview(card, true);
+  });
+  hls.loadSource(preview.url);
+  hls.attachMedia(video);
 }
 
 function startPreview(card, preview) {
@@ -169,6 +293,7 @@ function startPreview(card, preview) {
     start: Math.max(0, Number(preview.start) || 0),
     end: Math.max(0, Number(preview.end) || 0),
     resizeObserver: null,
+    hls: null,
   };
   activePreview = item;
 
@@ -176,21 +301,23 @@ function startPreview(card, preview) {
     if (activePreview !== item) return;
     video.play().catch(() => stopPreview(card, true));
   };
-  video.addEventListener("loadedmetadata", () => {
-    if (activePreview !== item || !Number.isFinite(video.duration)) return;
-    item.start = Math.min(item.start, Math.max(0, video.duration - .1));
-    item.end = Math.min(
-      video.duration,
-      Math.max(item.start + .25, item.end)
-    );
-    layoutActivePreview();
-    if (item.start > .01) {
-      video.addEventListener("seeked", playPreview, { once: true });
-      video.currentTime = item.start;
-    } else {
-      playPreview();
-    }
-  }, { once: true });
+  if (preview.kind !== "hls") {
+    video.addEventListener("loadedmetadata", () => {
+      if (activePreview !== item || !Number.isFinite(video.duration)) return;
+      item.start = Math.min(item.start, Math.max(0, video.duration - .1));
+      item.end = Math.min(
+        video.duration,
+        Math.max(item.start + .25, item.end)
+      );
+      layoutActivePreview();
+      if (item.start > .01) {
+        video.addEventListener("seeked", playPreview, { once: true });
+        video.currentTime = item.start;
+      } else {
+        playPreview();
+      }
+    }, { once: true });
+  }
   video.addEventListener("playing", () => {
     if (activePreview !== item) return;
     card.classList.remove("preview-loading");
@@ -219,8 +346,11 @@ function startPreview(card, preview) {
     item.resizeObserver.observe(host);
   }
   host.append(video);
-  video.src = preview.url;
-  video.load();
+  if (preview.kind === "hls") startHlsPreview(item);
+  else {
+    video.src = preview.url;
+    video.load();
+  }
 }
 
 function queuePreview(card, preview) {

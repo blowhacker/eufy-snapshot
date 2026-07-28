@@ -289,7 +289,40 @@ class DetectionWallCameraTests(unittest.TestCase):
             },
         )
 
-    def test_omits_preview_for_provisional_or_unusable_event(self) -> None:
+    def test_exposes_hls_preview_for_provisional_event_in_live_window(self) -> None:
+        provisional = _event(
+            18,
+            100.0,
+            "person",
+            provisional=True,
+            seg_path="front/segment.mp4",
+            boxes=[{"cls": "person", "x1": 0.2, "y1": 0.2, "x2": 0.4, "y2": 0.5}],
+        )
+
+        preview = _detection_wall_preview(
+            provisional,
+            "person",
+            {"start_ts": 95.0, "end_ts": 110.0},
+        )
+
+        self.assertEqual(
+            preview,
+            {
+                "kind": "hls",
+                "url": "/video/live/front/live.m3u8",
+                "source_id": "front",
+                "start_ts": 99.0,
+                "end_ts": 104.0,
+                "box": {
+                    "x1": 0.2,
+                    "y1": 0.2,
+                    "x2": 0.4,
+                    "y2": 0.5,
+                },
+            },
+        )
+
+    def test_omits_preview_outside_live_window_or_for_unusable_event(self) -> None:
         provisional = _event(
             18,
             100.0,
@@ -307,6 +340,11 @@ class DetectionWallCameraTests(unittest.TestCase):
         )
 
         self.assertIsNone(_detection_wall_preview(provisional, "person"))
+        self.assertIsNone(_detection_wall_preview(
+            provisional,
+            "person",
+            {"start_ts": 101.1, "end_ts": 110.0},
+        ))
         self.assertIsNone(_detection_wall_preview(malformed, "person"))
 
 
