@@ -49,6 +49,7 @@ const canHoverPreview = window.matchMedia(
 let pendingPreview = null;
 let activePreview = null;
 const liveWindowCache = new Map();
+const previewTracker = window.DetectionPreviewTrack;
 
 const moreObserver = "IntersectionObserver" in window
   ? new IntersectionObserver(entries => {
@@ -60,7 +61,13 @@ const moreObserver = "IntersectionObserver" in window
     }, { rootMargin: "320px 0px" })
   : null;
 
-function previewCrop(box, frameWidth, frameHeight, aspect = 4 / 3) {
+function previewCrop(
+  box,
+  frameWidth,
+  frameHeight,
+  aspect = 4 / 3,
+  fixedSize = null
+) {
   const x1 = Math.max(0, Math.min(1, Number(box.x1))) * frameWidth;
   const y1 = Math.max(0, Math.min(1, Number(box.y1))) * frameHeight;
   const x2 = Math.max(0, Math.min(1, Number(box.x2))) * frameWidth;
@@ -72,17 +79,24 @@ function previewCrop(box, frameWidth, frameHeight, aspect = 4 / 3) {
   const boxHeight = y2 - y1;
   const centerX = (x1 + x2) / 2;
   const centerY = (y1 + y2) / 2;
-  const padding = Math.max(24, Math.max(boxWidth, boxHeight) * .45);
-  let cropWidth = boxWidth + padding * 2;
-  let cropHeight = boxHeight + padding * 2;
-  if (cropWidth / cropHeight < aspect) cropWidth = cropHeight * aspect;
-  else cropHeight = cropWidth / aspect;
-  cropWidth = Math.min(frameWidth, Math.max(96, cropWidth));
-  cropHeight = Math.min(frameHeight, Math.max(72, cropHeight));
-  if (cropWidth / cropHeight < aspect) {
-    cropWidth = Math.min(frameWidth, cropHeight * aspect);
+  let cropWidth;
+  let cropHeight;
+  if (fixedSize) {
+    cropWidth = Number(fixedSize.width) * frameWidth;
+    cropHeight = Number(fixedSize.height) * frameHeight;
   } else {
-    cropHeight = Math.min(frameHeight, cropWidth / aspect);
+    const padding = Math.max(24, Math.max(boxWidth, boxHeight) * .45);
+    cropWidth = boxWidth + padding * 2;
+    cropHeight = boxHeight + padding * 2;
+    if (cropWidth / cropHeight < aspect) cropWidth = cropHeight * aspect;
+    else cropHeight = cropWidth / aspect;
+    cropWidth = Math.min(frameWidth, Math.max(96, cropWidth));
+    cropHeight = Math.min(frameHeight, Math.max(72, cropHeight));
+    if (cropWidth / cropHeight < aspect) {
+      cropWidth = Math.min(frameWidth, cropHeight * aspect);
+    } else {
+      cropHeight = Math.min(frameHeight, cropWidth / aspect);
+    }
   }
   const width = Math.min(frameWidth, Math.max(2, Math.round(cropWidth)));
   const height = Math.min(frameHeight, Math.max(2, Math.round(cropHeight)));
@@ -96,13 +110,32 @@ function previewCrop(box, frameWidth, frameHeight, aspect = 4 / 3) {
 
 function layoutActivePreview() {
   if (!activePreview) return;
-  const { video, host, preview } = activePreview;
+  const item = activePreview;
+  const { video, host, preview } = item;
   const frameWidth = video.videoWidth;
   const frameHeight = video.videoHeight;
   const hostWidth = host.clientWidth;
   const hostHeight = host.clientHeight;
   if (!frameWidth || !frameHeight || !hostWidth || !hostHeight) return;
-  const crop = previewCrop(preview.box, frameWidth, frameHeight);
+  if (!item.cropSize) {
+    const initialCrop = previewCrop(
+      preview.box,
+      frameWidth,
+      frameHeight
+    );
+    if (!initialCrop) return;
+    item.cropSize = {
+      width: initialCrop.width / frameWidth,
+      height: initialCrop.height / frameHeight,
+    };
+  }
+  const crop = previewCrop(
+    item.panBox || preview.box,
+    frameWidth,
+    frameHeight,
+    4 / 3,
+    item.cropSize
+  );
   if (!crop) return;
   const scale = Math.max(hostWidth / crop.width, hostHeight / crop.height);
   video.style.width = `${frameWidth * scale}px`;
@@ -113,6 +146,85 @@ function layoutActivePreview() {
   video.style.top = `${
     -crop.y * scale + (hostHeight - crop.height * scale) / 2
   }px`;
+}
+
+function previewAbsoluteTime(item, mediaTime = item.video.currentTime) {
+  const startTs = Number(item.timelineStartTs);
+  const start = Number(item.start);
+  const current = Number(mediaTime);
+  if (![startTs, start, current].every(Number.isFinite)) return null;
+  return startTs + current - start;
+}
+
+function updatePreviewPan(item, mediaTime) {
+  if (activePreview !== item || !item.track) return;
+  const ts = previewAbsoluteTime(item, mediaTime);
+  const box = previewTracker?.sampleTrack(item.track, ts);
+  if (!box) return;
+  item.panBox = box;
+  layoutActivePreview();
+}
+
+function schedulePreviewPan(item) {
+  if (activePreview !== item || item.panFrame != null) return;
+  if ("requestVideoFrameCallback" in item.video) {
+    item.panFrameKind = "video";
+    item.panFrame = item.video.requestVideoFrameCallback((_, metadata) => {
+      item.panFrame = null;
+      updatePreviewPan(item, metadata.mediaTime);
+      schedulePreviewPan(item);
+    });
+  } else {
+    item.panFrameKind = "animation";
+    item.panFrame = requestAnimationFrame(() => {
+      item.panFrame = null;
+      updatePreviewPan(item, item.video.currentTime);
+      schedulePreviewPan(item);
+    });
+  }
+}
+
+async function loadPreviewTrack(item, refreshesLeft = 0) {
+  const preview = item.trackingPreview;
+  if (
+    activePreview !== item
+    || !previewTracker
+    || !preview?.source_id
+    || !preview?.class
+    || !Number.isFinite(Number(preview.start_ts))
+    || !Number.isFinite(Number(preview.end_ts))
+  ) return;
+  item.trackAbort?.abort();
+  const abort = new AbortController();
+  item.trackAbort = abort;
+  const params = new URLSearchParams({
+    source: preview.source_id,
+    since: String(Math.floor(Number(preview.start_ts) - 1)),
+    until: String(Math.ceil(Number(preview.end_ts) + 1)),
+  });
+  const data = await fetch(`/api/video/overlays?${params}`, {
+    cache: "no-store",
+    signal: abort.signal,
+  })
+    .then(response => response.ok ? response.json() : null)
+    .catch(() => null);
+  if (activePreview !== item || abort.signal.aborted) return;
+  const tracks = previewTracker.buildTracks(
+    data?.detections || [],
+    preview.class
+  );
+  item.track = previewTracker.selectTrack(
+    tracks,
+    Number(preview.event_ts),
+    preview.box
+  );
+  updatePreviewPan(item, item.video.currentTime);
+  if (refreshesLeft > 0) {
+    item.trackRefreshTimer = setTimeout(
+      () => loadPreviewTrack(item, refreshesLeft - 1),
+      1000
+    );
+  }
 }
 
 function cancelPendingPreview(card = null) {
@@ -180,8 +292,23 @@ function liveSeekTarget(video, window, ts) {
 function stopPreview(card = null, failed = false) {
   cancelPendingPreview(card);
   if (!activePreview || (card && activePreview.card !== card)) return;
-  const { card: activeCard, video, resizeObserver, hls } = activePreview;
+  const {
+    card: activeCard,
+    video,
+    resizeObserver,
+    hls,
+    panFrame,
+    panFrameKind,
+    trackAbort,
+    trackRefreshTimer,
+  } = activePreview;
   activePreview = null;
+  clearTimeout(trackRefreshTimer);
+  trackAbort?.abort();
+  if (panFrame != null) {
+    if (panFrameKind === "video") video.cancelVideoFrameCallback?.(panFrame);
+    else cancelAnimationFrame(panFrame);
+  }
   resizeObserver?.disconnect();
   hls?.destroy();
   activeCard.classList.remove("preview-loading", "preview-playing");
@@ -200,6 +327,7 @@ function startMp4Preview(item, preview) {
   item.preview = preview;
   item.start = Math.max(0, Number(preview.start) || 0);
   item.end = Math.max(0, Number(preview.end) || 0);
+  const requestedStart = item.start;
   video.addEventListener("loadedmetadata", () => {
     if (
       activePreview !== item
@@ -211,6 +339,8 @@ function startMp4Preview(item, preview) {
       video.duration,
       Math.max(item.start + .25, item.end)
     );
+    item.timelineStartTs = Number(preview.start_ts)
+      + (item.start - requestedStart);
     layoutActivePreview();
     const play = () => {
       if (activePreview === item && item.mode === "mp4") {
@@ -280,6 +410,11 @@ async function fallbackToRecordedPreview(item) {
   );
   startMp4Preview(item, {
     url: resolved.url,
+    source_id: preview.source_id,
+    class: preview.class,
+    event_ts: eventTs,
+    start_ts: desiredStartTs,
+    end_ts: desiredEndTs,
     start,
     end,
     box: preview.box,
@@ -309,6 +444,7 @@ async function startHlsPreview(item) {
     if (activePreview !== item || item.mode !== "hls") return;
     item.start = liveSeekTarget(video, window, startTs);
     item.end = item.start + (endTs - startTs);
+    item.timelineStartTs = startTs;
     if (video.seekable?.length) {
       const seekableEnd = video.seekable.end(video.seekable.length - 1);
       item.end = Math.min(item.end, seekableEnd);
@@ -391,6 +527,15 @@ function startPreview(card, preview) {
     hlsPreview: preview.kind === "hls" ? preview : null,
     fallbackStarted: false,
     mode: preview.kind === "hls" ? "hls" : "mp4",
+    trackingPreview: preview,
+    timelineStartTs: Number(preview.start_ts),
+    track: null,
+    trackAbort: null,
+    trackRefreshTimer: null,
+    panBox: preview.box,
+    cropSize: null,
+    panFrame: null,
+    panFrameKind: null,
   };
   activePreview = item;
 
@@ -426,6 +571,8 @@ function startPreview(card, preview) {
     item.resizeObserver.observe(host);
   }
   host.append(video);
+  schedulePreviewPan(item);
+  loadPreviewTrack(item, preview.kind === "hls" ? 2 : 0);
   if (preview.kind === "hls") startHlsPreview(item);
   else startMp4Preview(item, preview);
 }

@@ -278,6 +278,11 @@ class DetectionWallCameraTests(unittest.TestCase):
             preview,
             {
                 "url": "/video/files/front/segment%20one.mp4",
+                "source_id": "front",
+                "class": "person",
+                "event_ts": 100.0,
+                "start_ts": 99.0,
+                "end_ts": 105.0,
                 "start": 5.0,
                 "end": 11.0,
                 "box": {
@@ -311,6 +316,7 @@ class DetectionWallCameraTests(unittest.TestCase):
                 "kind": "hls",
                 "url": "/video/live/front/live.m3u8",
                 "source_id": "front",
+                "class": "person",
                 "event_ts": 100.0,
                 "start_ts": 99.0,
                 "end_ts": 104.0,

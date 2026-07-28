@@ -314,6 +314,7 @@ def _detection_wall_preview(
                 f"/video/live/{quote(source_id, safe='')}/live.m3u8"
             ),
             "source_id": source_id,
+            "class": cls,
             "event_ts": round(event_ts, 3),
             "start_ts": round(start_ts, 3),
             "end_ts": round(end_ts, 3),
@@ -321,12 +322,24 @@ def _detection_wall_preview(
         }
 
     seg_path = str(event.get("seg_path") or "")
+    source_id = str(event.get("source_id") or "")
     if not seg_path or not seg_path.lower().endswith(".mp4"):
+        return None
+    try:
+        event_ts = float(event.get("abs_ts"))
+    except (TypeError, ValueError):
+        return None
+    if not source_id or not math.isfinite(event_ts):
         return None
     start = max(0.0, start_off - 1.0)
     end = min(start + 8.0, max(start + 3.0, end_off + 1.0))
     return {
         "url": f"/video/files/{quote(seg_path, safe='/')}",
+        "source_id": source_id,
+        "class": cls,
+        "event_ts": round(event_ts, 3),
+        "start_ts": round(event_ts - (start_off - start), 3),
+        "end_ts": round(event_ts + (end - start_off), 3),
         "start": round(start, 3),
         "end": round(end, 3),
         "box": clean_box,

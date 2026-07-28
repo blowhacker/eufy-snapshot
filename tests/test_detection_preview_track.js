@@ -1,0 +1,45 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+
+const {
+  buildTracks,
+  selectTrack,
+  sampleTrack,
+} = require("../src/wanyard/static/detection-preview-track.js");
+
+function box(cls, centerX, centerY = .5) {
+  return {
+    cls,
+    x1: centerX - .02,
+    y1: centerY - .05,
+    x2: centerX + .02,
+    y2: centerY + .05,
+  };
+}
+
+test("tracks and interpolates the event subject without switching people", () => {
+  const detections = [
+    { abs_ts: 10, boxes: [box("person", .10), box("person", .80)] },
+    { abs_ts: 11, boxes: [box("person", .20), box("person", .79)] },
+    { abs_ts: 12, boxes: [box("person", .30), box("person", .78)] },
+    { abs_ts: 13, boxes: [box("person", .40), box("person", .77)] },
+  ];
+  const tracks = buildTracks(detections, "person");
+  const track = selectTrack(tracks, 11, box("person", .20));
+  const sampled = sampleTrack(track, 12.5);
+
+  assert.ok(track);
+  assert.equal(track.points.length, 4);
+  assert.ok(Math.abs((sampled.x1 + sampled.x2) / 2 - .35) < .000001);
+});
+
+test("filters other classes and drops a stale pan target", () => {
+  const tracks = buildTracks([
+    { abs_ts: 20, boxes: [box("dog", .2), box("person", .6)] },
+  ], "person");
+  const track = selectTrack(tracks, 20, box("person", .6));
+
+  assert.equal(tracks.length, 1);
+  assert.equal(sampleTrack(track, 20.5).cls, "person");
+  assert.equal(sampleTrack(track, 21.1), null);
+});
