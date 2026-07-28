@@ -47,12 +47,34 @@ LOG = logging.getLogger(__name__)
 
 _THUMB_W  = 160
 _IMG_CACHE = "public, max-age=604800, immutable"
-_GZIP_SKIP_PREFIXES = ("/video/live/", "/video/native-live/")
+_GZIP_SKIP_PREFIXES = (
+    "/video/live/",
+    "/video/native-live/",
+    "/api/thumb",
+    "/api/video/event-thumb/",
+    "/api/video/live-thumb",
+)
 # Already-compressed media: gzip gains nothing, burns CPU per request, and a
 # gzip+chunked full-file response breaks the browser's byte-range strategy
 # for <video> (Content-Length gone, 200 instead of clean 206 semantics) —
 # scrubbing needs cheap ranges.
 _GZIP_SKIP_SUFFIXES = (".mp4", ".m4s", ".ts", ".jpg", ".jpeg")
+_EVENT_THUMB_MAX_W = 640
+
+
+def _gzip_path_is_excluded(
+    path: str,
+    prefixes: tuple[str, ...],
+    suffixes: tuple[str, ...],
+) -> bool:
+    return (
+        any(path.startswith(prefix) for prefix in prefixes)
+        or path.endswith(suffixes)
+        or (
+            path.startswith("/api/notifications/")
+            and path.endswith("/thumb")
+        )
+    )
 
 
 class _PathAwareGZipMiddleware:
@@ -66,8 +88,9 @@ class _PathAwareGZipMiddleware:
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":
             path = scope.get("path", "").lower()
-            if (any(path.startswith(prefix) for prefix in self.skip_prefixes)
-                    or path.endswith(self.skip_suffixes)):
+            if _gzip_path_is_excluded(
+                path, self.skip_prefixes, self.skip_suffixes
+            ):
                 await self.app(scope, receive, send)
                 return
         await self.gzip_app(scope, receive, send)
@@ -575,8 +598,7 @@ def _extract_video_thumb(seg_path: Path, cache_file: Path, t: float,
             x, y, w, h = crop
             vf = (
                 f"crop={w}:{h}:{x}:{y},"
-                "scale=176:132:force_original_aspect_ratio=increase,"
-                "crop=176:132"
+                f"scale='min({_EVENT_THUMB_MAX_W},iw)':-2"
             )
 
     cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -587,7 +609,7 @@ def _extract_video_thumb(seg_path: Path, cache_file: Path, t: float,
         ]
         if vf:
             cmd += ["-vf", vf]
-        cmd += ["-frames:v", "1", "-q:v", "5", str(cache_file)]
+        cmd += ["-frames:v", "1", "-q:v", "3", str(cache_file)]
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=10, check=False)
         except (subprocess.TimeoutExpired, OSError):
@@ -1131,9 +1153,9 @@ def make_app(
             ch if ch.isalnum() or ch in {"-", "_"} else "_"
             for ch in event_id_raw
         )
-        # v2: v1 crops were cut with a classless box pick (car instead of the
-        # notified bird) and are cached immutable — new key invalidates them.
-        cache_file = cache_dir / f"event_{safe_event_id}_crop_v2.jpg"
+        # v3 raises the old 176×132 ceiling and JPEG quality. The versioned
+        # key invalidates already-cached low-resolution crops.
+        cache_file = cache_dir / f"event_{safe_event_id}_crop_v3.jpg"
         if not cache_file.exists():
             ok = await asyncio.to_thread(_extract_video_thumb, seg_path, cache_file, t, box)
             if not ok:

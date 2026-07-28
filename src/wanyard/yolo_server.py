@@ -84,9 +84,9 @@ class YoloSocketServer(socketserver.ThreadingUnixStreamServer):
 # ── Per-class thumb crop (matches MP4 _select_event_box + _crop_from_box) ─────
 
 def _crop_thumb(frame, cls_boxes: list, cls: str,
-                thumb_w: int = 176, thumb_h: int = 132,
+                thumb_w: int = 640, thumb_h: int = 480,
                 aspect: float = 4 / 3) -> bytes | None:
-    """Crop the frame around the best box for this class, resize to thumb_w×thumb_h."""
+    """Crop around the best box, shrinking only when it exceeds the thumb cap."""
     import cv2
     if not cls_boxes:
         return None
@@ -131,8 +131,19 @@ def _crop_thumb(frame, cls_boxes: list, cls: str,
     cropped = frame[y:y+rh, x:x+rw]
     if cropped.size == 0:
         return None
-    small = cv2.resize(cropped, (thumb_w, thumb_h))
-    ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if cropped.shape[1] > thumb_w or cropped.shape[0] > thumb_h:
+        scale = min(
+            thumb_w / cropped.shape[1],
+            thumb_h / cropped.shape[0],
+        )
+        output_size = (
+            max(2, round(cropped.shape[1] * scale)),
+            max(2, round(cropped.shape[0] * scale)),
+        )
+        small = cv2.resize(cropped, output_size, interpolation=cv2.INTER_AREA)
+    else:
+        small = cropped
+    ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else None
 
 

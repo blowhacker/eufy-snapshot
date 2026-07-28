@@ -16,6 +16,7 @@ from wanyard.web import (
     _detection_wall_all,
     _detection_wall_camera,
     _detection_wall_preview,
+    _gzip_path_is_excluded,
 )
 from wanyard.video import VideoSegmentDB
 
@@ -354,6 +355,31 @@ class DetectionWallCameraTests(unittest.TestCase):
             {"start_ts": 101.1, "end_ts": 110.0},
         ))
         self.assertIsNone(_detection_wall_preview(malformed, "person"))
+
+    def test_image_api_paths_bypass_gzip(self) -> None:
+        prefixes = (
+            "/video/live/",
+            "/api/thumb",
+            "/api/video/event-thumb/",
+            "/api/video/live-thumb",
+        )
+        suffixes = (".jpg", ".jpeg")
+
+        self.assertTrue(_gzip_path_is_excluded(
+            "/api/video/event-thumb/p%3a1%3aperson%3a2.0",
+            prefixes,
+            suffixes,
+        ))
+        self.assertTrue(_gzip_path_is_excluded(
+            "/api/notifications/42/thumb",
+            prefixes,
+            suffixes,
+        ))
+        self.assertFalse(_gzip_path_is_excluded(
+            "/api/detections/wall",
+            prefixes,
+            suffixes,
+        ))
 
 
 class DetectionWallDatabaseTests(unittest.TestCase):
