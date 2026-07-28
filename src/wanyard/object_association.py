@@ -15,6 +15,37 @@ _TRACK_HIGH_CONFIDENCE = 0.35
 _TRACK_LOW_CONFIDENCE = 0.10
 _TRACK_BUFFER_SECONDS = 5.0
 _TRACK_RESET_GRACE_SECONDS = 1.0
+# ByteTrack associates with bounding-box overlap.  At the deliberately sparse
+# 2fps detector rate, a narrow walking person can move an entire box width
+# between samples and never establish a track.  Dilate only the geometry fed to
+# the tracker; the original YOLO boxes are still stored and displayed.
+_ASSOCIATION_BOX_SCALE = 2.5
+
+
+class _AssociationDetections:
+    """Minimal Ultralytics-results facade with association-only box padding."""
+
+    def __init__(self, cls, conf, xywh) -> None:
+        self.cls = np.asarray(cls)
+        self.conf = np.asarray(conf)
+        self.xywh = np.asarray(xywh).copy()
+
+    @classmethod
+    def from_detections(cls, detections) -> "_AssociationDetections":
+        xywh = np.asarray(detections.xywh).copy()
+        if len(xywh):
+            xywh[:, 2:4] *= _ASSOCIATION_BOX_SCALE
+        return cls(detections.cls, detections.conf, xywh)
+
+    def __len__(self) -> int:
+        return len(self.cls)
+
+    def __getitem__(self, indices) -> "_AssociationDetections":
+        return _AssociationDetections(
+            self.cls[indices],
+            self.conf[indices],
+            self.xywh[indices],
+        )
 
 
 class ByteTrackAssociator:
@@ -50,8 +81,10 @@ class ByteTrackAssociator:
             track_low_thresh=_TRACK_LOW_CONFIDENCE,
             new_track_thresh=_TRACK_HIGH_CONFIDENCE,
             track_buffer=max(1, round(self.fps * _TRACK_BUFFER_SECONDS)),
-            match_thresh=0.8,
-            fuse_score=True,
+            match_thresh=0.9,
+            # Score fusion makes the fixed 0.7 "unconfirmed track" gate reject
+            # moderate-confidence people even when their padded boxes overlap.
+            fuse_score=False,
         )
         return factory(args)
 
@@ -90,7 +123,12 @@ class ByteTrackAssociator:
         if detections is None:
             return self._fallback(boxes)
         try:
-            class_ids = np.asarray(detections.cls, dtype=np.int64)
+            tracking_detections = _AssociationDetections.from_detections(
+                detections
+            )
+            class_ids = np.asarray(
+                tracking_detections.cls, dtype=np.int64
+            )
         except Exception:
             LOG.exception("ByteTrack %s received unusable detections", self.source_id)
             return self._fallback(boxes)
@@ -103,7 +141,7 @@ class ByteTrackAssociator:
                 tracker = self._new_tracker()
                 self._trackers[class_id] = tracker
             indices = np.flatnonzero(class_ids == class_id)
-            subset = detections[indices]
+            subset = tracking_detections[indices]
             try:
                 tracker.update(subset)
             except Exception:

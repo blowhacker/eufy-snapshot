@@ -16,14 +16,27 @@ from wanyard.object_association import ByteTrackAssociator
 
 
 class FakeDetections:
-    def __init__(self, classes):
+    def __init__(self, classes, xywh=None, confidence=None):
         self.cls = np.asarray(classes, dtype=np.float32)
+        count = len(self.cls)
+        self.conf = np.asarray(
+            confidence if confidence is not None else [0.8] * count,
+            dtype=np.float32,
+        )
+        self.xywh = np.asarray(
+            xywh if xywh is not None else [[10.0, 10.0, 4.0, 8.0]] * count,
+            dtype=np.float32,
+        ).reshape((-1, 4))
 
     def __len__(self):
         return len(self.cls)
 
     def __getitem__(self, indices):
-        return FakeDetections(self.cls[indices])
+        return FakeDetections(
+            self.cls[indices],
+            self.xywh[indices],
+            self.conf[indices],
+        )
 
 
 class FakeTrack:
@@ -34,12 +47,15 @@ class FakeTrack:
 
 
 class FakeTracker:
-    def __init__(self, _args):
+    def __init__(self, args):
+        self.args = args
         self.frame_id = 0
         self.tracked_stracks = []
+        self.received_xywh = []
 
     def update(self, detections):
         self.frame_id += 1
+        self.received_xywh.append(detections.xywh.copy())
         if len(detections):
             if not self.tracked_stracks:
                 self.tracked_stracks = [FakeTrack(1)]
@@ -103,6 +119,24 @@ class ByteTrackAssociatorTests(unittest.TestCase):
         )
 
         self.assertNotEqual(first[0]["track_id"], after_gap[0]["track_id"])
+
+    def test_pads_only_tracker_geometry_for_sparse_frames(self) -> None:
+        associator = self.make_associator()
+        original = [box("person")]
+        associator.annotate(
+            FakeDetections([0], [[10.0, 20.0, 4.0, 8.0]]),
+            original,
+            abs_ts=100.0,
+        )
+
+        tracker = associator._trackers[0]
+        np.testing.assert_allclose(
+            tracker.received_xywh[0],
+            [[10.0, 20.0, 10.0, 20.0]],
+        )
+        self.assertEqual(original[0]["x1"], 0.1)
+        self.assertFalse(tracker.args.fuse_score)
+        self.assertEqual(tracker.args.match_thresh, 0.9)
 
     def test_fallback_keeps_only_normal_confidence_boxes(self) -> None:
         associator = self.make_associator()

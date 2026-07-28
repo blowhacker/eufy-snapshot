@@ -24,6 +24,7 @@ from .detection_settings import (
     DEFAULT_DETECTION_CLASSES,
     configured_detection_class_ids,
 )
+from .object_association import ByteTrackAssociator
 
 LOG = logging.getLogger(__name__)
 
@@ -2048,7 +2049,7 @@ class VideoSegmentDB:
         }
 
 
-_CONF_THRESHOLD = 0.35
+_BACKFILL_DETECTION_FPS = 2.0
 # Backward-compatible internal names. The catalog is complete; the actual
 # inference whitelist comes from the persisted Settings selection.
 _CCTV_CLASSES = COCO_CLASSES
@@ -2119,6 +2120,10 @@ def _yolo_tag_video(
         return 0
 
     detections: list[dict] = []
+    associator = ByteTrackAssociator(
+        str(seg_row.get("source_id") or "backfill"),
+        _BACKFILL_DETECTION_FPS,
+    )
     if class_ids is None:
         class_ids = configured_detection_class_ids(db)
     next_sample_pts: float | None = None
@@ -2129,7 +2134,9 @@ def _yolo_tag_video(
                 continue
             if next_sample_pts is not None and fpts < next_sample_pts:
                 continue
-            next_sample_pts = fpts + 1.0   # ~1fps on the container timeline
+            next_sample_pts = (
+                fpts + (1.0 / _BACKFILL_DETECTION_FPS)
+            )
 
             abs_ts, crc_ok = sei.decode_frame(frame)
             if not crc_ok or abs_ts is None:
@@ -2147,15 +2154,36 @@ def _yolo_tag_video(
                 if predict_lock is None:
                     results = model.predict(
                         frame_bgr, classes=class_ids,
-                        conf=_CONF_THRESHOLD, verbose=False,
+                        conf=associator.low_confidence, verbose=False,
                     )
                 else:
                     with predict_lock:
                         results = model.predict(
                             frame_bgr, classes=class_ids,
-                            conf=_CONF_THRESHOLD, verbose=False,
+                            conf=associator.low_confidence, verbose=False,
                         )
-                has_human, conf, boxes = _parse_results(results)
+                _, _, boxes = _parse_results(results)
+                result_boxes = (
+                    results[0].boxes.cpu().numpy()
+                    if results and results[0].boxes is not None
+                    else None
+                )
+                boxes = associator.annotate(
+                    result_boxes,
+                    boxes,
+                    abs_ts=abs_ts,
+                )
+                has_human = any(
+                    box["cls"] == "person" for box in boxes
+                )
+                conf = max(
+                    (
+                        float(box["conf"])
+                        for box in boxes
+                        if box["cls"] == "person"
+                    ),
+                    default=0.0,
+                )
                 classes = list({b["cls"] for b in boxes}) if boxes else []
                 detections.append({
                     "abs_ts": abs_ts,
