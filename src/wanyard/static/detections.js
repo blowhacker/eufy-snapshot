@@ -872,7 +872,7 @@ function preloadNextFeedCard(card) {
   }
   if (preview.kind === "hls") {
     clearFeedPreload();
-    loadHlsJs().catch(() => {});
+    if (!shouldUseNativeHls()) loadHlsJs().catch(() => {});
     return;
   }
   if (
@@ -1254,6 +1254,7 @@ function makeCard(event, cameraName, showCamera = false) {
   link.className = "dw-card";
   link.href = event.target_url;
   link._preview = event.preview;
+  link._event = event;
   link.dataset.eventId = String(event.id);
   link.setAttribute(
     "aria-label",
@@ -1400,7 +1401,10 @@ function makeCameraSection(camera) {
   return section;
 }
 
-function renderCameras() {
+function renderCameras({ preserveFeedPosition = false } = {}) {
+  const preservedEvent = preserveFeedPosition && state.view === "feed"
+    ? document.querySelector(".dw-card.feed-current")?._event
+    : null;
   stopPreview();
   stopFeedObserver();
   moreObserver?.disconnect();
@@ -1425,6 +1429,17 @@ function renderCameras() {
     return;
   }
   for (const camera of cameras) dom.main.append(makeCameraSection(camera));
+  if (preservedEvent) {
+    const target = [...dom.main.querySelectorAll(".dw-card")].find(card =>
+      String(card._event?.id) === String(preservedEvent.id)
+      || sameFinalizedEpisode(card._event, preservedEvent)
+    );
+    if (target) {
+      const mainRect = dom.main.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      dom.main.scrollTop += targetRect.top - mainRect.top;
+    }
+  }
   startFeedObserver();
 }
 
@@ -1470,6 +1485,8 @@ async function loadMore(cameraId, wrap, button) {
 }
 
 function renderFailure(error) {
+  stopPreview();
+  stopFeedObserver();
   dom.main.innerHTML = "";
   const empty = dom.emptyTemplate.content.cloneNode(true);
   const root = empty.querySelector(".dw-empty");
@@ -1526,6 +1543,7 @@ function syncRecentCardMetadata(cameraId, events) {
     if (!event) continue;
     card.href = event.target_url;
     card._preview = event.preview;
+    card._event = event;
     const duration = card.querySelector(".dw-duration");
     if (duration) duration.textContent = eventDuration(event);
   }
@@ -1543,12 +1561,13 @@ function scheduleRecentRefresh(delay = RECENT_REFRESH_MS) {
 async function refreshRecent() {
   clearTimeout(state.recentTimer);
   state.recentTimer = null;
+  const previewBlocksRefresh = state.view !== "feed"
+    && Boolean(activePreview || pendingPreview);
   if (
     document.hidden
     || state.loading
     || state.recentLoading
-    || activePreview
-    || pendingPreview
+    || previewBlocksRefresh
   ) {
     scheduleRecentRefresh();
     return;
@@ -1557,10 +1576,11 @@ async function refreshRecent() {
   const request = state.request;
   try {
     const data = await fetchWall({ limit: 8, counts: false });
+    const previewChanged = state.view !== "feed"
+      && Boolean(activePreview || pendingPreview);
     if (
       request !== state.request
-      || activePreview
-      || pendingPreview
+      || previewChanged
     ) return;
     let layoutChanged = false;
     for (const recentCamera of data.cameras || []) {
@@ -1585,7 +1605,9 @@ async function refreshRecent() {
         syncRecentCardMetadata(camera.id, camera.events);
       }
     }
-    if (layoutChanged) renderCameras();
+    if (layoutChanged) {
+      renderCameras({ preserveFeedPosition: state.view === "feed" });
+    }
   } catch {
     // A transient poll failure should not replace a usable wall with an error.
   } finally {
@@ -1598,6 +1620,7 @@ async function loadInitial() {
   clearTimeout(state.recentTimer);
   state.recentTimer = null;
   stopPreview();
+  stopFeedObserver();
   const request = ++state.request;
   state.loading = true;
   dom.refresh.classList.add("loading");
