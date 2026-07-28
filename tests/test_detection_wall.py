@@ -489,13 +489,16 @@ class DetectionWallAllCameraTests(unittest.TestCase):
             first["events"][-1]["display_ts"],
         )
 
-    def test_selected_areas_only_include_their_own_sources(self) -> None:
+    def test_area_selection_is_independent_per_camera(self) -> None:
         db = FakeVideoDB([
             _event(
                 1, 100.0, "person", source_id="front", boxes=[_box(0.1, 0.1)]
             ),
             _event(
                 2, 101.0, "person", source_id="garden", boxes=[_box(0.1, 0.1)]
+            ),
+            _event(
+                3, 102.0, "person", source_id="front", boxes=[_box(0.8, 0.8)]
             ),
         ])
 
@@ -508,12 +511,11 @@ class DetectionWallAllCameraTests(unittest.TestCase):
             polygons_by_source={
                 "front": [_area(0.0, 0.0, 0.3, 0.3)],
             },
-            zone_filter_active=True,
         )
 
         self.assertEqual(
             [(event["source_id"], event["id"]) for event in camera["events"]],
-            [("front", "1")],
+            [("garden", "2"), ("front", "1")],
         )
 
 

@@ -362,16 +362,6 @@ function makeCameraTag(value, label) {
   button.addEventListener("click", () => {
     if (state.camera === value) return;
     state.camera = value;
-    if (value !== "all") {
-      const compatible = new Set(
-        state.availableZones
-          .filter(zone => zone.source_id === value)
-          .map(zone => zone.uid)
-      );
-      state.zones = new Set(
-        [...state.zones].filter(uid => compatible.has(uid))
-      );
-    }
     syncUrl();
     loadInitial();
   });
@@ -386,17 +376,26 @@ function renderCameraTags() {
   }
 }
 
-function makeAreaTag(value, label) {
+function selectedZonesForSource(sourceId) {
+  return new Set(
+    state.availableZones
+      .filter(zone => zone.source_id === sourceId && state.zones.has(zone.uid))
+      .map(zone => zone.uid)
+  );
+}
+
+function makeAreaTag(sourceId, value, label) {
   const button = document.createElement("button");
   button.type = "button";
-  const active = value ? state.zones.has(value) : state.zones.size === 0;
+  const sourceZones = selectedZonesForSource(sourceId);
+  const active = value ? sourceZones.has(value) : sourceZones.size === 0;
   button.className = `dw-tag${active ? " active" : ""}`;
   button.setAttribute("aria-pressed", String(active));
   button.textContent = label;
   button.addEventListener("click", () => {
     if (!value) {
-      if (state.zones.size === 0) return;
-      state.zones.clear();
+      if (sourceZones.size === 0) return;
+      for (const uid of sourceZones) state.zones.delete(uid);
     } else if (state.zones.has(value)) {
       state.zones.delete(value);
     } else {
@@ -410,16 +409,35 @@ function makeAreaTag(value, label) {
 
 function renderAreaTags() {
   dom.areas.innerHTML = "";
-  dom.areasFilter.hidden = state.availableZones.length === 0;
+  const visibleSources = state.camera === "all"
+    ? state.sources
+    : state.sources.filter(source => source.id === state.camera);
+  const groups = visibleSources
+    .map(source => ({
+      source,
+      zones: state.availableZones.filter(zone => zone.source_id === source.id),
+    }))
+    .filter(group => group.zones.length);
+  dom.areasFilter.hidden = groups.length === 0;
   if (dom.areasFilter.hidden) return;
-  dom.areas.append(makeAreaTag("", "Whole frame"));
-  const showCamera = state.camera === "all";
-  for (const zone of state.availableZones) {
-    const areaName = zone.name || "Activity area";
-    const label = showCamera
-      ? `${zone.source_name || zone.source_id} · ${areaName}`
-      : areaName;
-    dom.areas.append(makeAreaTag(zone.uid, label));
+  for (const { source, zones } of groups) {
+    const group = document.createElement("div");
+    group.className = "dw-area-group";
+    group.setAttribute("role", "group");
+    group.setAttribute(
+      "aria-label",
+      `${source.name || source.id} detection area`
+    );
+    const camera = document.createElement("span");
+    camera.className = "dw-area-camera";
+    camera.textContent = source.name || source.id;
+    group.append(camera, makeAreaTag(source.id, "", "All"));
+    for (const zone of zones) {
+      group.append(
+        makeAreaTag(source.id, zone.uid, zone.name || "Activity area")
+      );
+    }
+    dom.areas.append(group);
   }
 }
 

@@ -290,7 +290,6 @@ def _detection_wall_all(
     limit: int,
     before: float | None,
     polygons_by_source: dict[str, list[list[dict]]] | None = None,
-    zone_filter_active: bool = False,
 ) -> dict:
     """Interleave source-local pages into one newest-first camera feed."""
     source_pages = [
@@ -301,7 +300,7 @@ def _detection_wall_all(
             limit + 1,
             before,
             (polygons_by_source or {}).get(source["id"]),
-            zone_filter_active,
+            source["id"] in (polygons_by_source or {}),
         )
         for source in sources
     ]
@@ -845,8 +844,8 @@ def make_app(
         limit = min(60, max(8, limit))
 
         def _payload() -> dict:
-            selected_source_ids = {
-                source["id"] for source in selected_sources
+            all_source_ids = {
+                source["id"] for source in all_sources
             }
             source_names = {
                 source["id"]: source.get("name") or source["id"]
@@ -858,7 +857,7 @@ def make_app(
                 if (
                     zone.get("enabled", True)
                     and zone.get("uid")
-                    and zone.get("source_id") in selected_source_ids
+                    and zone.get("source_id") in all_source_ids
                     and isinstance(zone.get("polygon"), list)
                     and len(zone["polygon"]) >= 3
                 )
@@ -869,7 +868,6 @@ def make_app(
             selected_zone_uids = [
                 uid for uid in requested_zone_uids if uid in zones_by_uid
             ]
-            zone_filter_active = bool(selected_zone_uids)
             polygons_by_source: dict[str, list[list[dict]]] = {}
             for uid in selected_zone_uids:
                 zone = zones_by_uid[uid]
@@ -881,11 +879,9 @@ def make_app(
             # selection. Pagination does not repeat the aggregation.
             counts: dict[str, int] = {}
             if before is None:
-                if zone_filter_active:
+                if selected_zone_uids:
                     for source in selected_sources:
                         polygons = polygons_by_source.get(source["id"])
-                        if not polygons:
-                            continue
                         for cls, count in video_db.detection_class_counts(
                             source["id"], polygons, True
                         ).items():
@@ -904,7 +900,6 @@ def make_app(
                     limit,
                     before,
                     polygons_by_source,
-                    zone_filter_active,
                 )]
                 if source_id == "all"
                 else [_detection_wall_camera(
@@ -914,7 +909,7 @@ def make_app(
                     limit,
                     before,
                     polygons_by_source.get(selected_sources[0]["id"]),
-                    zone_filter_active,
+                    selected_sources[0]["id"] in polygons_by_source,
                 )]
             )
             return {

@@ -105,6 +105,25 @@ button, a { -webkit-tap-highlight-color: transparent; }
   scrollbar-width: none;
 }
 .dw-tags::-webkit-scrollbar { display: none; }
+.dw-area-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.dw-area-group + .dw-area-group {
+  margin-left: 4px;
+  padding-left: 10px;
+  border-left: 1px solid var(--line-soft);
+}
+.dw-area-camera {
+  max-width: 140px;
+  overflow: hidden;
+  color: var(--txt-3);
+  font: 500 10px/1 var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .dw-tag {
   display: inline-flex;
   align-items: center;
