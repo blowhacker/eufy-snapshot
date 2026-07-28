@@ -932,6 +932,7 @@ function activateVisibleFeedCard() {
     bestCard.classList.add("feed-current");
   }
   feedKeyboardCard = bestCard;
+  syncFeedCardUrl(bestCard);
   if (activePreview?.card === bestCard || pendingPreview?.card === bestCard) {
     preloadNextFeedCard(bestCard);
     return;
@@ -1060,7 +1061,7 @@ function selectedZones() {
 }
 
 function syncUrl({ replace = false } = {}) {
-  const url = new URL(location.href);
+  const url = new URL("/detections", location.origin);
   if (state.camera && state.camera !== "all") {
     url.searchParams.set("camera", state.camera);
   } else {
@@ -1076,6 +1077,17 @@ function syncUrl({ replace = false } = {}) {
   else url.searchParams.delete("view");
   history[replace ? "replaceState" : "pushState"](
     { detectionWall: true },
+    "",
+    url
+  );
+}
+
+function syncFeedCardUrl(card) {
+  if (state.view !== "feed" || !card?.href) return;
+  const url = new URL(card.href, location.origin);
+  if (url.origin !== location.origin || url.href === location.href) return;
+  history.replaceState(
+    { detectionFeedPreview: true },
     "",
     url
   );
@@ -1689,11 +1701,19 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 window.addEventListener("popstate", () => {
+  if (location.pathname !== "/detections") {
+    location.reload();
+    return;
+  }
   restoreFiltersFromUrl();
   loadInitial();
 });
 window.addEventListener("pageshow", event => {
   if (event.persisted) {
+    if (location.pathname !== "/detections") {
+      location.reload();
+      return;
+    }
     restoreFiltersFromUrl();
     loadInitial();
   }
