@@ -1616,12 +1616,89 @@ function syncRecentCardMetadata(cameraId, events) {
   for (const card of section.querySelectorAll(".dw-card")) {
     const event = byId.get(card.dataset.eventId);
     if (!event) continue;
+    syncCardMetadata(card, event);
+  }
+}
+
+function syncCardMetadata(card, event) {
     card.href = event.target_url;
     card._preview = event.preview;
     card._event = event;
+    card.dataset.eventId = String(event.id);
     const duration = card.querySelector(".dw-duration");
     if (duration) duration.textContent = eventDuration(event);
+}
+
+function reconcileFeedCamera(camera) {
+  const section = document.querySelector(
+    `[data-camera-id="${CSS.escape(camera.id)}"]`
+  );
+  const grid = section?.querySelector(".dw-grid");
+  if (!section || !grid) return false;
+
+  const anchor = (
+    activePreview?.card?.isConnected
+      ? activePreview.card
+      : section.querySelector(".dw-card.feed-current")
+  );
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  const existing = [...grid.querySelectorAll(".dw-card")];
+  const unused = new Set(existing);
+  const desired = camera.events.map(event => {
+    let card = existing.find(
+      candidate => (
+        unused.has(candidate)
+        && String(candidate.dataset.eventId) === String(event.id)
+      )
+    );
+    if (!card) {
+      card = existing.find(
+        candidate => (
+          unused.has(candidate)
+          && sameFinalizedEpisode(candidate._event, event)
+        )
+      );
+    }
+    if (card) {
+      unused.delete(card);
+      syncCardMetadata(card, event);
+      return card;
+    }
+    card = makeCard(event, camera.name, camera.id === "all");
+    feedObserver?.observe(card);
+    return card;
+  });
+
+  for (let index = 0; index < desired.length; index += 1) {
+    const card = desired[index];
+    const current = grid.children[index] || null;
+    if (current !== card) grid.insertBefore(card, current);
   }
+  for (const card of unused) {
+    feedObserver?.unobserve(card);
+    feedVisibility.delete(card);
+    if (activePreview?.card === card) stopPreview(card);
+    card.remove();
+  }
+
+  const anchorAfter = anchor?.isConnected
+    ? anchor.getBoundingClientRect().top
+    : null;
+  if (
+    Number.isFinite(anchorTop)
+    && Number.isFinite(anchorAfter)
+  ) {
+    dom.main.scrollTop += anchorAfter - anchorTop;
+  }
+
+  const more = section.querySelector(".dw-more");
+  if (more) {
+    more.hidden = camera.next_before == null;
+    if (more.hidden) moreObserver?.unobserve(more);
+    else moreObserver?.observe(more);
+  }
+  updateCameraMeta(camera);
+  return true;
 }
 
 function scheduleRecentRefresh(delay = RECENT_REFRESH_MS) {
@@ -1681,7 +1758,20 @@ async function refreshRecent() {
       }
     }
     if (layoutChanged) {
-      renderCameras({ preserveFeedPosition: state.view === "feed" });
+      if (state.view === "feed") {
+        const reconciled = [...state.cameras.values()]
+          .every(camera => reconcileFeedCamera(camera));
+        if (!reconciled) renderCameras({ preserveFeedPosition: true });
+        const visible = [...state.cameras.values()]
+          .reduce((sum, camera) => sum + camera.events.length, 0);
+        const cameraCount = state.camera === "all"
+          ? state.sources.length
+          : state.cameras.size;
+        dom.summary.textContent =
+          `${plural(cameraCount, "camera")} · ${plural(visible, "detection")} shown`;
+      } else {
+        renderCameras();
+      }
     }
   } catch {
     // A transient poll failure should not replace a usable wall with an error.
