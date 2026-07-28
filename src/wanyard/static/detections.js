@@ -28,7 +28,8 @@ const dom = {
   areasFilter: document.getElementById("dwAreasFilter"),
   tags: document.getElementById("dwTags"),
   summary: document.getElementById("dwSummary"),
-  viewToggle: document.getElementById("dwViewToggle"),
+  gridView: document.getElementById("dwGridView"),
+  feedView: document.getElementById("dwFeedView"),
   refresh: document.getElementById("dwRefresh"),
   emptyTemplate: document.getElementById("dwEmptyTemplate"),
 };
@@ -996,13 +997,10 @@ function moveFeed(direction) {
 function updateViewMode() {
   const feed = state.view === "feed";
   document.body.classList.toggle("dw-feed-mode", feed);
-  dom.viewToggle.classList.toggle("active", feed);
-  dom.viewToggle.setAttribute("aria-pressed", String(feed));
-  dom.viewToggle.title = feed ? "Use grid view" : "Use feed view";
-  dom.viewToggle.setAttribute(
-    "aria-label",
-    feed ? "Use grid view" : "Use feed view"
-  );
+  dom.gridView.classList.toggle("active", !feed);
+  dom.gridView.setAttribute("aria-pressed", String(!feed));
+  dom.feedView.classList.toggle("active", feed);
+  dom.feedView.setAttribute("aria-pressed", String(feed));
 }
 
 function setView(view, { updateHistory = true } = {}) {
@@ -1654,9 +1652,8 @@ async function loadInitial() {
 }
 
 dom.refresh.addEventListener("click", loadInitial);
-dom.viewToggle.addEventListener("click", () => {
-  setView(state.view === "feed" ? "grid" : "feed");
-});
+dom.gridView.addEventListener("click", () => setView("grid"));
+dom.feedView.addEventListener("click", () => setView("feed"));
 document.addEventListener("keydown", event => {
   if (
     state.view !== "feed"

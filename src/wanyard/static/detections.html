@@ -13,26 +13,29 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/detections.css?v=14">
+    <link rel="stylesheet" href="/detections.css?v=15">
   </head>
   <body>
     <div class="dw-sticky">
       <header class="dw-head">
-        <a class="dw-brand" href="/?view=wall" aria-label="Open live camera wall">
-          <span class="dw-logo"><img src="/assets/favicon.svg" alt=""></span>
-          <span class="dw-title">Detections</span>
-        </a>
+        <div class="dw-brand">
+          <a class="dw-logo" href="/?view=wall" title="Live wall" aria-label="Open live camera wall">
+            <img src="/assets/favicon.svg" alt="">
+          </a>
+          <h1 class="dw-title">Detections</h1>
+        </div>
         <div id="dwSummary" class="dw-summary" aria-live="polite">Loading</div>
-        <nav class="dw-actions" aria-label="Primary">
-          <button id="dwViewToggle" class="dw-icon dw-view-toggle" type="button" title="Use feed view" aria-label="Use feed view" aria-pressed="false">
-            <svg class="dw-view-feed-icon" width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true"><rect x="3.5" y="2" width="10" height="5.2" rx="1" stroke="currentColor" stroke-width="1.25"/><rect x="3.5" y="9.8" width="10" height="5.2" rx="1" stroke="currentColor" stroke-width="1.25"/></svg>
-          </button>
+        <nav class="dw-actions" aria-label="Detection controls">
+          <div class="dw-view-switch" role="group" aria-label="Detection view">
+            <button id="dwGridView" class="dw-view-option active" type="button" aria-pressed="true">Grid</button>
+            <button id="dwFeedView" class="dw-view-option" type="button" aria-pressed="false">
+              <svg width="15" height="15" viewBox="0 0 17 17" fill="none" aria-hidden="true"><rect x="3.5" y="2" width="10" height="5.2" rx="1" stroke="currentColor" stroke-width="1.25"/><rect x="3.5" y="9.8" width="10" height="5.2" rx="1" stroke="currentColor" stroke-width="1.25"/></svg>
+              <span>Feed</span>
+            </button>
+          </div>
           <button id="dwRefresh" class="dw-icon" type="button" title="Refresh detections" aria-label="Refresh detections">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M12.5 5.2A5 5 0 1 0 13 9" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/><path d="M10.1 2.8h2.8v2.8" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
-          <a class="dw-icon" href="/?view=wall" title="Live camera wall" aria-label="Open live camera wall">
-            <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true"><rect x="2" y="2.5" width="5.4" height="4.8" rx=".7" stroke="currentColor" stroke-width="1.25"/><rect x="9.6" y="2.5" width="5.4" height="4.8" rx=".7" stroke="currentColor" stroke-width="1.25"/><rect x="2" y="9.7" width="5.4" height="4.8" rx=".7" stroke="currentColor" stroke-width="1.25"/><rect x="9.6" y="9.7" width="5.4" height="4.8" rx=".7" stroke="currentColor" stroke-width="1.25"/></svg>
-          </a>
           <a class="dw-icon" href="/settings" title="Settings" aria-label="Settings">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M8 2v1.5M8 12.5V14M2 8h1.5M12.5 8H14M3.8 3.8l1 1M11.2 11.2l1 1M3.8 12.2l1-1M11.2 4.8l1-1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
           </a>
@@ -73,6 +76,6 @@
     </template>
 
     <script src="/detection-preview-track.js?v=4"></script>
-    <script src="/detections.js?v=25"></script>
+    <script src="/detections.js?v=26"></script>
   </body>
 </html>
