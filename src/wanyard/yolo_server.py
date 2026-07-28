@@ -23,6 +23,7 @@ LOG = logging.getLogger(__name__)
 
 SOCKET_PATH = os.environ.get("YOLO_SOCKET", "/tmp/yolo.sock")
 _CONFIRMATION_STRATEGY = "yolo1280-crop640-960-v1"
+_DEFAULT_BACKFILL_MAX_AGE_SECONDS = 60 * 60.0
 _CONFIRM_FULL_IMGSZ = 1280
 _CONFIRM_CROP_IMGSZ = (640, 960)
 _CONFIRM_MIN_CONF = 0.25
@@ -417,20 +418,70 @@ def _response_box(box: dict | None) -> dict | None:
 
 # ── Backfill loop ──────────────────────────────────────────────────────────────
 
+def _backfill_max_age_seconds() -> float:
+    raw = os.environ.get(
+        "WANYARD_BACKFILL_MAX_AGE_SECONDS",
+        str(_DEFAULT_BACKFILL_MAX_AGE_SECONDS),
+    )
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        LOG.warning(
+            "invalid WANYARD_BACKFILL_MAX_AGE_SECONDS=%r; using %.0fs",
+            raw,
+            _DEFAULT_BACKFILL_MAX_AGE_SECONDS,
+        )
+        return _DEFAULT_BACKFILL_MAX_AGE_SECONDS
+
+
+def _backfill_batch(
+    video_db,
+    *,
+    now: float,
+    max_age_seconds: float,
+    limit: int = 5,
+) -> tuple[int, list]:
+    """Skip expired gaps and return the oldest recent gaps to scan."""
+    cutoff = float(now) - max(0.0, float(max_age_seconds))
+    with video_db._connect() as conn:
+        skipped = conn.execute(
+            "UPDATE segments SET scanned_at=?"
+            " WHERE end_ts IS NOT NULL"
+            " AND media_epoch IS NOT NULL"
+            " AND scanned_at IS NULL"
+            " AND end_ts<?",
+            (float(now), cutoff),
+        ).rowcount
+        segs = conn.execute(
+            "SELECT s.* FROM segments s WHERE s.end_ts IS NOT NULL"
+            " AND s.media_epoch IS NOT NULL"
+            " AND s.scanned_at IS NULL"
+            " AND s.end_ts>=?"
+            " ORDER BY s.start_ts"
+            " LIMIT ?",
+            (cutoff, max(1, int(limit))),
+        ).fetchall()
+    return int(skipped), list(segs)
+
+
 def _backfill_loop(model, video_db, video_dir: Path, stop_event: threading.Event, predict_lock):
     from .video import _yolo_tag_video, extract_events
 
-    LOG.info("backfill loop started")
+    max_age_seconds = _backfill_max_age_seconds()
+    LOG.info("backfill loop started max_age=%.0fs", max_age_seconds)
     while not stop_event.is_set():
         try:
-            with video_db._connect() as conn:
-                segs = conn.execute(
-                    "SELECT s.* FROM segments s WHERE s.end_ts IS NOT NULL"
-                    " AND s.media_epoch IS NOT NULL"
-                    " AND s.scanned_at IS NULL"
-                    " ORDER BY s.start_ts"
-                    " LIMIT 5"
-                ).fetchall()
+            skipped, segs = _backfill_batch(
+                video_db,
+                now=time.time(),
+                max_age_seconds=max_age_seconds,
+            )
+            if skipped:
+                LOG.info(
+                    "backfill skipped %d segment(s) older than %.0fs",
+                    skipped,
+                    max_age_seconds,
+                )
 
             if not segs:
                 stop_event.wait(15)
