@@ -17,7 +17,8 @@ _TRACK_BUFFER_SECONDS = 5.0
 _TRACK_RESET_GRACE_SECONDS = 1.0
 _IDENTITY_RESCUE_SECONDS = 1.5
 _IDENTITY_MAX_AREA_RATIO = 4.0
-_IDENTITY_RESCUE_CENTER_DISTANCE = 0.10
+_IDENTITY_RESCUE_BASE_DISTANCE = 0.06
+_IDENTITY_RESCUE_SPEED_DISTANCE = 0.06
 # ByteTrack associates with bounding-box overlap.  At the deliberately sparse
 # 2fps detector rate, a narrow walking person can move an entire box width
 # between samples and never establish a track.  Dilate only the geometry fed to
@@ -70,7 +71,10 @@ class ByteTrackAssociator:
         self._session_id = session_id or secrets.token_hex(4)
         self._trackers: dict[int, Any] = {}
         self._tokens: dict[Any, str] = {}
-        self._token_states: dict[str, tuple[int, dict, float]] = {}
+        self._token_states: dict[
+            str,
+            tuple[int, dict, float, tuple[float, float]],
+        ] = {}
         self._next_token = 1
         self._last_ts: float | None = None
 
@@ -120,7 +124,8 @@ class ByteTrackAssociator:
         claimed: set[str],
     ) -> str | None:
         best: tuple[float, str] | None = None
-        for token, (state_class_id, previous, previous_ts) in self._token_states.items():
+        for token, state in self._token_states.items():
+            state_class_id, previous, previous_ts, velocity = state
             if token == exclude or token in claimed or state_class_id != class_id:
                 continue
             elapsed = timestamp - previous_ts
@@ -129,16 +134,65 @@ class ByteTrackAssociator:
             area_ratio = _box_area_ratio(previous, box)
             if area_ratio is None or area_ratio > _IDENTITY_MAX_AREA_RATIO:
                 continue
-            distance = _box_center_distance(previous, box)
+            previous_center = _box_center(previous)
+            current_center = _box_center(box)
+            if previous_center is None or current_center is None:
+                continue
+            predicted_center = (
+                previous_center[0] + velocity[0] * elapsed,
+                previous_center[1] + velocity[1] * elapsed,
+            )
+            distance = float(np.hypot(
+                predicted_center[0] - current_center[0],
+                predicted_center[1] - current_center[1],
+            ))
+            max_distance = (
+                _IDENTITY_RESCUE_BASE_DISTANCE
+                + _IDENTITY_RESCUE_SPEED_DISTANCE * elapsed
+            )
             if (
-                distance is None
-                or distance > _IDENTITY_RESCUE_CENTER_DISTANCE
+                distance > max_distance
             ):
                 continue
             score = distance + abs(np.log(area_ratio)) * 0.02
             if best is None or score < best[0]:
                 best = (score, token)
         return best[1] if best else None
+
+    def _update_token_state(
+        self,
+        token: str,
+        class_id: int,
+        box: dict,
+        timestamp: float,
+    ) -> None:
+        velocity = (0.0, 0.0)
+        previous_state = self._token_states.get(token)
+        if previous_state is not None and previous_state[0] == class_id:
+            _, previous_box, previous_ts, previous_velocity = previous_state
+            elapsed = timestamp - previous_ts
+            previous_center = _box_center(previous_box)
+            current_center = _box_center(box)
+            if (
+                elapsed > 0
+                and elapsed <= _IDENTITY_RESCUE_SECONDS
+                and previous_center is not None
+                and current_center is not None
+            ):
+                measured_velocity = (
+                    (current_center[0] - previous_center[0]) / elapsed,
+                    (current_center[1] - previous_center[1]) / elapsed,
+                )
+                velocity = (
+                    previous_velocity[0] * 0.4 + measured_velocity[0] * 0.6,
+                    previous_velocity[1] * 0.4 + measured_velocity[1] * 0.6,
+                )
+        self._token_states[token] = (
+            class_id,
+            dict(box),
+            timestamp,
+            velocity,
+        )
 
     def annotate(
         self,
@@ -203,6 +257,7 @@ class ByteTrackAssociator:
                     class_id,
                 )
                 return self._fallback(boxes)
+            current_tracks = []
             for track in tracker.tracked_stracks:
                 if int(track.frame_id) != int(tracker.frame_id):
                     continue
@@ -214,35 +269,65 @@ class ByteTrackAssociator:
                     continue
                 box = boxes[detection_index]
                 token = self._tokens.get(track)
+                state = self._token_states.get(token) if token else None
+                area_ratio = (
+                    _box_area_ratio(state[1], box)
+                    if state is not None
+                    else None
+                )
+                # Preserve credible existing assignments before allowing a
+                # newly-created track to claim their canonical identity.
+                priority = (
+                    0
+                    if token and (
+                        area_ratio is None
+                        or area_ratio <= _IDENTITY_MAX_AREA_RATIO
+                    )
+                    else 1 if token else 2
+                )
+                current_tracks.append(
+                    (priority, detection_index, track, box, token, area_ratio)
+                )
+
+            for (
+                _,
+                detection_index,
+                track,
+                box,
+                token,
+                area_ratio,
+            ) in sorted(current_tracks, key=lambda item: item[0]):
                 if token is None:
-                    token = self._new_token()
+                    token = self._rescue_token(
+                        class_id,
+                        box,
+                        timestamp,
+                        exclude="",
+                        claimed=claimed,
+                    ) or self._new_token()
                     self._tokens[track] = token
-                else:
-                    state = self._token_states.get(token)
-                    if state is not None:
-                        _, previous, _ = state
-                        area_ratio = _box_area_ratio(previous, box)
-                        if (
-                            area_ratio is not None
-                            and area_ratio > _IDENTITY_MAX_AREA_RATIO
-                        ):
-                            rescued = self._rescue_token(
-                                class_id,
-                                box,
-                                timestamp,
-                                exclude=token,
-                                claimed=claimed,
-                            )
-                            token = rescued or self._new_token()
-                            self._tokens[track] = token
+                elif (
+                    area_ratio is not None
+                    and area_ratio > _IDENTITY_MAX_AREA_RATIO
+                ):
+                    rescued = self._rescue_token(
+                        class_id,
+                        box,
+                        timestamp,
+                        exclude=token,
+                        claimed=claimed,
+                    )
+                    token = rescued or self._new_token()
+                    self._tokens[track] = token
                 if token in claimed:
                     token = self._new_token()
                     self._tokens[track] = token
                 accepted[detection_index] = token
                 claimed.add(token)
-                self._token_states[token] = (
+                self._update_token_state(
+                    token,
                     class_id,
-                    dict(box),
+                    box,
                     timestamp,
                 )
 
@@ -278,19 +363,11 @@ def _box_area_ratio(first: dict, second: dict) -> float | None:
     return larger / smaller
 
 
-def _box_center_distance(first: dict, second: dict) -> float | None:
+def _box_center(box: dict) -> tuple[float, float] | None:
     try:
-        first_center = (
-            (float(first["x1"]) + float(first["x2"])) / 2,
-            (float(first["y1"]) + float(first["y2"])) / 2,
-        )
-        second_center = (
-            (float(second["x1"]) + float(second["x2"])) / 2,
-            (float(second["y1"]) + float(second["y2"])) / 2,
+        return (
+            (float(box["x1"]) + float(box["x2"])) / 2,
+            (float(box["y1"]) + float(box["y2"])) / 2,
         )
     except (KeyError, TypeError, ValueError):
         return None
-    return float(np.hypot(
-        first_center[0] - second_center[0],
-        first_center[1] - second_center[1],
-    ))

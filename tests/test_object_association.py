@@ -88,6 +88,21 @@ class IdentityHijackTracker(FakeTracker):
         return np.empty((0, 8), dtype=np.float32)
 
 
+class FreshTrackEachFrameTracker(FakeTracker):
+    """Represent ByteTrack fragmenting a continuously moving subject."""
+
+    def update(self, detections):
+        self.frame_id += 1
+        self.received_xywh.append(detections.xywh.copy())
+        self.tracked_stracks = []
+        for index in range(len(detections)):
+            track = FakeTrack(self.frame_id * 100 + index)
+            track.frame_id = self.frame_id
+            track.idx = index
+            self.tracked_stracks.append(track)
+        return np.empty((0, 8), dtype=np.float32)
+
+
 def box(cls: str, confidence: float = 0.8) -> dict:
     return {
         "cls": cls,
@@ -202,6 +217,72 @@ class ByteTrackAssociatorTests(unittest.TestCase):
 
         self.assertEqual(second[0]["track_id"], first[0]["track_id"])
         self.assertNotEqual(second[0]["track_id"], first[1]["track_id"])
+
+    def test_reconnects_fresh_track_using_recent_motion(self) -> None:
+        associator = ByteTrackAssociator(
+            "front",
+            2.0,
+            tracker_factory=FreshTrackEachFrameTracker,
+            session_id="test",
+        )
+        observed_tokens = []
+        for frame, x1 in enumerate((0.72, 0.78, 0.85, 0.91)):
+            current = {
+                **box("person"),
+                "x1": x1,
+                "x2": x1 + 0.05,
+                "y1": 0.55,
+                "y2": 0.73,
+            }
+            tracked = associator.annotate(
+                FakeDetections(
+                    [0],
+                    [[(x1 + 0.025) * 100, 64.0, 5.0, 18.0]],
+                ),
+                [current],
+                abs_ts=100.0 + frame * 0.56,
+            )
+            observed_tokens.append(tracked[0]["track_id"])
+
+        self.assertEqual(len(set(observed_tokens)), 1)
+
+    def test_fresh_tracks_do_not_merge_simultaneous_people(self) -> None:
+        associator = ByteTrackAssociator(
+            "front",
+            2.0,
+            tracker_factory=FreshTrackEachFrameTracker,
+            session_id="test",
+        )
+        first_boxes = [
+            {**box("person"), "x1": 0.40, "x2": 0.45},
+            {**box("person"), "x1": 0.48, "x2": 0.53},
+        ]
+        first = associator.annotate(
+            FakeDetections(
+                [0, 0],
+                [[42.5, 20.0, 5.0, 20.0], [50.5, 20.0, 5.0, 20.0]],
+            ),
+            first_boxes,
+            abs_ts=100.0,
+        )
+        second_boxes = [
+            {**first_boxes[0], "x1": 0.42, "x2": 0.47},
+            {**first_boxes[1], "x1": 0.50, "x2": 0.55},
+        ]
+        second = associator.annotate(
+            FakeDetections(
+                [0, 0],
+                [[44.5, 20.0, 5.0, 20.0], [52.5, 20.0, 5.0, 20.0]],
+            ),
+            second_boxes,
+            abs_ts=100.5,
+        )
+
+        self.assertEqual(len({item["track_id"] for item in second}), 2)
+        self.assertEqual(
+            [item["track_id"] for item in second],
+            [item["track_id"] for item in first],
+        )
 
 
 if __name__ == "__main__":
