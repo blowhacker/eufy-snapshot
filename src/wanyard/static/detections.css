@@ -505,9 +505,12 @@ body.dw-feed-mode .dw-thumb {
   aspect-ratio: auto;
 }
 body.dw-feed-mode .dw-thumb img {
-  object-fit: cover;
+  object-fit: contain;
+  opacity: .72;
   transform: none;
+  transition: opacity 140ms ease;
 }
+body.dw-feed-mode .dw-card.preview-loading .dw-thumb img { opacity: .28; }
 body.dw-feed-mode .dw-card-meta {
   height: 52px;
   flex: 0 0 52px;
