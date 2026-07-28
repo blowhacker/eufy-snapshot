@@ -331,6 +331,51 @@ class DetectionWallCameraTests(unittest.TestCase):
             },
         )
 
+    def test_preview_follows_long_encounter_with_safety_cap(self) -> None:
+        recorded = _event(
+            19,
+            100.0,
+            "person",
+            seg_path="front/long-walk.mp4",
+            boxes=[{"cls": "person", "x1": 0.2, "y1": 0.2, "x2": 0.4, "y2": 0.5}],
+        )
+        recorded["start_off"] = 20.0
+        recorded["end_off"] = 93.8
+
+        preview = _detection_wall_preview(recorded, "person")
+
+        self.assertEqual(preview["start"], 19.0)
+        self.assertEqual(preview["end"], 94.8)
+        self.assertEqual(preview["start_ts"], 99.0)
+        self.assertEqual(preview["end_ts"], 174.8)
+
+        recorded["end_off"] = 250.0
+        capped = _detection_wall_preview(recorded, "person")
+        self.assertEqual(capped["start"], 19.0)
+        self.assertEqual(capped["end"], 109.0)
+        self.assertEqual(capped["end_ts"], 189.0)
+
+    def test_live_preview_follows_long_provisional_encounter(self) -> None:
+        provisional = _event(
+            20,
+            100.0,
+            "person",
+            provisional=True,
+            seg_path="front/segment.mp4",
+            boxes=[{"cls": "person", "x1": 0.2, "y1": 0.2, "x2": 0.4, "y2": 0.5}],
+        )
+        provisional["start_off"] = 20.0
+        provisional["end_off"] = 93.8
+
+        preview = _detection_wall_preview(
+            provisional,
+            "person",
+            {"start_ts": 50.0, "end_ts": 200.0},
+        )
+
+        self.assertEqual(preview["start_ts"], 99.0)
+        self.assertEqual(preview["end_ts"], 174.8)
+
     def test_omits_preview_outside_live_window_or_for_unusable_event(self) -> None:
         provisional = _event(
             18,
@@ -616,6 +661,25 @@ class EncounterGroupingTests(unittest.TestCase):
         self.assertEqual(rows[0]["abs_ts"], 101.0)
         self.assertEqual(rows[0]["start_off"], 1.0)
         self.assertAlmostEqual(rows[0]["end_off"], 4.8)
+
+    def test_distant_false_positive_does_not_extend_departed_walker(self) -> None:
+        detections = [
+            self.detection(101.0, [_box(0.12, 0.40)]),
+            self.detection(101.5, [_box(0.07, 0.39)]),
+            # The walker has left at the upper-left. A small static shape at
+            # the bottom-left appears inside the temporal gap but is not the
+            # same encounter.
+            self.detection(107.0, [_box(0.01, 0.73)]),
+            self.detection(107.5, [_box(0.01, 0.73)]),
+        ]
+
+        rows = _encounter_events_from_detections(self.segment, detections)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            sorted(round(row["end_off"] - row["start_off"], 1) for row in rows),
+            [0.5, 0.5],
+        )
 
 
 class DetectionWallAllCameraTests(unittest.TestCase):

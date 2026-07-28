@@ -60,6 +60,10 @@ _GZIP_SKIP_PREFIXES = (
 # scrubbing needs cheap ranges.
 _GZIP_SKIP_SUFFIXES = (".mp4", ".m4s", ".ts", ".jpg", ".jpeg")
 _EVENT_THUMB_MAX_W = 640
+# Encounters can now represent a complete walk rather than a short detector
+# burst.  Let previews follow that span, but do not let a static false positive
+# monopolise the feed for an entire recording segment.
+_DETECTION_PREVIEW_MAX_SECONDS = 90.0
 
 
 def _gzip_path_is_excluded(
@@ -333,7 +337,10 @@ def _detection_wall_preview(
             window_end,
             max(start_ts + 3.0, event_ts + duration + 1.0),
         )
-        end_ts = min(end_ts, start_ts + 8.0)
+        end_ts = min(
+            end_ts,
+            start_ts + _DETECTION_PREVIEW_MAX_SECONDS,
+        )
         if end_ts - start_ts < 0.25:
             return None
         return {
@@ -360,7 +367,10 @@ def _detection_wall_preview(
     if not source_id or not math.isfinite(event_ts):
         return None
     start = max(0.0, start_off - 1.0)
-    end = min(start + 8.0, max(start + 3.0, end_off + 1.0))
+    end = min(
+        start + _DETECTION_PREVIEW_MAX_SECONDS,
+        max(start + 3.0, end_off + 1.0),
+    )
     return {
         "url": f"/video/files/{quote(seg_path, safe='/')}",
         "source_id": source_id,

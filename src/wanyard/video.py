@@ -51,6 +51,7 @@ _ENCOUNTER_GROUP_BASE_DISTANCE = 0.08
 _ENCOUNTER_GROUP_SIZE_FACTOR = 0.65
 _ENCOUNTER_MOTION_BASE_DISTANCE = 0.08
 _ENCOUNTER_MOTION_SPEED_DISTANCE = 0.10
+_ENCOUNTER_MAX_PREDICTED_DISTANCE = 0.36
 _ENCOUNTER_MAX_AREA_RATIO = 8.0
 _PROVISIONAL_GRACE_SECONDS = 3600.0
 _OBJECT_TRACK_CENTER_DISTANCE = 0.045
@@ -1242,7 +1243,7 @@ class VideoSegmentDB:
                         0.65
                         if shared_tokens
                         else min(
-                            0.5,
+                            _ENCOUNTER_MAX_PREDICTED_DISTANCE,
                             _ENCOUNTER_MOTION_BASE_DISTANCE
                             + _ENCOUNTER_MOTION_SPEED_DISTANCE * gap,
                         )
@@ -2855,7 +2856,7 @@ def _encounter_events_from_detections(
                 predicted_y = float(track["cy"]) + float(track["vy"]) * gap
                 distance = _center_distance(cx, cy, predicted_x, predicted_y)
                 max_distance = min(
-                    0.5,
+                    _ENCOUNTER_MAX_PREDICTED_DISTANCE,
                     _ENCOUNTER_MOTION_BASE_DISTANCE
                     + _ENCOUNTER_MOTION_SPEED_DISTANCE * gap,
                 )

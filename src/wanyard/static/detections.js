@@ -596,7 +596,7 @@ async function fallbackToRecordedPreview(item) {
   const eventTs = Number(preview.event_ts ?? preview.start_ts);
   const desiredStartTs = eventTs - 1;
   const desiredEndTs = Math.min(
-    desiredStartTs + 8,
+    desiredStartTs + 90,
     Math.max(desiredStartTs + 3, Number(preview.end_ts))
   );
   const start = Math.max(
