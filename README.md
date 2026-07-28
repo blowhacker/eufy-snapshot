@@ -82,4 +82,4 @@ configuration or production footage.
 - `http://localhost:8091` — live wall (all cameras); click one for its viewer
 - `http://localhost:8091/detections` — object-tag filters and detection thumbnails grouped by camera
 - `http://localhost:8091/?source=<id>&live=1` — single-camera timeline viewer + event feed
-- `http://localhost:8091/settings` — cameras, media health history, notifications, and storage
+- `http://localhost:8091/settings` — cameras, detection classes, media health history, notifications, and storage

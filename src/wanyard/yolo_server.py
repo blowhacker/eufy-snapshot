@@ -48,11 +48,13 @@ class _YoloHandler(socketserver.StreamRequestHandler):
 
 
 class YoloSocketServer(socketserver.ThreadingUnixStreamServer):
-    def __init__(self, socket_path: str, model, video_db, video_dir, predict_lock):
+    def __init__(self, socket_path: str, model, video_db, video_dir, predict_lock,
+                 class_selector=None):
         self.model            = model
         self.video_db         = video_db
         self.video_dir        = video_dir
         self.predict_lock     = predict_lock
+        self.class_selector   = class_selector
         self._backfill_thread: threading.Thread | None = None
         if Path(socket_path).exists():
             Path(socket_path).unlink()
@@ -67,6 +69,10 @@ class YoloSocketServer(socketserver.ThreadingUnixStreamServer):
             bt = self._backfill_thread
             return {"status": "ok",
                     "model": str(getattr(self.model, "model_name", None)),
+                    "classes": (
+                        self.class_selector.ids()
+                        if self.class_selector is not None else None
+                    ),
                     "backfill_alive": bool(bt and bt.is_alive())}
         if t == "confirm_notification_event":
             return _confirm_notification_event(
@@ -565,6 +571,7 @@ def run(video_db_path: Path, video_dir: Path):
         _configure_torch_threads()
 
     from ultralytics import YOLO
+    from .detection_settings import DetectionClassSelector
     from .video import VideoSegmentDB
 
     model_path = os.environ.get("YOLO_MODEL_PATH", "yolo11m.pt")
@@ -580,6 +587,7 @@ def run(video_db_path: Path, video_dir: Path):
         LOG.info("DB integrity check passed")
     stop_event = threading.Event()
     predict_lock = threading.Lock()
+    class_selector = DetectionClassSelector(video_db)
 
     def _shutdown(sig, frame):
         LOG.info("shutting down")
@@ -604,7 +612,7 @@ def run(video_db_path: Path, video_dir: Path):
     if os.environ.get("WANYARD_LIVE_DETECTOR", "") == "1":
         from .live_detector import start_live_detector
         live_detector_thread = start_live_detector(
-            model, video_db, stop_event, predict_lock
+            model, video_db, stop_event, predict_lock, class_selector
         )
 
     cleanup_thread = threading.Thread(
@@ -614,7 +622,9 @@ def run(video_db_path: Path, video_dir: Path):
     )
     cleanup_thread.start()
 
-    srv = YoloSocketServer(SOCKET_PATH, model, video_db, video_dir, predict_lock)
+    srv = YoloSocketServer(
+        SOCKET_PATH, model, video_db, video_dir, predict_lock, class_selector
+    )
     srv._backfill_thread = backfill_thread
     srv._live_detector_thread = live_detector_thread
     srv.socket.settimeout(1.0)

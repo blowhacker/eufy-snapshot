@@ -20,6 +20,7 @@ let _editingRuleId = null;
 let _mediaHealth = null;
 let _healthHours = 24;
 let _healthSource = '';
+let _detectionConfig = null;
 
 async function loadStatus() {
   const d = await fetch('/api/settings/status',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}));
@@ -733,6 +734,117 @@ document.getElementById('notifySource').addEventListener('change', e => {
   populateNotifyZones(e.target.value, 'whole_frame');
 });
 
+// ── Detection classes ────────────────────────────────
+function detectionClassLabel(name) {
+  return String(name || '').replaceAll('_', ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function selectedDetectionClasses() {
+  return [...document.querySelectorAll('[data-detection-class]:checked')]
+    .map(input => input.dataset.detectionClass)
+    .filter(Boolean);
+}
+
+function updateDetectionSummary() {
+  const selected = selectedDetectionClasses();
+  const total = (_detectionConfig?.groups || [])
+    .reduce((sum, group) => sum + (group.classes || []).length, 0);
+  const summary = document.getElementById('detectionSummary');
+  const save = document.getElementById('detectionSaveBtn');
+  if (summary) {
+    summary.textContent = selected.length
+      ? `${selected.length} of ${total} model classes enabled`
+      : 'Select at least one class';
+  }
+  if (save) save.disabled = selected.length === 0;
+}
+
+function setDetectionSelection(names) {
+  const wanted = new Set(names || []);
+  document.querySelectorAll('[data-detection-class]').forEach(input => {
+    input.checked = wanted.has(input.dataset.detectionClass);
+  });
+  updateDetectionSummary();
+}
+
+function renderDetectionConfig() {
+  const root = document.getElementById('detectionGroups');
+  if (!root || !_detectionConfig) return;
+  root.innerHTML = '';
+  (_detectionConfig.groups || []).forEach(group => {
+    const section = document.createElement('section');
+    section.className = 's-detection-group';
+    const title = document.createElement('h3');
+    title.className = 's-detection-group-title';
+    title.textContent = group.name;
+    const options = document.createElement('div');
+    options.className = 's-detection-options';
+    (group.classes || []).forEach(item => {
+      const label = document.createElement('label');
+      label.className = 's-detection-option';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.dataset.detectionClass = item.name;
+      input.checked = (_detectionConfig.enabled || []).includes(item.name);
+      input.addEventListener('change', updateDetectionSummary);
+      const text = document.createElement('span');
+      text.textContent = detectionClassLabel(item.name);
+      label.append(input, text);
+      options.appendChild(label);
+    });
+    section.append(title, options);
+    root.appendChild(section);
+  });
+  updateDetectionSummary();
+}
+
+async function loadDetectionConfig() {
+  const root = document.getElementById('detectionGroups');
+  const d = await fetch('/api/settings/detection-config', {cache:'no-store'})
+    .then(async r => r.ok ? r.json() : Promise.reject(new Error(`Error ${r.status}`)))
+    .catch(() => null);
+  if (!d) {
+    if (root) root.innerHTML = '<div class="s-rule-empty">Could not load detection classes.</div>';
+    return;
+  }
+  _detectionConfig = d;
+  renderDetectionConfig();
+}
+
+document.getElementById('detectionDefaultsBtn')?.addEventListener('click', () => {
+  setDetectionSelection(_detectionConfig?.defaults || []);
+});
+document.getElementById('detectionAllBtn')?.addEventListener('click', () => {
+  const all = (_detectionConfig?.groups || [])
+    .flatMap(group => (group.classes || []).map(item => item.name));
+  setDetectionSelection(all);
+});
+document.getElementById('detectionNoneBtn')?.addEventListener('click', () => {
+  setDetectionSelection([]);
+});
+document.getElementById('detectionSaveBtn')?.addEventListener('click', async () => {
+  const msg = document.getElementById('detectionMsg');
+  const classes = selectedDetectionClasses();
+  if (!classes.length) return;
+  msg.textContent = 'Saving…';
+  msg.className = 's-save-msg';
+  const r = await fetch('/api/settings/detection-config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({classes}),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    msg.textContent = d.error || `Error ${r.status}`;
+    msg.className = 's-save-msg err';
+    return;
+  }
+  _detectionConfig = d;
+  renderDetectionConfig();
+  msg.textContent = `Saved — ${d.enabled.length} classes active within a few seconds`;
+  msg.className = 's-save-msg ok';
+});
+
 // ── Auto-cleanup / per-camera retention ───────────────
 let _retention = null;
 const RETENTION_DAY_CHOICES = [1, 2, 3, 7, 14, 30, 60, 90];
@@ -896,7 +1008,7 @@ document.getElementById('cleanupBtn').addEventListener('click', async () => {
 
 // ── Sidebar scroll-spy ────────────────────────────────
 const sideLinks = document.querySelectorAll('.s-side-link');
-const sections  = ['system','cameras','media-health','notifications','storage'].map(id => document.getElementById(id)).filter(Boolean);
+const sections  = ['system','cameras','detection','media-health','notifications','storage'].map(id => document.getElementById(id)).filter(Boolean);
 
 const observer = new IntersectionObserver(entries => {
   entries.forEach(entry => {
@@ -914,6 +1026,7 @@ sections.forEach(s => observer.observe(s));
 // ── Init ──────────────────────────────────────────────
 loadStatus();
 loadCameras().then(() => { loadNotificationRules(); });
+loadDetectionConfig();
 loadMediaHealth();
 loadCleanupConfig();
 setInterval(loadMediaHealth, 30000);

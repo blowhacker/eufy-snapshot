@@ -19,6 +19,11 @@ from urllib.parse import urlencode, urlparse
 import urllib.request
 
 from . import sei
+from .detection_settings import (
+    COCO_CLASSES,
+    DEFAULT_DETECTION_CLASSES,
+    configured_detection_class_ids,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -45,9 +50,7 @@ _OBJECT_TRACK_AREA_RATIO = 3.0
 _OBJECT_MIN_OBSERVATIONS = 2
 _OBJECT_EXIT_GRACE_SECONDS = 15 * 60.0
 _OBJECT_TRACK_LOOKBACK_SECONDS = 2 * 60 * 60.0
-_CLASS_PRIORITY      = ["person", "bird", "cat", "dog",
-                         "bus", "truck", "motorcycle", "bicycle", "car",
-                         "backpack", "suitcase"]
+_CLASS_PRIORITY      = list(DEFAULT_DETECTION_CLASSES)
 _NOTIFICATION_CONFIRMATION_STRATEGY = "yolo1280-crop640-960-v1"
 _NOTIFICATION_CONFIRMATION_RETRY_SECONDS = 30.0
 _NOTIFICATION_CONFIRMATION_TIMEOUT_SECONDS = 8.0
@@ -1977,12 +1980,14 @@ class VideoSegmentDB:
 
 
 _CONF_THRESHOLD = 0.35
-_CCTV_CLASSES = {
-    0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus",
-    7: "truck", 14: "bird", 15: "cat", 16: "dog",
-    24: "backpack", 28: "suitcase",
-}
-_CCTV_CLASS_IDS = list(_CCTV_CLASSES.keys())
+# Backward-compatible internal names. The catalog is complete; the actual
+# inference whitelist comes from the persisted Settings selection.
+_CCTV_CLASSES = COCO_CLASSES
+_CCTV_CLASS_IDS = [
+    class_id
+    for class_id, name in COCO_CLASSES.items()
+    if name in DEFAULT_DETECTION_CLASSES
+]
 
 
 def _parse_results(results) -> tuple:
@@ -2007,6 +2012,7 @@ def _yolo_tag_video(
     seg_id: int,
     db: VideoSegmentDB,
     predict_lock=None,
+    class_ids: list[int] | None = None,
 ) -> int:
     """Read video file at ~1fps, run YOLO, store detections in clock time.
 
@@ -2044,6 +2050,8 @@ def _yolo_tag_video(
         return 0
 
     detections: list[dict] = []
+    if class_ids is None:
+        class_ids = configured_detection_class_ids(db)
     next_sample_pts: float | None = None
     try:
         for frame in container.decode(video_stream):
@@ -2069,13 +2077,13 @@ def _yolo_tag_video(
             try:
                 if predict_lock is None:
                     results = model.predict(
-                        frame_bgr, classes=_CCTV_CLASS_IDS,
+                        frame_bgr, classes=class_ids,
                         conf=_CONF_THRESHOLD, verbose=False,
                     )
                 else:
                     with predict_lock:
                         results = model.predict(
-                            frame_bgr, classes=_CCTV_CLASS_IDS,
+                            frame_bgr, classes=class_ids,
                             conf=_CONF_THRESHOLD, verbose=False,
                         )
                 has_human, conf, boxes = _parse_results(results)

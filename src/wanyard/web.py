@@ -26,6 +26,10 @@ from starlette.staticfiles import StaticFiles
 
 from . import native_hls
 from .config import AppConfig
+from .detection_settings import (
+    detection_settings_payload,
+    save_detection_classes,
+)
 from .media_health import MediaHealthCollector, MediaHealthStore, default_db_path
 from .retention import (
     RECORD_MODE_CONTINUOUS,
@@ -750,7 +754,7 @@ def make_app(
             for cls in raw_classes.split(",")
             if cls.strip()
         ))
-        if len(classes) > 16 or any(len(cls) > 80 for cls in classes):
+        if len(classes) > 80 or any(len(cls) > 80 for cls in classes):
             return JSONResponse({"error": "invalid classes"}, status_code=400)
 
         try:
@@ -1938,6 +1942,30 @@ def make_app(
         finally:
             out.unlink(missing_ok=True)
 
+    async def api_settings_detection_config(request: Request) -> JSONResponse:
+        """Get or update the YOLO class whitelist used by live and backfill."""
+        if not video_db:
+            return JSONResponse(
+                {"error": "video db not configured"}, status_code=501
+            )
+        if request.method == "GET":
+            return JSONResponse(detection_settings_payload(video_db))
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"}, status_code=400
+            )
+        try:
+            save_detection_classes(video_db, body.get("classes"))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        payload = detection_settings_payload(video_db)
+        payload["applies_within_seconds"] = 3
+        return JSONResponse(payload)
+
     async def api_settings_cleanup_config(request: Request) -> JSONResponse:
         """Get or update auto-cleanup thresholds and per-camera retention.
 
@@ -2194,6 +2222,7 @@ def make_app(
         Route("/api/settings/status",            api_settings_status),
         Route("/api/settings/media-health",      api_settings_media_health),
         Route("/api/settings/camera/test",       api_settings_camera_test, methods=["POST"]),
+        Route("/api/settings/detection-config",  api_settings_detection_config, methods=["GET", "POST"]),
         Route("/api/settings/cleanup-config",    api_settings_cleanup_config, methods=["GET", "POST"]),
         Route("/api/settings/cleanup",           api_settings_cleanup,     methods=["POST"]),
         Mount("/", StaticFiles(directory=static_dir, html=True)),

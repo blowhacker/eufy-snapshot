@@ -46,7 +46,7 @@ class _DetectionRow:
 class _SourceWorker:
     def __init__(self, relay_host: str, source_id: str, relay_path: str, model, video_db,
                  stop_event: threading.Event, predict_lock: threading.Lock,
-                 fps: float, claim: bool) -> None:
+                 fps: float, claim: bool, class_selector) -> None:
         self.relay_host = relay_host
         self.source_id = source_id
         self.relay_path = relay_path
@@ -56,6 +56,7 @@ class _SourceWorker:
         self.predict_lock = predict_lock
         self.fps = max(0.1, float(fps))
         self.claim = claim
+        self.class_selector = class_selector
         self.local_stop = threading.Event()
         self.pending: deque[_DetectionRow] = deque()
         self.open_segment_id: int | None = None
@@ -192,7 +193,7 @@ class _SourceWorker:
             return
         self.next_infer_wall = wall + (1.0 / self.fps)
 
-        from .video import _CCTV_CLASS_IDS, _CONF_THRESHOLD, _parse_results
+        from .video import _CONF_THRESHOLD, _parse_results
 
         # The clock rides as frame side data (SEI); reencode streams emit the
         # same SEI, so there is no pixel carrier to fall back to.
@@ -226,7 +227,7 @@ class _SourceWorker:
             results = self.model.predict(
                 frame_bgr,
                 imgsz=640,
-                classes=_CCTV_CLASS_IDS,
+                classes=self.class_selector.ids(),
                 conf=_CONF_THRESHOLD,
                 verbose=False,
             )
@@ -361,11 +362,12 @@ class _SourceWorker:
 
 class _LiveDetectorSupervisor:
     def __init__(self, model, video_db, stop_event: threading.Event,
-                 predict_lock: threading.Lock) -> None:
+                 predict_lock: threading.Lock, class_selector) -> None:
         self.model = model
         self.video_db = video_db
         self.stop_event = stop_event
         self.predict_lock = predict_lock
+        self.class_selector = class_selector
         self.relay_host = os.environ.get("WANYARD_RELAY_HOST", "mediamtx").strip() or "mediamtx"
         self.path_suffix = os.environ.get("WANYARD_RELAY_PATH_SUFFIX", "").strip()
         self.fps = float(os.environ.get("WANYARD_LIVE_FPS", "2.0") or "2.0")
@@ -413,6 +415,7 @@ class _LiveDetectorSupervisor:
                 self.predict_lock,
                 self.fps,
                 self.claim,
+                self.class_selector,
             )
             self.workers[source_id] = worker
             worker.start()
@@ -492,10 +495,15 @@ def _configure_torch_threads() -> None:
 
 
 def start_live_detector(model, video_db, stop_event: threading.Event,
-                        predict_lock: threading.Lock) -> threading.Thread:
+                        predict_lock: threading.Lock,
+                        class_selector=None) -> threading.Thread:
+    if class_selector is None:
+        from .detection_settings import DetectionClassSelector
+        class_selector = DetectionClassSelector(video_db)
     return _LiveDetectorSupervisor(
         model,
         video_db,
         stop_event,
         predict_lock,
+        class_selector,
     ).start()

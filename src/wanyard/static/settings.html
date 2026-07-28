@@ -13,7 +13,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/app.css">
-  <link rel="stylesheet" href="/settings.css?v=home-logo-1">
+  <link rel="stylesheet" href="/settings.css?v=detection-classes-1">
 </head>
 <body>
 
@@ -44,6 +44,10 @@
       <a href="#system" class="s-side-link active">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="1.5" y="1.5" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="8" y="1.5" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="1.5" y="8" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="8" y="8" width="4.5" height="4.5" rx="1" stroke="currentColor" stroke-width="1.2"/></svg>
         Cameras &amp; system
+      </a>
+      <a href="#detection" class="s-side-link">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2 5V2h3M9 2h3v3M12 9v3H9M5 12H2V9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="7" cy="7" r="2" stroke="currentColor" stroke-width="1.2"/></svg>
+        Object detection
       </a>
       <a href="#media-health" class="s-side-link">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M1.5 9.5h2l1.4-4 2.1 6 1.7-5 1.2 3h2.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -127,6 +131,39 @@
                   <button id="addBtn" class="s-btn s-btn-primary" disabled type="button">Add camera</button>
                 </div>
               </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Object detection -->
+      <section class="s-sec" id="detection">
+        <div class="s-sec-head">
+          <h2 class="s-sec-title">Object detection</h2>
+          <p class="s-sec-sub">Choose the object classes YOLO detects across all cameras.</p>
+        </div>
+
+        <div class="s-card">
+          <div class="s-card-section">
+            <div class="s-detection-toolbar">
+              <div>
+                <div class="s-card-section-head">Enabled classes</div>
+                <div id="detectionSummary" class="s-detection-summary">Loading classes.</div>
+              </div>
+              <div class="s-detection-actions">
+                <button id="detectionDefaultsBtn" class="s-btn" type="button">Recommended</button>
+                <button id="detectionAllBtn" class="s-btn" type="button">Select all</button>
+                <button id="detectionNoneBtn" class="s-btn" type="button">Clear</button>
+              </div>
+            </div>
+            <div id="detectionGroups" class="s-detection-groups" aria-live="polite"></div>
+            <p class="s-detection-note">
+              Changes affect new live and backfill inference within a few seconds.
+              Existing detections keep their stored labels.
+            </p>
+            <div class="s-card-footer">
+              <button id="detectionSaveBtn" class="s-btn s-btn-primary" type="button">Save detection classes</button>
+              <span id="detectionMsg" class="s-save-msg"></span>
             </div>
           </div>
         </div>
@@ -352,6 +389,6 @@
     </main>
   </div>
 
-  <script src="/settings.js?v=cleanup-shared-2"></script>
+  <script src="/settings.js?v=detection-classes-1"></script>
 </body>
 </html>

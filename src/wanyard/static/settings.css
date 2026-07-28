@@ -763,6 +763,78 @@
   text-align: center;
 }
 
+/* Object detection class picker */
+.s-detection-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+.s-detection-toolbar .s-card-section-head { margin-bottom: 5px; }
+.s-detection-summary {
+  color: var(--txt-3);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.s-detection-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.s-detection-groups {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.s-detection-group {
+  padding: 13px 14px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r);
+  background: var(--bg);
+}
+.s-detection-group-title {
+  margin-bottom: 10px;
+  color: var(--txt-3);
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.s-detection-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 10px;
+}
+.s-detection-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--txt-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.s-detection-option input {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  margin: 0;
+  accent-color: var(--amber);
+}
+.s-detection-option span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.s-detection-note {
+  margin-top: 14px;
+  color: var(--txt-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
 /* Buttons — !important needed to beat app.css button { width:32px } */
 .s-btn {
   height: 32px !important;
@@ -804,6 +876,11 @@
     flex-wrap: wrap;
   }
   .s-health-chart-wrap { margin: 0 12px; }
+  .s-detection-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .s-detection-actions { justify-content: flex-start; }
   .s-quality-table { min-width: 0; table-layout: auto; }
   .s-quality-table thead { display: none; }
   .s-quality-table tbody,
@@ -836,6 +913,7 @@
 
 @media (max-width: 600px) {
   .s-pipeline-chip { display: none; }
+  .s-detection-groups { grid-template-columns: 1fr; }
   .s-health-table { min-width: 0; table-layout: auto; }
   .s-health-table thead { display: none; }
   .s-health-table tbody,
