@@ -13,7 +13,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/detections.css?v=11">
+    <link rel="stylesheet" href="/detections.css?v=12">
   </head>
   <body>
     <div class="dw-sticky">
@@ -24,6 +24,9 @@
         </a>
         <div id="dwSummary" class="dw-summary" aria-live="polite">Loading</div>
         <nav class="dw-actions" aria-label="Primary">
+          <button id="dwViewToggle" class="dw-icon dw-view-toggle" type="button" title="Use feed view" aria-label="Use feed view" aria-pressed="false">
+            <svg class="dw-view-feed-icon" width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true"><rect x="3.5" y="2" width="10" height="5.2" rx="1" stroke="currentColor" stroke-width="1.25"/><rect x="3.5" y="9.8" width="10" height="5.2" rx="1" stroke="currentColor" stroke-width="1.25"/></svg>
+          </button>
           <button id="dwRefresh" class="dw-icon" type="button" title="Refresh detections" aria-label="Refresh detections">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M12.5 5.2A5 5 0 1 0 13 9" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/><path d="M10.1 2.8h2.8v2.8" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
@@ -70,6 +73,6 @@
     </template>
 
     <script src="/detection-preview-track.js?v=3"></script>
-    <script src="/detections.js?v=17"></script>
+    <script src="/detections.js?v=18"></script>
   </body>
 </html>

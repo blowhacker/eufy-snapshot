@@ -5,6 +5,7 @@ function filtersFromUrl() {
   const params = new URLSearchParams(location.search);
   return {
     camera: params.get("camera") || "all",
+    view: params.get("view") === "feed" ? "feed" : "grid",
     classes: new Set(
       (params.get("classes") || "")
         .split(",")
@@ -27,6 +28,7 @@ const dom = {
   areasFilter: document.getElementById("dwAreasFilter"),
   tags: document.getElementById("dwTags"),
   summary: document.getElementById("dwSummary"),
+  viewToggle: document.getElementById("dwViewToggle"),
   refresh: document.getElementById("dwRefresh"),
   emptyTemplate: document.getElementById("dwEmptyTemplate"),
 };
@@ -34,6 +36,7 @@ const dom = {
 const initialFilters = filtersFromUrl();
 const state = {
   camera: initialFilters.camera,
+  view: initialFilters.view,
   classes: initialFilters.classes,
   zones: initialFilters.zones,
   classCounts: {},
@@ -51,6 +54,9 @@ const canHoverPreview = window.matchMedia(
 );
 let pendingPreview = null;
 let activePreview = null;
+let feedObserver = null;
+const feedVisibility = new Map();
+let feedActivationFrame = null;
 const liveWindowCache = new Map();
 const previewTracker = window.DetectionPreviewTrack;
 
@@ -635,10 +641,10 @@ async function startHlsPreview(item) {
   fallbackToRecordedPreview(item);
 }
 
-function startPreview(card, preview) {
+function startPreview(card, preview, { force = false } = {}) {
   pendingPreview = null;
   if (
-    !canHoverPreview.matches
+    (!force && !canHoverPreview.matches)
     || !card.isConnected
     || card.dataset.previewFailed
   ) {
@@ -733,7 +739,12 @@ function startPreview(card, preview) {
 }
 
 function queuePreview(card, preview) {
-  if (!preview || !canHoverPreview.matches || card.dataset.previewFailed) return;
+  if (
+    state.view === "feed"
+    || !preview
+    || !canHoverPreview.matches
+    || card.dataset.previewFailed
+  ) return;
   if (activePreview?.card === card) return;
   cancelPendingPreview();
   card.classList.add("preview-loading");
@@ -741,6 +752,94 @@ function queuePreview(card, preview) {
     card,
     timer: setTimeout(() => startPreview(card, preview), 180),
   };
+}
+
+function stopFeedObserver() {
+  feedObserver?.disconnect();
+  feedObserver = null;
+  feedVisibility.clear();
+  if (feedActivationFrame != null) {
+    cancelAnimationFrame(feedActivationFrame);
+    feedActivationFrame = null;
+  }
+  document.querySelector(".dw-card.feed-current")
+    ?.classList.remove("feed-current");
+}
+
+function activateVisibleFeedCard() {
+  feedActivationFrame = null;
+  if (state.view !== "feed" || document.hidden) return;
+  let bestCard = null;
+  let bestRatio = 0;
+  for (const [card, ratio] of feedVisibility) {
+    if (card.isConnected && ratio > bestRatio) {
+      bestCard = card;
+      bestRatio = ratio;
+    }
+  }
+  if (!bestCard || bestRatio < .55) {
+    stopPreview();
+    return;
+  }
+  const current = document.querySelector(".dw-card.feed-current");
+  if (current !== bestCard) {
+    current?.classList.remove("feed-current");
+    bestCard.classList.add("feed-current");
+  }
+  if (activePreview?.card === bestCard || pendingPreview?.card === bestCard) {
+    return;
+  }
+  stopPreview();
+  if (bestCard._preview) {
+    bestCard.classList.add("preview-loading");
+    startPreview(bestCard, bestCard._preview, { force: true });
+  }
+}
+
+function scheduleFeedActivation() {
+  if (feedActivationFrame != null) return;
+  feedActivationFrame = requestAnimationFrame(activateVisibleFeedCard);
+}
+
+function startFeedObserver() {
+  stopFeedObserver();
+  if (state.view !== "feed" || !("IntersectionObserver" in window)) return;
+  feedObserver = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      feedVisibility.set(entry.target, entry.intersectionRatio);
+    }
+    scheduleFeedActivation();
+  }, {
+    root: dom.main,
+    threshold: [0, .25, .55, .75, 1],
+  });
+  for (const card of dom.main.querySelectorAll(".dw-card")) {
+    feedObserver.observe(card);
+  }
+}
+
+function updateViewMode() {
+  const feed = state.view === "feed";
+  document.body.classList.toggle("dw-feed-mode", feed);
+  dom.viewToggle.classList.toggle("active", feed);
+  dom.viewToggle.setAttribute("aria-pressed", String(feed));
+  dom.viewToggle.title = feed ? "Use grid view" : "Use feed view";
+  dom.viewToggle.setAttribute(
+    "aria-label",
+    feed ? "Use grid view" : "Use feed view"
+  );
+}
+
+function setView(view, { updateHistory = true } = {}) {
+  const next = view === "feed" ? "feed" : "grid";
+  if (state.view === next) return;
+  stopPreview();
+  stopFeedObserver();
+  state.view = next;
+  updateViewMode();
+  if (updateHistory) syncUrl();
+  renderCameras();
+  if (next === "feed") dom.main.scrollTop = 0;
 }
 
 function classLabel(value) {
@@ -800,6 +899,8 @@ function syncUrl({ replace = false } = {}) {
   const zones = selectedZones();
   if (zones.length) url.searchParams.set("zones", zones.join(","));
   else url.searchParams.delete("zones");
+  if (state.view === "feed") url.searchParams.set("view", "feed");
+  else url.searchParams.delete("view");
   history[replace ? "replaceState" : "pushState"](
     { detectionWall: true },
     "",
@@ -810,8 +911,10 @@ function syncUrl({ replace = false } = {}) {
 function restoreFiltersFromUrl() {
   const filters = filtersFromUrl();
   state.camera = filters.camera;
+  state.view = filters.view;
   state.classes = filters.classes;
   state.zones = filters.zones;
+  updateViewMode();
 }
 
 function apiUrl({
@@ -1002,7 +1105,7 @@ function makeCard(event, cameraName, showCamera = false) {
     link.classList.add("previewable");
     const previewMark = document.createElement("span");
     previewMark.className = "dw-preview-mark";
-    previewMark.title = "Hover to preview";
+    previewMark.title = "Preview available";
     previewMark.setAttribute("aria-hidden", "true");
     previewMark.innerHTML = `<svg width="8" height="8" viewBox="0 0 8 8"><path d="m2 1.25 4.5 2.75L2 6.75v-5.5Z" fill="currentColor"/></svg>`;
     thumb.append(previewMark);
@@ -1121,6 +1224,7 @@ function makeCameraSection(camera) {
 
 function renderCameras() {
   stopPreview();
+  stopFeedObserver();
   moreObserver?.disconnect();
   dom.main.innerHTML = "";
   const cameras = [...state.cameras.values()];
@@ -1143,6 +1247,7 @@ function renderCameras() {
     return;
   }
   for (const camera of cameras) dom.main.append(makeCameraSection(camera));
+  startFeedObserver();
 }
 
 async function loadMore(cameraId, wrap, button) {
@@ -1162,7 +1267,9 @@ async function loadMore(cameraId, wrap, button) {
     camera.events.push(...added);
     camera.next_before = page.next_before;
     for (const event of added) {
-      grid?.append(makeCard(event, camera.name, camera.id === "all"));
+      const card = makeCard(event, camera.name, camera.id === "all");
+      grid?.append(card);
+      feedObserver?.observe(card);
     }
     wrap.hidden = camera.next_before == null;
     if (wrap.hidden) moreObserver?.unobserve(wrap);
@@ -1346,6 +1453,9 @@ async function loadInitial() {
 }
 
 dom.refresh.addEventListener("click", loadInitial);
+dom.viewToggle.addEventListener("click", () => {
+  setView(state.view === "feed" ? "grid" : "feed");
+});
 window.addEventListener("scroll", () => stopPreview(), { passive: true });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
@@ -1353,6 +1463,7 @@ document.addEventListener("visibilitychange", () => {
     state.recentTimer = null;
     stopPreview();
   } else {
+    scheduleFeedActivation();
     scheduleRecentRefresh(0);
   }
 });
@@ -1367,4 +1478,5 @@ window.addEventListener("pageshow", event => {
   }
 });
 
+updateViewMode();
 loadInitial();

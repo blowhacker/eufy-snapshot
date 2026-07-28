@@ -77,6 +77,10 @@ button, a { -webkit-tap-highlight-color: transparent; }
   color: var(--txt);
 }
 .dw-icon.loading svg { animation: dw-spin 800ms linear infinite; }
+.dw-view-toggle.active {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
 
 .dw-filters {
   padding: 4px 20px 9px;
@@ -448,6 +452,85 @@ button, a { -webkit-tap-highlight-color: transparent; }
   border: 1px solid var(--line-soft);
   border-radius: var(--r-lg);
   background: var(--surf);
+}
+
+body.dw-feed-mode {
+  height: 100dvh;
+  overflow: hidden;
+  background: #06080b;
+}
+body.dw-feed-mode .dw-filters { display: none; }
+body.dw-feed-mode .dw-main {
+  width: min(100%, 520px);
+  height: calc(100dvh - 48px);
+  min-height: 0;
+  padding: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scroll-snap-type: y mandatory;
+  scrollbar-width: none;
+}
+body.dw-feed-mode .dw-main::-webkit-scrollbar { display: none; }
+body.dw-feed-mode .dw-camera,
+body.dw-feed-mode .dw-camera + .dw-camera {
+  padding: 0;
+  border: 0;
+}
+body.dw-feed-mode .dw-camera-head,
+body.dw-feed-mode .dw-camera-empty {
+  display: none;
+}
+body.dw-feed-mode .dw-grid { display: block; }
+body.dw-feed-mode .dw-card {
+  display: flex;
+  height: calc(100dvh - 48px);
+  flex-direction: column;
+  border: 0;
+  border-radius: 0;
+  background: #06080b;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+  transform: none;
+}
+body.dw-feed-mode .dw-card:hover,
+body.dw-feed-mode .dw-card:focus-visible {
+  border-color: transparent;
+  background: #06080b;
+  transform: none;
+}
+body.dw-feed-mode .dw-thumb {
+  min-height: 0;
+  flex: 1 1 auto;
+  aspect-ratio: auto;
+}
+body.dw-feed-mode .dw-thumb img {
+  object-fit: cover;
+  transform: none;
+}
+body.dw-feed-mode .dw-card-meta {
+  height: 52px;
+  flex: 0 0 52px;
+  padding: 0 14px max(0px, env(safe-area-inset-bottom));
+  background: #0d1016;
+}
+body.dw-feed-mode .dw-time { font-size: 11px; }
+body.dw-feed-mode .dw-duration { display: block; }
+body.dw-feed-mode .dw-badge {
+  top: 12px;
+  left: 12px;
+  padding: 5px 8px;
+  font-size: 10px;
+}
+body.dw-feed-mode .dw-preview-mark {
+  top: 12px;
+  right: 12px;
+  display: grid;
+}
+body.dw-feed-mode .dw-more {
+  min-height: 48px;
+  padding: 8px 0;
+  background: #06080b;
 }
 
 @keyframes dw-pulse { 50% { opacity: .46; } }
