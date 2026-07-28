@@ -19,10 +19,15 @@ from wanyard.video import (
 )
 
 
-def box(cx: float, *, track_id: str | None = None) -> dict:
+def box(
+    cx: float,
+    *,
+    track_id: str | None = None,
+    confidence: float = 0.8,
+) -> dict:
     value = {
         "cls": "person",
-        "conf": 0.8,
+        "conf": confidence,
         "x1": cx - 0.04,
         "y1": 0.3,
         "x2": cx + 0.04,
@@ -33,11 +38,19 @@ def box(cx: float, *, track_id: str | None = None) -> dict:
     return value
 
 
-def detection(offset: float, cx: float, *, track_id: str | None = None) -> dict:
+def detection(
+    offset: float,
+    cx: float,
+    *,
+    track_id: str | None = None,
+    confidence: float = 0.8,
+) -> dict:
     return {
         "ts_offset": offset,
         "abs_ts": 100.0 + offset,
-        "boxes": [box(cx, track_id=track_id)],
+        "boxes": [
+            box(cx, track_id=track_id, confidence=confidence)
+        ],
     }
 
 
@@ -77,6 +90,31 @@ class ObjectTrackletTests(unittest.TestCase):
             _object_tracklets_from_detections(segment, detections),
             [],
         )
+
+    def test_representative_box_and_time_are_same_observation(self) -> None:
+        segment = {"id": 1, "source_id": "front", "media_epoch": 100.0}
+        token = "front:session:1"
+        detections = [
+            detection(1.0, 0.10, track_id=token, confidence=0.60),
+            detection(1.5, 0.40, track_id=token, confidence=0.95),
+            detection(2.0, 0.70, track_id=token, confidence=0.75),
+        ]
+
+        row = _object_tracklets_from_detections(segment, detections)[0]
+        representative = json.loads(row["boxes_json"])[0]
+        first = json.loads(row["first_boxes_json"])[0]
+        last = json.loads(row["last_boxes_json"])[0]
+
+        self.assertEqual(row["abs_ts"], 101.5)
+        self.assertEqual(row["start_off"], 1.5)
+        self.assertAlmostEqual(
+            (representative["x1"] + representative["x2"]) / 2,
+            0.40,
+        )
+        self.assertEqual(row["track_first_abs_ts"], 101.0)
+        self.assertAlmostEqual((first["x1"] + first["x2"]) / 2, 0.10)
+        self.assertEqual(row["track_last_abs_ts"], 102.0)
+        self.assertAlmostEqual((last["x1"] + last["x2"]) / 2, 0.70)
 
     def test_identity_continues_an_episode_across_segments(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

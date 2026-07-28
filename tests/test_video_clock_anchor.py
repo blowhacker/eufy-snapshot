@@ -299,9 +299,10 @@ class VideoDbLogicTests(unittest.TestCase):
         self.assertEqual(resolved["seg_path"], "front/live.mp4")
         self.assertEqual(resolved["seg_media_epoch"], base)
         self.assertEqual(resolved["seg_end_ts"], None)
-        self.assertEqual(round(resolved["abs_ts"], 1), round(base + 2.0, 1))
+        self.assertEqual(round(resolved["abs_ts"], 1), round(base + 2.5, 1))
         boxes = json.loads(resolved["boxes_json"])
         self.assertEqual(boxes[0]["cls"], "person")
+        self.assertEqual(boxes[0]["conf"], 0.82)
 
     def test_notification_class_recovers_for_detection_refs(self) -> None:
         """d:<id> refs resolve with NULL class; the notification's own class

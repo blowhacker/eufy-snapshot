@@ -1153,9 +1153,9 @@ def make_app(
             ch if ch.isalnum() or ch in {"-", "_"} else "_"
             for ch in event_id_raw
         )
-        # v3 raises the old 176×132 ceiling and JPEG quality. The versioned
-        # key invalidates already-cached low-resolution crops.
-        cache_file = cache_dir / f"event_{safe_event_id}_crop_v3.jpg"
+        # v4 invalidates crops cut before representative event boxes and times
+        # were guaranteed to come from the same detection observation.
+        cache_file = cache_dir / f"event_{safe_event_id}_crop_v4.jpg"
         if not cache_file.exists():
             ok = await asyncio.to_thread(_extract_video_thumb, seg_path, cache_file, t, box)
             if not ok:

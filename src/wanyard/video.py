@@ -1201,12 +1201,27 @@ class VideoSegmentDB:
             used_track_ids: set[int] = set()
 
             for tracklet in sorted(tracklets, key=lambda e: e["abs_ts"]):
-                box = _event_box(tracklet)
-                if not box:
+                first_event = {
+                    **tracklet,
+                    "boxes_json": tracklet.get(
+                        "first_boxes_json", tracklet.get("boxes_json")
+                    ),
+                }
+                first_box = _event_box(first_event)
+                if not first_box:
                     continue
-                tracker_id = _box_tracker_id(box)
-                cx, cy = _box_center(box)
-                area = _box_area(box)
+                last_event = {
+                    **tracklet,
+                    "boxes_json": tracklet.get(
+                        "last_boxes_json", tracklet.get("boxes_json")
+                    ),
+                }
+                last_box = _event_box(last_event) or first_box
+                tracker_id = _box_tracker_id(first_box)
+                first_cx, first_cy = _box_center(first_box)
+                first_area = _box_area(first_box)
+                last_cx, last_cy = _box_center(last_box)
+                last_area = _box_area(last_box)
                 best: dict | None = None
                 best_dist = _OBJECT_TRACK_CENTER_DISTANCE
                 for track in active:
@@ -1220,15 +1235,36 @@ class VideoSegmentDB:
                             best = track
                             break
                         continue
-                    if not _area_compatible(area, float(track["area"])):
+                    if not _area_compatible(first_area, float(track["area"])):
                         continue
-                    dist = _center_distance(cx, cy, float(track["cx"]), float(track["cy"]))
+                    dist = _center_distance(
+                        first_cx,
+                        first_cy,
+                        float(track["cx"]),
+                        float(track["cy"]),
+                    )
                     if dist <= best_dist:
                         best = track
                         best_dist = dist
 
-                last_seen = float(tracklet["abs_ts"]) + max(
-                    0.0, float(tracklet["end_off"]) - float(tracklet["start_off"])
+                first_seen = float(
+                    tracklet.get("track_first_abs_ts", tracklet["abs_ts"])
+                )
+                last_seen = float(
+                    tracklet.get(
+                        "track_last_abs_ts",
+                        float(tracklet["abs_ts"]) + max(
+                            0.0,
+                            float(tracklet["end_off"])
+                            - float(tracklet["start_off"]),
+                        ),
+                    )
+                )
+                first_start_off = float(
+                    tracklet.get("track_first_off", tracklet["start_off"])
+                )
+                state_boxes_json = tracklet.get(
+                    "last_boxes_json", tracklet["boxes_json"]
                 )
                 if best:
                     track_id = int(best["id"])
@@ -1241,23 +1277,24 @@ class VideoSegmentDB:
                         " boxes_json=?, active=1, state='active'"
                         " WHERE id=?",
                         (
-                            cx, cy, area, last_seen, tracklet["segment_id"],
+                            last_cx, last_cy, last_area, last_seen,
+                            tracklet["segment_id"],
                             tracklet["start_off"], tracklet["end_off"],
                             tracklet["confidence"], observations,
-                            tracklet["boxes_json"], track_id,
+                            state_boxes_json, track_id,
                         ),
                     )
                     best.update({
-                        "cx": cx,
-                        "cy": cy,
-                        "area": area,
+                        "cx": last_cx,
+                        "cy": last_cy,
+                        "area": last_area,
                         "last_seen": last_seen,
                         "last_segment_id": tracklet["segment_id"],
                         "last_start_off": tracklet["start_off"],
                         "last_end_off": tracklet["end_off"],
                         "confidence": tracklet["confidence"],
                         "observations": observations,
-                        "boxes_json": tracklet["boxes_json"],
+                        "boxes_json": state_boxes_json,
                     })
                 else:
                     cur = conn.execute(
@@ -1268,12 +1305,13 @@ class VideoSegmentDB:
                         " boxes_json, active, state, stationary_since)"
                         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'active',?)",
                         (
-                            source_id, tracklet["class"], cx, cy, area,
-                            tracklet["abs_ts"], last_seen, tracklet["segment_id"],
-                            tracklet["segment_id"], tracklet["start_off"],
+                            source_id, tracklet["class"],
+                            last_cx, last_cy, last_area,
+                            first_seen, last_seen, tracklet["segment_id"],
+                            tracklet["segment_id"], first_start_off,
                             tracklet["start_off"], tracklet["end_off"],
                             tracklet["confidence"], int(tracklet.get("observations", 1)),
-                            tracklet["boxes_json"], tracklet["abs_ts"],
+                            state_boxes_json, first_seen,
                         ),
                     )
                     track_id = int(cur.lastrowid)
@@ -1282,22 +1320,22 @@ class VideoSegmentDB:
                         "id": track_id,
                         "source_id": source_id,
                         "class": tracklet["class"],
-                        "cx": cx,
-                        "cy": cy,
-                        "area": area,
-                        "first_seen": tracklet["abs_ts"],
+                        "cx": last_cx,
+                        "cy": last_cy,
+                        "area": last_area,
+                        "first_seen": first_seen,
                         "last_seen": last_seen,
                         "first_segment_id": tracklet["segment_id"],
                         "last_segment_id": tracklet["segment_id"],
-                        "first_start_off": tracklet["start_off"],
+                        "first_start_off": first_start_off,
                         "last_start_off": tracklet["start_off"],
                         "last_end_off": tracklet["end_off"],
                         "confidence": tracklet["confidence"],
                         "observations": int(tracklet.get("observations", 1)),
-                        "boxes_json": tracklet["boxes_json"],
+                        "boxes_json": state_boxes_json,
                         "active": 1,
                         "state": "active",
-                        "stationary_since": tracklet["abs_ts"],
+                        "stationary_since": first_seen,
                     })
                     output.append({
                         **tracklet,
@@ -2464,7 +2502,11 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
                     "area": area,
                     "seen": 1,
                     "confidence": float(box.get("conf", 0.0)),
-                    "box": dict(box),
+                    "representative_off": off,
+                    "representative_abs_ts": det_abs_ts,
+                    "representative_box": dict(box),
+                    "first_box": dict(box),
+                    "last_box": dict(box),
                 })
                 new_idx = len(tracks) - 1
                 active_indices.append(new_idx)
@@ -2478,32 +2520,45 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
             track["seen"] += 1
             if tracker_id:
                 track["tracker_id"] = tracker_id
-                track["box"]["track_id"] = tracker_id
+                track["representative_box"]["track_id"] = tracker_id
+                track["first_box"]["track_id"] = tracker_id
             track["cx"] = (track["cx"] * 0.7) + (cx * 0.3)
             track["cy"] = (track["cy"] * 0.7) + (cy * 0.3)
             track["area"] = (track["area"] * 0.7) + (area * 0.3)
+            track["last_box"] = dict(box)
             conf = float(box.get("conf", 0.0))
-            if conf >= track["confidence"]:
+            if conf > track["confidence"]:
                 track["confidence"] = conf
-                track["box"] = dict(box)
+                track["representative_off"] = off
+                track["representative_abs_ts"] = det_abs_ts
+                track["representative_box"] = dict(box)
 
     rows: list[dict] = []
     for track in tracks:
         if track["seen"] < _OBJECT_MIN_OBSERVATIONS:
             continue
-        box = dict(track["box"])
-        box["cls"] = track["class"]
+        representative_box = dict(track["representative_box"])
+        representative_box["cls"] = track["class"]
+        first_box = dict(track["first_box"])
+        first_box["cls"] = track["class"]
+        last_box = dict(track["last_box"])
+        last_box["cls"] = track["class"]
         rows.append({
             "segment_id": segment["id"],
             "source_id": segment["source_id"],
-            "abs_ts": float(track["first_abs_ts"]),
-            "display_ts": float(track["first_abs_ts"]),
+            "abs_ts": float(track["representative_abs_ts"]),
+            "display_ts": float(track["representative_abs_ts"]),
             "class": track["class"],
-            "start_off": float(track["first"]),
+            "start_off": float(track["representative_off"]),
             "end_off": float(track["last"]),
             "confidence": float(track["confidence"]),
             "observations": int(track["seen"]),
-            "boxes_json": json.dumps([box]),
+            "boxes_json": json.dumps([representative_box]),
+            "track_first_abs_ts": float(track["first_abs_ts"]),
+            "track_first_off": float(track["first"]),
+            "first_boxes_json": json.dumps([first_box]),
+            "track_last_abs_ts": float(track["last_abs_ts"]),
+            "last_boxes_json": json.dumps([last_box]),
         })
     rows.sort(key=lambda r: (r["abs_ts"], r["class"]))
     return rows
