@@ -172,11 +172,10 @@ function previewAbsoluteTime(item, mediaTime = item.video.currentTime) {
 function updatePreviewPan(item, mediaTime) {
   if (activePreview !== item || !item.track) return;
   const ts = previewAbsoluteTime(item, mediaTime);
-  const stabilize = state.view !== "feed";
-  const verticalAnchor = stabilize && item.trackingPreview?.class === "person"
+  const verticalAnchor = item.trackingPreview?.class === "person"
     ? 0.3
     : 0.5;
-  const box = stabilize && previewTracker?.sampleTrackSmooth
+  const box = previewTracker?.sampleTrackSmooth
     ? previewTracker.sampleTrackSmooth(item.track, ts, verticalAnchor)
     : previewTracker?.sampleTrack(item.track, ts);
   if (!box) return;
