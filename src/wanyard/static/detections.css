@@ -258,9 +258,18 @@ button, a { -webkit-tap-highlight-color: transparent; }
   pointer-events: none;
   background: #090b0f;
   transition: opacity 100ms ease;
+  will-change: transform, opacity;
 }
-.dw-card.preview-playing .dw-preview-video { opacity: 1; }
-.dw-card.preview-playing.preview-looping .dw-preview-video { opacity: 0; }
+.dw-card.preview-playing .dw-preview-video {
+  opacity: 1;
+  transition: opacity 100ms ease, transform 90ms linear;
+}
+.dw-card.preview-playing.preview-looping .dw-preview-video {
+  opacity: 0;
+}
+.dw-card.preview-playing.preview-looping.preview-seeking .dw-preview-video {
+  transition: opacity 100ms ease;
+}
 .dw-thumb.missing img { display: none; }
 .dw-thumb-fallback {
   position: absolute;

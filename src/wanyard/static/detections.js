@@ -101,11 +101,11 @@ function previewCrop(
       cropHeight = Math.min(frameHeight, cropWidth / aspect);
     }
   }
-  const width = Math.min(frameWidth, Math.max(2, Math.round(cropWidth)));
-  const height = Math.min(frameHeight, Math.max(2, Math.round(cropHeight)));
+  const width = Math.min(frameWidth, Math.max(2, cropWidth));
+  const height = Math.min(frameHeight, Math.max(2, cropHeight));
   return {
-    x: Math.round(Math.max(0, Math.min(frameWidth - width, centerX - width / 2))),
-    y: Math.round(Math.max(0, Math.min(frameHeight - height, centerY - height / 2))),
+    x: Math.max(0, Math.min(frameWidth - width, centerX - width / 2)),
+    y: Math.max(0, Math.min(frameHeight - height, centerY - height / 2)),
     width,
     height,
   };
@@ -143,12 +143,15 @@ function layoutActivePreview() {
   const scale = Math.max(hostWidth / crop.width, hostHeight / crop.height);
   video.style.width = `${frameWidth * scale}px`;
   video.style.height = `${frameHeight * scale}px`;
-  video.style.left = `${
+  const left = (
     -crop.x * scale + (hostWidth - crop.width * scale) / 2
-  }px`;
-  video.style.top = `${
+  );
+  const top = (
     -crop.y * scale + (hostHeight - crop.height * scale) / 2
-  }px`;
+  );
+  video.style.left = "0";
+  video.style.top = "0";
+  video.style.transform = `translate3d(${left}px, ${top}px, 0)`;
 }
 
 function previewAbsoluteTime(item, mediaTime = item.video.currentTime) {
@@ -225,7 +228,10 @@ async function loadPreviewTrack(item, refreshesLeft = 0) {
     || !preview?.class
     || !Number.isFinite(Number(preview.start_ts))
     || !Number.isFinite(Number(preview.end_ts))
-  ) return;
+  ) {
+    settlePreviewTrack(item);
+    return;
+  }
   item.trackAbort?.abort();
   const abort = new AbortController();
   item.trackAbort = abort;
@@ -250,13 +256,42 @@ async function loadPreviewTrack(item, refreshesLeft = 0) {
     Number(preview.event_ts),
     preview.box
   );
-  updatePreviewPan(item, item.video.currentTime);
+  updatePreviewPan(
+    item,
+    item.videoPlaying ? item.video.currentTime : item.start
+  );
+  settlePreviewTrack(item);
   if (refreshesLeft > 0) {
     item.trackRefreshTimer = setTimeout(
       () => loadPreviewTrack(item, refreshesLeft - 1),
       1000
     );
   }
+}
+
+function revealPreview(item) {
+  if (
+    activePreview !== item
+    || !item.videoPlaying
+    || !item.trackReady
+  ) return;
+  clearTimeout(item.trackRevealTimer);
+  item.trackRevealTimer = null;
+  item.card.classList.remove("preview-loading");
+  if (!item.card.classList.contains("preview-playing")) {
+    layoutActivePreview();
+    // Commit the initial tracked transform before enabling its transition.
+    // Otherwise the video fades in while flying from the event thumbnail's
+    // later box to the actual pre-roll position.
+    void item.video.offsetWidth;
+    item.card.classList.add("preview-playing");
+  }
+}
+
+function settlePreviewTrack(item) {
+  if (activePreview !== item) return;
+  item.trackReady = true;
+  revealPreview(item);
 }
 
 function cancelPendingPreview(card = null) {
@@ -334,10 +369,12 @@ function stopPreview(card = null, failed = false) {
     trackAbort,
     trackRefreshTimer,
     loopTimer,
+    trackRevealTimer,
   } = activePreview;
   activePreview = null;
   clearTimeout(trackRefreshTimer);
   clearTimeout(loopTimer);
+  clearTimeout(trackRevealTimer);
   trackAbort?.abort();
   if (panFrame != null) {
     if (panFrameKind === "video") video.cancelVideoFrameCallback?.(panFrame);
@@ -348,7 +385,8 @@ function stopPreview(card = null, failed = false) {
   activeCard.classList.remove(
     "preview-loading",
     "preview-playing",
-    "preview-looping"
+    "preview-looping",
+    "preview-seeking"
   );
   if (failed) activeCard.dataset.previewFailed = "1";
   try {
@@ -367,6 +405,7 @@ function restartPreview(item) {
   item.loopTimer = setTimeout(() => {
     item.loopTimer = null;
     if (activePreview !== item) return;
+    item.card.classList.add("preview-seeking");
     item.panMediaTime = null;
     const reveal = () => {
       if (activePreview !== item) return;
@@ -374,7 +413,7 @@ function restartPreview(item) {
       item.video.play().catch(() => {});
       requestAnimationFrame(() => {
         if (activePreview !== item) return;
-        item.card.classList.remove("preview-looping");
+        item.card.classList.remove("preview-looping", "preview-seeking");
         item.looping = false;
       });
     };
@@ -600,6 +639,9 @@ function startPreview(card, preview) {
     trackRefreshTimer: null,
     loopTimer: null,
     looping: false,
+    videoPlaying: false,
+    trackReady: false,
+    trackRevealTimer: null,
     panBox: preview.box,
     panCenter: {
       x: (Number(preview.box.x1) + Number(preview.box.x2)) / 2,
@@ -614,8 +656,8 @@ function startPreview(card, preview) {
 
   video.addEventListener("playing", () => {
     if (activePreview !== item) return;
-    card.classList.remove("preview-loading");
-    card.classList.add("preview-playing");
+    item.videoPlaying = true;
+    revealPreview(item);
   });
   video.addEventListener("waiting", () => {
     if (activePreview === item) card.classList.add("preview-loading");
@@ -642,6 +684,10 @@ function startPreview(card, preview) {
   }
   host.append(video);
   schedulePreviewPan(item);
+  item.trackRevealTimer = setTimeout(
+    () => settlePreviewTrack(item),
+    450
+  );
   loadPreviewTrack(item, preview.kind === "hls" ? 2 : 0);
   if (preview.kind === "hls") startHlsPreview(item);
   else startMp4Preview(item, preview);
