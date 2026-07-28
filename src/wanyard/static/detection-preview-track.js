@@ -5,11 +5,12 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
-  const MAX_GAP = 2.5;
+  const MAX_GAP = 4.0;
   const HOLD_SECONDS = 1.0;
   const GATE_FLOOR = 0.22;
   const GATE_SPEED = 2.5;
   const WARM_GATE = 0.40;
+  const MAX_GATE = 0.40;
   const MIN_SPEED = 0.04;
 
   function finiteBox(box) {
@@ -81,7 +82,13 @@
         const x = moving ? head.x + track.vx * dt : head.x;
         const y = moving ? head.y + track.vy * dt : head.y;
         const gate = moving
-          ? Math.max(GATE_FLOOR, GATE_SPEED * Math.hypot(track.vx, track.vy) * dt)
+          ? Math.min(
+              MAX_GATE,
+              Math.max(
+                GATE_FLOOR,
+                GATE_SPEED * Math.hypot(track.vx, track.vy) * dt
+              )
+            )
           : WARM_GATE;
         return {
           track,

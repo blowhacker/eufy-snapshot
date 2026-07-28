@@ -52,6 +52,25 @@ test("keeps close parallel people as two continuous tracks", () => {
   );
 });
 
+test("bridges sparse walker samples without taking a corner false positive", () => {
+  const detections = [
+    { abs_ts: 10, boxes: [box("person", .93, .66), box("person", .01, .74)] },
+    { abs_ts: 13.37, boxes: [box("person", .64, .58)] },
+    { abs_ts: 14, boxes: [box("person", .58, .56)] },
+    { abs_ts: 17.37, boxes: [box("person", .29, .48), box("person", .01, .74)] },
+    { abs_ts: 20.74, boxes: [box("person", .10, .42)] },
+    { abs_ts: 21.3, boxes: [box("person", .05, .40)] },
+  ];
+
+  const tracks = buildTracks(detections, "person");
+  const track = selectTrack(tracks, 10, box("person", .93, .66));
+
+  assert.ok(track);
+  assert.equal(track.points.length, 6);
+  assert.ok(sampleTrack(track, 18).x2 < .3);
+  assert.ok(sampleTrack(track, 21).x2 < .1);
+});
+
 test("filters other classes and drops a stale pan target", () => {
   const tracks = buildTracks([
     { abs_ts: 20, boxes: [box("dog", .2), box("person", .6)] },
