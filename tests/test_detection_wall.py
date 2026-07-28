@@ -18,7 +18,12 @@ from wanyard.web import (
     _detection_wall_preview,
     _gzip_path_is_excluded,
 )
-from wanyard.video import VideoSegmentDB, _encounter_events_from_detections
+from wanyard.video import (
+    VideoSegmentDB,
+    _encounter_events_from_detections,
+    _filter_with_polygons,
+    _merge_encounter_area_boxes,
+)
 
 
 def _event(
@@ -264,6 +269,15 @@ class DetectionWallCameraTests(unittest.TestCase):
                     "y1": 0.25,
                     "x2": 0.4,
                     "y2": 0.75,
+                },
+                {
+                    "cls": "person",
+                    "conf": 0.99,
+                    "x1": 0.7,
+                    "y1": 0.1,
+                    "x2": 0.9,
+                    "y2": 0.4,
+                    "_zone_sample": True,
                 },
             ],
         )
@@ -680,6 +694,35 @@ class EncounterGroupingTests(unittest.TestCase):
             sorted(round(row["end_off"] - row["start_off"], 1) for row in rows),
             [0.5, 0.5],
         )
+
+    def test_encounter_matches_area_entered_after_first_observation(self) -> None:
+        detections = [
+            self.detection(101.0, [_box(0.10, 0.45)]),
+            self.detection(101.5, [_box(0.20, 0.45)]),
+            self.detection(102.0, [_box(0.30, 0.45)]),
+        ]
+        area = _area(0.28, 0.40, 0.34, 0.50)
+
+        rows = _encounter_events_from_detections(self.segment, detections)
+        boxes = json.loads(rows[0]["boxes_json"])
+
+        self.assertTrue(any(box.get("_zone_sample") for box in boxes))
+        self.assertEqual(_filter_with_polygons(rows, [area]), rows)
+
+    def test_area_trail_is_merged_when_encounter_crosses_segments(self) -> None:
+        first = json.dumps([_box(0.10, 0.45)])
+        second = json.dumps([_box(0.30, 0.45)])
+        merged = _merge_encounter_area_boxes(first, second)
+        event = {"boxes_json": merged}
+
+        self.assertEqual(
+            _filter_with_polygons(
+                [event],
+                [_area(0.28, 0.40, 0.34, 0.50)],
+            ),
+            [event],
+        )
+        self.assertTrue(json.loads(merged)[1]["_zone_sample"])
 
 
 class DetectionWallAllCameraTests(unittest.TestCase):

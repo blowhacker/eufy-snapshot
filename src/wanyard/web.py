@@ -548,7 +548,13 @@ def _select_event_box(boxes: list, cls: str) -> dict | None:
     candidates = [b for b in boxes if isinstance(b, dict)]
     if not candidates:
         return None
-    matching = [b for b in candidates if b.get("cls") == cls] or candidates
+    display_candidates = [
+        box for box in candidates
+        if not box.get("_zone_sample")
+    ] or candidates
+    matching = [
+        b for b in display_candidates if b.get("cls") == cls
+    ] or display_candidates
 
     def score(box: dict) -> tuple[float, float]:
         try:

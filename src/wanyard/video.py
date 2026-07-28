@@ -1262,14 +1262,19 @@ class VideoSegmentDB:
                             set(previous.get("tracker_ids") or [])
                             | set(state.get("tracker_ids") or [])
                         )
+                    merged_boxes = _merge_encounter_area_boxes(
+                        candidate["boxes_json"],
+                        event.get("boxes_json"),
+                    )
                     conn.execute(
-                        "UPDATE video_events SET confidence=?, track_id=?"
+                        "UPDATE video_events SET confidence=?, boxes_json=?, track_id=?"
                         " WHERE id=?",
                         (
                             max(
                                 float(candidate["confidence"]),
                                 float(event.get("confidence", 0.0)),
                             ),
+                            merged_boxes,
                             json.dumps(state, separators=(",", ":")),
                             candidate["id"],
                         ),
@@ -2889,6 +2894,14 @@ def _encounter_events_from_detections(
                     "seen": 1,
                     "confidence": float(group["confidence"]),
                     "representative_boxes": group["boxes"],
+                    "area_boxes": [],
+                    "area_cells": {
+                        cell for cell in (
+                            _encounter_area_cell(box)
+                            for box in group["boxes"]
+                        )
+                        if cell is not None
+                    },
                     "first_box": dict(group["union"]),
                     "last_box": dict(group["union"]),
                     "tracker_ids": set(group["tracker_ids"]),
@@ -2914,6 +2927,7 @@ def _encounter_events_from_detections(
             track["seen"] += 1
             track["last_box"] = dict(group["union"])
             track["tracker_ids"].update(group["tracker_ids"])
+            _append_encounter_area_boxes(track, group["boxes"])
             track["confidence"] = max(
                 float(track["confidence"]),
                 float(group["confidence"]),
@@ -2940,7 +2954,10 @@ def _encounter_events_from_detections(
             "end_off": float(track["last"]),
             "confidence": float(track["confidence"]),
             "boxes_json": json.dumps(
-                track["representative_boxes"],
+                [
+                    *track["representative_boxes"],
+                    *track["area_boxes"],
+                ],
                 separators=(",", ":"),
             ),
             "event_type": "detection",
@@ -3006,6 +3023,70 @@ def _encounter_frame_groups(boxes: list[dict]) -> list[dict]:
     return groups
 
 
+def _encounter_area_cell(box: dict) -> tuple[int, int] | None:
+    try:
+        cx, cy = _box_center(box)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(cx) or not math.isfinite(cy):
+        return None
+    return (
+        max(0, min(99, int(cx * 100))),
+        max(0, min(99, int(cy * 100))),
+    )
+
+
+def _append_encounter_area_boxes(track: dict, boxes: list[dict]) -> None:
+    """Retain one box per visited 1%-of-frame cell for area filtering."""
+    cells = track["area_cells"]
+    for box in boxes:
+        cell = _encounter_area_cell(box)
+        if cell is None or cell in cells:
+            continue
+        sample = {
+            key: box[key]
+            for key in ("cls", "x1", "y1", "x2", "y2")
+            if key in box
+        }
+        sample["_zone_sample"] = True
+        track["area_boxes"].append(sample)
+        cells.add(cell)
+
+
+def _merge_encounter_area_boxes(existing_raw, incoming_raw) -> str:
+    try:
+        existing = json.loads(existing_raw) if existing_raw else []
+    except (TypeError, json.JSONDecodeError):
+        existing = []
+    try:
+        incoming = json.loads(incoming_raw) if incoming_raw else []
+    except (TypeError, json.JSONDecodeError):
+        incoming = []
+    if not isinstance(existing, list):
+        existing = []
+    if not isinstance(incoming, list):
+        incoming = []
+    cells = {
+        cell for cell in (
+            _encounter_area_cell(box)
+            for box in existing
+            if isinstance(box, dict)
+        )
+        if cell is not None
+    }
+    for box in incoming:
+        if not isinstance(box, dict):
+            continue
+        cell = _encounter_area_cell(box)
+        if cell is None or cell in cells:
+            continue
+        sample = dict(box)
+        sample["_zone_sample"] = True
+        existing.append(sample)
+        cells.add(cell)
+    return json.dumps(existing, separators=(",", ":"))
+
+
 def _encounter_boxes_near(first: dict, second: dict) -> bool:
     try:
         first_cx, first_cy = _box_center(first)
@@ -3055,15 +3136,18 @@ def _public_object_event(event: dict) -> dict:
     return row
 
 
-def _event_box(event: dict) -> dict | None:
+def _event_boxes(event: dict) -> list[dict]:
     try:
         boxes = json.loads(event["boxes_json"]) if event.get("boxes_json") else []
     except (TypeError, json.JSONDecodeError):
-        return None
-    for box in boxes:
-        if isinstance(box, dict):
-            return box
-    return None
+        return []
+    if not isinstance(boxes, list):
+        return []
+    return [box for box in boxes if isinstance(box, dict)]
+
+
+def _event_box(event: dict) -> dict | None:
+    return next(iter(_event_boxes(event)), None)
 
 
 def _box_tracker_id(box: dict | None) -> str | None:
@@ -3823,11 +3907,14 @@ def _normalize_polygon(raw) -> list[dict]:
 def _event_allowed_by_areas(event: dict, areas: list[list[dict]]) -> bool:
     if not areas:
         return True
-    box = _event_box(event)
-    if not box:
-        return False
-    cx, cy = _box_center(box)
-    return _point_in_any_polygon(cx, cy, areas)
+    for box in _event_boxes(event):
+        try:
+            cx, cy = _box_center(box)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if _point_in_any_polygon(cx, cy, areas):
+            return True
+    return False
 
 
 def _zone_filter_disabled(zone_id) -> bool:
