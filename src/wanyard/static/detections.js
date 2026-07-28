@@ -1164,20 +1164,23 @@ function makeCard(event, cameraName, showCamera = false) {
 
   const thumb = document.createElement("div");
   thumb.className = "dw-thumb";
-  const image = document.createElement("img");
-  image.src = event.thumb_url;
-  image.alt = "";
-  image.loading = "lazy";
-  image.decoding = "async";
-  image.addEventListener("error", () => thumb.classList.add("missing"), { once: true });
-
-  const fallback = document.createElement("span");
-  fallback.className = "dw-thumb-fallback";
-  fallback.textContent = "No preview";
   const badge = document.createElement("span");
   badge.className = "dw-badge";
   badge.textContent = classLabel(event.class);
-  thumb.append(image, fallback, badge);
+  if (state.view !== "feed") {
+    const image = document.createElement("img");
+    image.src = event.thumb_url;
+    image.alt = "";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.addEventListener("error", () => thumb.classList.add("missing"), { once: true });
+
+    const fallback = document.createElement("span");
+    fallback.className = "dw-thumb-fallback";
+    fallback.textContent = "No preview";
+    thumb.append(image, fallback);
+  }
+  thumb.append(badge);
   if (event.preview) {
     link.classList.add("previewable");
     const previewMark = document.createElement("span");
