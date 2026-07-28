@@ -211,5 +211,28 @@
     return recent?.box || null;
   }
 
-  return { buildTracks, selectTrack, sampleTrack };
+  function dampCenter(previous, target, elapsed, timeConstant = 0.22) {
+    const fallback = {
+      x: Number(target?.x),
+      y: Number(target?.y),
+    };
+    if (
+      !Number.isFinite(Number(previous?.x))
+      || !Number.isFinite(Number(previous?.y))
+      || !Number.isFinite(fallback.x)
+      || !Number.isFinite(fallback.y)
+      || !Number.isFinite(Number(elapsed))
+      || Number(elapsed) <= 0
+      || Number(elapsed) > 0.75
+    ) return fallback;
+    const alpha = 1 - Math.exp(
+      -Number(elapsed) / Math.max(0.01, Number(timeConstant) || 0.22)
+    );
+    return {
+      x: Number(previous.x) + (fallback.x - Number(previous.x)) * alpha,
+      y: Number(previous.y) + (fallback.y - Number(previous.y)) * alpha,
+    };
+  }
+
+  return { buildTracks, selectTrack, sampleTrack, dampCenter };
 });

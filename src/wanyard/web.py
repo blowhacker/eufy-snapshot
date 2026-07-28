@@ -907,6 +907,10 @@ def make_app(
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         limit = min(60, max(8, limit))
+        include_counts = (
+            request.query_params.get("counts", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
 
         def _payload() -> dict:
             all_source_ids = {
@@ -952,7 +956,7 @@ def make_app(
             # Counts populate the sticky object filter on an initial camera
             # selection. Pagination does not repeat the aggregation.
             counts: dict[str, int] = {}
-            if before is None:
+            if before is None and include_counts:
                 if selected_zone_uids:
                     for source in selected_sources:
                         polygons = polygons_by_source.get(source["id"])

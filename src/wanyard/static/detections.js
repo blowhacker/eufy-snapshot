@@ -1,4 +1,5 @@
 const PAGE_SIZE = 24;
+const RECENT_REFRESH_MS = 4000;
 
 function filtersFromUrl() {
   const params = new URLSearchParams(location.search);
@@ -41,6 +42,8 @@ const state = {
   cameras: new Map(),
   request: 0,
   loading: false,
+  recentLoading: false,
+  recentTimer: null,
 };
 
 const canHoverPreview = window.matchMedia(
@@ -161,7 +164,31 @@ function updatePreviewPan(item, mediaTime) {
   const ts = previewAbsoluteTime(item, mediaTime);
   const box = previewTracker?.sampleTrack(item.track, ts);
   if (!box) return;
-  item.panBox = box;
+  const target = {
+    x: (Number(box.x1) + Number(box.x2)) / 2,
+    y: (Number(box.y1) + Number(box.y2)) / 2,
+  };
+  const currentMediaTime = Number(mediaTime);
+  if (item.panMediaTime == null) {
+    item.panMediaTime = currentMediaTime;
+  } else {
+    item.panCenter = previewTracker.dampCenter(
+      item.panCenter,
+      target,
+      currentMediaTime - item.panMediaTime
+    );
+    item.panMediaTime = currentMediaTime;
+  }
+  const center = item.panCenter || target;
+  const halfWidth = (Number(box.x2) - Number(box.x1)) / 2;
+  const halfHeight = (Number(box.y2) - Number(box.y1)) / 2;
+  item.panBox = {
+    ...box,
+    x1: center.x - halfWidth,
+    y1: center.y - halfHeight,
+    x2: center.x + halfWidth,
+    y2: center.y + halfHeight,
+  };
   layoutActivePreview();
 }
 
@@ -533,6 +560,11 @@ function startPreview(card, preview) {
     trackAbort: null,
     trackRefreshTimer: null,
     panBox: preview.box,
+    panCenter: {
+      x: (Number(preview.box.x1) + Number(preview.box.x2)) / 2,
+      y: (Number(preview.box.y1) + Number(preview.box.y2)) / 2,
+    },
+    panMediaTime: null,
     cropSize: null,
     panFrame: null,
     panFrameKind: null,
@@ -659,13 +691,19 @@ function restoreFiltersFromUrl() {
   state.zones = filters.zones;
 }
 
-function apiUrl({ source = state.camera, before = null } = {}) {
-  const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
+function apiUrl({
+  source = state.camera,
+  before = null,
+  limit = PAGE_SIZE,
+  counts = true,
+} = {}) {
+  const params = new URLSearchParams({ limit: String(limit) });
   const classes = selectedClasses();
   if (classes.length) params.set("classes", classes.join(","));
   const zones = selectedZones();
   if (zones.length) params.set("zones", zones.join(","));
   params.set("source", source || "all");
+  if (!counts) params.set("counts", "0");
   if (Number.isFinite(before)) params.set("before", String(before));
   return `/api/detections/wall?${params}`;
 }
@@ -814,6 +852,7 @@ function makeCard(event, cameraName, showCamera = false) {
   const link = document.createElement("a");
   link.className = "dw-card";
   link.href = event.target_url;
+  link._preview = event.preview;
   link.dataset.eventId = String(event.id);
   link.setAttribute(
     "aria-label",
@@ -844,9 +883,9 @@ function makeCard(event, cameraName, showCamera = false) {
     previewMark.setAttribute("aria-hidden", "true");
     previewMark.innerHTML = `<svg width="8" height="8" viewBox="0 0 8 8"><path d="m2 1.25 4.5 2.75L2 6.75v-5.5Z" fill="currentColor"/></svg>`;
     thumb.append(previewMark);
-    link.addEventListener("mouseenter", () => queuePreview(link, event.preview));
+    link.addEventListener("mouseenter", () => queuePreview(link, link._preview));
     link.addEventListener("mouseleave", () => stopPreview(link));
-    link.addEventListener("focus", () => queuePreview(link, event.preview));
+    link.addEventListener("focus", () => queuePreview(link, link._preview));
     link.addEventListener("blur", () => stopPreview(link));
   }
 
@@ -1033,7 +1072,123 @@ function renderFailure(error) {
   dom.summary.textContent = "Unavailable";
 }
 
+function sameFinalizedEpisode(a, b) {
+  return (
+    Boolean(a?.provisional) !== Boolean(b?.provisional)
+    && a?.source_id === b?.source_id
+    && a?.class === b?.class
+    && Math.abs(Number(a?.abs_ts) - Number(b?.abs_ts)) < .15
+  );
+}
+
+function mergeRecentEvents(currentEvents, recentEvents) {
+  const wantedLength = Math.max(PAGE_SIZE, currentEvents.length);
+  const merged = [];
+  for (const event of [...recentEvents, ...currentEvents]) {
+    const exact = merged.findIndex(item => String(item.id) === String(event.id));
+    if (exact >= 0) continue;
+    const transitioned = merged.findIndex(item => sameFinalizedEpisode(item, event));
+    if (transitioned >= 0) {
+      if (merged[transitioned].provisional && !event.provisional) {
+        merged[transitioned] = event;
+      }
+      continue;
+    }
+    merged.push(event);
+  }
+  merged.sort((a, b) =>
+    Number(b.display_ts) - Number(a.display_ts)
+    || String(b.id).localeCompare(String(a.id))
+  );
+  return merged.slice(0, wantedLength);
+}
+
+function eventOrder(events) {
+  return events.map(event => String(event.id)).join("\n");
+}
+
+function syncRecentCardMetadata(cameraId, events) {
+  const section = document.querySelector(
+    `[data-camera-id="${CSS.escape(cameraId)}"]`
+  );
+  if (!section) return;
+  const byId = new Map(events.map(event => [String(event.id), event]));
+  for (const card of section.querySelectorAll(".dw-card")) {
+    const event = byId.get(card.dataset.eventId);
+    if (!event) continue;
+    card.href = event.target_url;
+    card._preview = event.preview;
+    const duration = card.querySelector(".dw-duration");
+    if (duration) duration.textContent = eventDuration(event);
+  }
+}
+
+function scheduleRecentRefresh(delay = RECENT_REFRESH_MS) {
+  clearTimeout(state.recentTimer);
+  if (document.hidden) {
+    state.recentTimer = null;
+    return;
+  }
+  state.recentTimer = setTimeout(refreshRecent, delay);
+}
+
+async function refreshRecent() {
+  clearTimeout(state.recentTimer);
+  state.recentTimer = null;
+  if (
+    document.hidden
+    || state.loading
+    || state.recentLoading
+    || activePreview
+    || pendingPreview
+  ) {
+    scheduleRecentRefresh();
+    return;
+  }
+  state.recentLoading = true;
+  const request = state.request;
+  try {
+    const data = await fetchWall({ limit: 8, counts: false });
+    if (
+      request !== state.request
+      || activePreview
+      || pendingPreview
+    ) return;
+    let layoutChanged = false;
+    for (const recentCamera of data.cameras || []) {
+      const camera = state.cameras.get(recentCamera.id);
+      if (!camera) continue;
+      const previousOrder = eventOrder(camera.events);
+      camera.events = mergeRecentEvents(
+        camera.events,
+        recentCamera.events || []
+      );
+      if (
+        camera.next_before != null
+        || recentCamera.next_before != null
+      ) {
+        camera.next_before = camera.events.length
+          ? Number(camera.events[camera.events.length - 1].display_ts) - .000001
+          : null;
+      }
+      if (eventOrder(camera.events) !== previousOrder) {
+        layoutChanged = true;
+      } else {
+        syncRecentCardMetadata(camera.id, camera.events);
+      }
+    }
+    if (layoutChanged) renderCameras();
+  } catch {
+    // A transient poll failure should not replace a usable wall with an error.
+  } finally {
+    state.recentLoading = false;
+    scheduleRecentRefresh();
+  }
+}
+
 async function loadInitial() {
+  clearTimeout(state.recentTimer);
+  state.recentTimer = null;
   stopPreview();
   const request = ++state.request;
   state.loading = true;
@@ -1062,6 +1217,7 @@ async function loadInitial() {
       state.loading = false;
       dom.refresh.classList.remove("loading");
       dom.refresh.disabled = false;
+      scheduleRecentRefresh();
     }
   }
 }
@@ -1069,7 +1225,13 @@ async function loadInitial() {
 dom.refresh.addEventListener("click", loadInitial);
 window.addEventListener("scroll", () => stopPreview(), { passive: true });
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopPreview();
+  if (document.hidden) {
+    clearTimeout(state.recentTimer);
+    state.recentTimer = null;
+    stopPreview();
+  } else {
+    scheduleRecentRefresh(0);
+  }
 });
 window.addEventListener("popstate", () => {
   restoreFiltersFromUrl();

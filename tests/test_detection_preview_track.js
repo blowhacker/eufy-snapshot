@@ -5,6 +5,7 @@ const {
   buildTracks,
   selectTrack,
   sampleTrack,
+  dampCenter,
 } = require("../src/wanyard/static/detection-preview-track.js");
 
 function box(cls, centerX, centerY = .5) {
@@ -42,4 +43,15 @@ test("filters other classes and drops a stale pan target", () => {
   assert.equal(tracks.length, 1);
   assert.equal(sampleTrack(track, 20.5).cls, "person");
   assert.equal(sampleTrack(track, 21.1), null);
+});
+
+test("damps box-centre noise and resets after a seek", () => {
+  const first = dampCenter({ x: .2, y: .5 }, { x: .4, y: .6 }, .04);
+
+  assert.ok(first.x > .2 && first.x < .25);
+  assert.ok(first.y > .5 && first.y < .525);
+  assert.deepEqual(
+    dampCenter(first, { x: .1, y: .3 }, -.5),
+    { x: .1, y: .3 }
+  );
 });

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -356,6 +357,37 @@ class DetectionWallCameraTests(unittest.TestCase):
 
 
 class DetectionWallDatabaseTests(unittest.TestCase):
+    def test_provisional_cache_refreshes_when_a_detection_arrives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            media_start = time.time() - 10.0
+            segment_id = db.open_segment(
+                "front", "front/open.mp4", media_start
+            )
+            db.set_segment_media_start(segment_id, media_start)
+            detection = {
+                "has_human": True,
+                "confidence": 0.9,
+                "classes": ["person"],
+            }
+            db.insert_live_detections(segment_id, "front", [{
+                **detection,
+                "abs_ts": media_start + 1.0,
+                "boxes": [_box(0.2, 0.4)],
+            }])
+
+            self.assertEqual(db.provisional_events("front"), [])
+
+            db.insert_live_detections(segment_id, "front", [{
+                **detection,
+                "abs_ts": media_start + 1.5,
+                "boxes": [_box(0.21, 0.4)],
+            }])
+            events = db.provisional_events("front")
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["class"], "person")
+
     def test_object_query_returns_only_appearances_with_prefixed_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = VideoSegmentDB(Path(tmpdir) / "video.db")

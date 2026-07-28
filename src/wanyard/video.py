@@ -54,7 +54,6 @@ _CLASS_PRIORITY      = list(DEFAULT_DETECTION_CLASSES)
 _NOTIFICATION_CONFIRMATION_STRATEGY = "yolo1280-crop640-960-v1"
 _NOTIFICATION_CONFIRMATION_RETRY_SECONDS = 30.0
 _NOTIFICATION_CONFIRMATION_TIMEOUT_SECONDS = 8.0
-_PROVISIONAL_TRACKLET_CACHE_TTL_SECONDS = 3.0
 _CLOCK_ANCHOR_SCAN_SECONDS = 5.0
 _CLOCK_ANCHOR_SCAN_FRAMES = 150
 _CLOCK_ZERO_CONTAINER_PTS = "container_pts"
@@ -335,7 +334,7 @@ def _worldize_event_row(r: dict) -> dict:
 class VideoSegmentDB:
     def __init__(self, db_path: Path) -> None:
         self._path = db_path
-        self._provisional_tracklet_cache: dict[int, tuple[float, list[dict]]] = {}
+        self._provisional_tracklet_cache: dict[int, tuple[int, list[dict]]] = {}
         self._provisional_tracklet_cache_lock = threading.Lock()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
@@ -1627,8 +1626,7 @@ class VideoSegmentDB:
             if not seg_row:
                 return None
             seg = dict(seg_row)
-            now = time.time()
-            for row in self._provisional_tracklets_for_segment(seg, now):
+            for row in self._provisional_tracklets_for_segment(seg):
                 if row.get("class") != cls:
                     continue
                 if round(float(row.get("start_off", -1.0)), 1) != round(start_off, 1):
@@ -1892,7 +1890,6 @@ class VideoSegmentDB:
         with self._connect() as conn:
             segs = [dict(r) for r in conn.execute(sql, params).fetchall()]
 
-        now = time.time()
         if not source_id or source_id == "all":
             qualifying_ids = {int(seg["id"]) for seg in segs}
             with self._provisional_tracklet_cache_lock:
@@ -1903,7 +1900,7 @@ class VideoSegmentDB:
         polygons = self.zone_polygons(source_id, zone_id)
         events: list[dict] = []
         for seg in segs:
-            rows = self._provisional_tracklets_for_segment(seg, now)
+            rows = self._provisional_tracklets_for_segment(seg)
             for row in rows:
                 if since is not None and row["abs_ts"] < since:
                     continue
@@ -1921,11 +1918,18 @@ class VideoSegmentDB:
         events.sort(key=lambda r: r["abs_ts"], reverse=True)
         return events
 
-    def _provisional_tracklets_for_segment(self, seg: dict, now: float) -> list[dict]:
+    def _provisional_tracklets_for_segment(self, seg: dict) -> list[dict]:
         seg_id = int(seg["id"])
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS watermark"
+                " FROM video_detections WHERE segment_id=?",
+                (seg_id,),
+            ).fetchone()
+        watermark = int(row["watermark"]) if row else 0
         with self._provisional_tracklet_cache_lock:
             cached = self._provisional_tracklet_cache.get(seg_id)
-            if cached and now - cached[0] < _PROVISIONAL_TRACKLET_CACHE_TTL_SECONDS:
+            if cached and cached[0] == watermark:
                 return [dict(row) for row in cached[1]]
 
         rows = _object_tracklets_from_detections(
@@ -1933,7 +1937,7 @@ class VideoSegmentDB:
         )
         cached_rows = [dict(row) for row in rows]
         with self._provisional_tracklet_cache_lock:
-            self._provisional_tracklet_cache[seg_id] = (now, cached_rows)
+            self._provisional_tracklet_cache[seg_id] = (watermark, cached_rows)
         return [dict(row) for row in cached_rows]
 
     def live_status(self, source_id: str | None = None, zone_id=None,
