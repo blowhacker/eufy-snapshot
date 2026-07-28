@@ -18,7 +18,7 @@ from wanyard.web import (
     _detection_wall_preview,
     _gzip_path_is_excluded,
 )
-from wanyard.video import VideoSegmentDB
+from wanyard.video import VideoSegmentDB, _encounter_events_from_detections
 
 
 def _event(
@@ -414,7 +414,7 @@ class DetectionWallDatabaseTests(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["class"], "person")
 
-    def test_object_query_returns_only_appearances_with_prefixed_ids(self) -> None:
+    def test_wall_query_uses_persisted_encounters_not_object_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = VideoSegmentDB(Path(tmpdir) / "video.db")
             segment_id = db.open_segment("front", "front/segment.mp4", 100.0)
@@ -452,6 +452,20 @@ class DetectionWallDatabaseTests(unittest.TestCase):
                     "event_type": "appeared",
                 },
             ])
+            db.insert_events([
+                {
+                    **base,
+                    "abs_ts": 101.0,
+                    "class": "person",
+                    "event_type": "detection",
+                },
+                {
+                    **base,
+                    "abs_ts": 105.0,
+                    "class": "car",
+                    "event_type": "detection",
+                },
+            ])
 
             rows = db.list_detection_events(
                 "front", ["person", "car"], limit=10
@@ -459,9 +473,36 @@ class DetectionWallDatabaseTests(unittest.TestCase):
 
             self.assertEqual(
                 [(row["class"], row["event_type"]) for row in rows],
-                [("car", "appeared"), ("person", "appeared")],
+                [("car", "detection"), ("person", "detection")],
             )
-            self.assertTrue(all(str(row["id"]).startswith("o:") for row in rows))
+            self.assertTrue(all(str(row["id"]).isdigit() for row in rows))
+
+    def test_provisional_wall_groups_nearby_people(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            media_start = time.time() - 10.0
+            segment_id = db.open_segment(
+                "front", "front/open.mp4", media_start
+            )
+            db.set_segment_media_start(segment_id, media_start)
+            for offset in (1.0, 1.5):
+                db.insert_live_detections(segment_id, "front", [{
+                    "abs_ts": media_start + offset,
+                    "has_human": True,
+                    "confidence": 0.9,
+                    "boxes": [
+                        _box(0.20 + offset * 0.01, 0.4),
+                        _box(0.25 + offset * 0.01, 0.4),
+                    ],
+                    "classes": ["person"],
+                }])
+
+            events = db.provisional_detection_events("front")
+
+        self.assertEqual(len(events), 1)
+        self.assertTrue(str(events[0]["id"]).startswith("g:"))
+        boxes = json.loads(events[0]["boxes_json"])
+        self.assertEqual(boxes[0]["group_size"], 2)
 
     def test_before_cursor_is_exclusive(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -524,6 +565,57 @@ class DetectionWallDatabaseTests(unittest.TestCase):
             )
 
             self.assertEqual(counts, {"person": 1, "bird": 1})
+
+
+class EncounterGroupingTests(unittest.TestCase):
+    segment = {
+        "id": 7,
+        "source_id": "front",
+        "media_epoch": 100.0,
+        "start_ts": 100.0,
+        "duration_sec": 60.0,
+    }
+
+    @staticmethod
+    def detection(ts: float, boxes: list[dict]) -> dict:
+        return {
+            "abs_ts": ts,
+            "ts_offset": ts - 100.0,
+            "boxes": boxes,
+        }
+
+    def test_nearby_pair_is_one_encounter_but_far_group_is_separate(self) -> None:
+        detections = []
+        for ts, shift in ((101.0, 0.0), (101.5, 0.02)):
+            detections.append(self.detection(ts, [
+                _box(0.20 + shift, 0.40),
+                _box(0.25 + shift, 0.41),
+                _box(0.80 - shift, 0.45),
+            ]))
+
+        rows = _encounter_events_from_detections(self.segment, detections)
+
+        self.assertEqual(len(rows), 2)
+        group_sizes = sorted(
+            json.loads(row["boxes_json"])[0]["group_size"]
+            for row in rows
+        )
+        self.assertEqual(group_sizes, [1, 2])
+
+    def test_short_detection_gap_reconnects_moving_group(self) -> None:
+        detections = [
+            self.detection(101.0, [_box(0.60, 0.45)]),
+            self.detection(101.5, [_box(0.55, 0.45)]),
+            self.detection(104.3, [_box(0.30, 0.45)]),
+            self.detection(104.8, [_box(0.25, 0.45)]),
+        ]
+
+        rows = _encounter_events_from_detections(self.segment, detections)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["abs_ts"], 101.0)
+        self.assertEqual(rows[0]["start_off"], 1.0)
+        self.assertAlmostEqual(rows[0]["end_off"], 4.8)
 
 
 class DetectionWallAllCameraTests(unittest.TestCase):

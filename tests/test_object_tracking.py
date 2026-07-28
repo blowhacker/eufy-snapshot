@@ -153,6 +153,39 @@ class ObjectTrackletTests(unittest.TestCase):
                 1,
             )
 
+    def test_distant_group_across_segment_boundary_stays_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            first_id = db.open_segment("front", "front/one.mp4", 100.0)
+            db.set_segment_media_start(first_id, 100.0)
+            db.close_segment(first_id, 110.0, None, None)
+            second_id = db.open_segment("front", "front/two.mp4", 110.0)
+            db.set_segment_media_start(second_id, 110.0)
+            db.close_segment(second_id, 120.0, None, None)
+
+            extract_events(db.get_segment(first_id), [
+                detection(8.5, 0.10, track_id="front:session:1"),
+                detection(9.0, 0.12, track_id="front:session:1"),
+            ], db)
+            extract_events(db.get_segment(second_id), [
+                {
+                    **detection(10.5, 0.85, track_id="front:session:2"),
+                    "ts_offset": 0.5,
+                    "abs_ts": 110.5,
+                },
+                {
+                    **detection(11.0, 0.88, track_id="front:session:2"),
+                    "ts_offset": 1.0,
+                    "abs_ts": 111.0,
+                },
+            ], db)
+
+            events = db.list_detection_events(
+                "front", ["person"], 10, None
+            )
+
+        self.assertEqual(len(events), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

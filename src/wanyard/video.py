@@ -46,6 +46,12 @@ _SPRITE_COLS         = 10
 _SPRITE_ROWS         = 6
 _EVENT_GAP_SECONDS   = 2.0    # detections within this gap = same event
 _TRACKED_EVENT_GAP_SECONDS = 6.0
+_ENCOUNTER_GAP_SECONDS = 6.0
+_ENCOUNTER_GROUP_BASE_DISTANCE = 0.08
+_ENCOUNTER_GROUP_SIZE_FACTOR = 0.65
+_ENCOUNTER_MOTION_BASE_DISTANCE = 0.08
+_ENCOUNTER_MOTION_SPEED_DISTANCE = 0.10
+_ENCOUNTER_MAX_AREA_RATIO = 8.0
 _PROVISIONAL_GRACE_SECONDS = 3600.0
 _OBJECT_TRACK_CENTER_DISTANCE = 0.045
 _OBJECT_TRACK_AREA_RATIO = 3.0
@@ -337,6 +343,7 @@ class VideoSegmentDB:
     def __init__(self, db_path: Path) -> None:
         self._path = db_path
         self._provisional_tracklet_cache: dict[int, tuple[int, list[dict]]] = {}
+        self._provisional_encounter_cache: dict[int, tuple[int, list[dict]]] = {}
         self._provisional_tracklet_cache_lock = threading.Lock()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
@@ -1179,6 +1186,109 @@ class VideoSegmentDB:
                 rows,
             )
 
+    def insert_encounter_events(self, events: list[dict]) -> None:
+        """Persist group encounters, continuing matches over segment edges."""
+        if not events:
+            return
+        used_prior_ids: set[int] = set()
+        with self._connect() as conn:
+            for event in sorted(events, key=lambda row: row["abs_ts"]):
+                state = _encounter_state(event.get("track_id"))
+                first_box = event.get("_encounter_first_box")
+                first_ts = float(
+                    event.get("_encounter_first_abs_ts", event["abs_ts"])
+                )
+                best: tuple[float, sqlite3.Row, dict] | None = None
+                candidates = conn.execute(
+                    "SELECT e.* FROM video_events e"
+                    " WHERE e.source_id=? AND e.class=?"
+                    " AND e.event_type='detection' AND e.segment_id<>?"
+                    " ORDER BY e.id DESC LIMIT 100",
+                    (
+                        event["source_id"],
+                        event["class"],
+                        event["segment_id"],
+                    ),
+                ).fetchall()
+                for candidate in candidates:
+                    candidate_id = int(candidate["id"])
+                    if candidate_id in used_prior_ids:
+                        continue
+                    previous = _encounter_state(candidate["track_id"])
+                    if not previous or not state or not first_box:
+                        continue
+                    gap = first_ts - float(previous["last_abs_ts"])
+                    if gap < 0 or gap > _ENCOUNTER_GAP_SECONDS:
+                        continue
+                    previous_box = previous.get("last_box")
+                    if not isinstance(previous_box, dict):
+                        continue
+                    previous_cx, previous_cy = _box_center(previous_box)
+                    current_cx, current_cy = _box_center(first_box)
+                    predicted_x = (
+                        previous_cx + float(previous.get("vx", 0.0)) * gap
+                    )
+                    predicted_y = (
+                        previous_cy + float(previous.get("vy", 0.0)) * gap
+                    )
+                    distance = _center_distance(
+                        current_cx, current_cy, predicted_x, predicted_y
+                    )
+                    shared_tokens = (
+                        set(previous.get("tracker_ids") or [])
+                        & set(event.get("_encounter_tracker_ids") or [])
+                    )
+                    max_distance = (
+                        0.65
+                        if shared_tokens
+                        else min(
+                            0.5,
+                            _ENCOUNTER_MOTION_BASE_DISTANCE
+                            + _ENCOUNTER_MOTION_SPEED_DISTANCE * gap,
+                        )
+                    )
+                    if distance > max_distance:
+                        continue
+                    score = distance - (1.0 if shared_tokens else 0.0)
+                    if best is None or score < best[0]:
+                        best = (score, candidate, previous)
+
+                if best is not None:
+                    _, candidate, previous = best
+                    used_prior_ids.add(int(candidate["id"]))
+                    if state:
+                        state["tracker_ids"] = sorted(
+                            set(previous.get("tracker_ids") or [])
+                            | set(state.get("tracker_ids") or [])
+                        )
+                    conn.execute(
+                        "UPDATE video_events SET confidence=?, track_id=?"
+                        " WHERE id=?",
+                        (
+                            max(
+                                float(candidate["confidence"]),
+                                float(event.get("confidence", 0.0)),
+                            ),
+                            json.dumps(state, separators=(",", ":")),
+                            candidate["id"],
+                        ),
+                    )
+                    continue
+
+                row = {
+                    **event,
+                    "event_type": event.get("event_type", "detection"),
+                    "track_id": event.get("track_id"),
+                }
+                conn.execute(
+                    "INSERT INTO video_events"
+                    "(segment_id, source_id, abs_ts, class, start_off, end_off,"
+                    " confidence, boxes_json, event_type, track_id)"
+                    " VALUES(:segment_id,:source_id,:abs_ts,:class,:start_off,:end_off,"
+                    " :confidence,:boxes_json,:event_type,:track_id)",
+                    row,
+                )
+
     def track_object_events(self, segment: dict, tracklets: list[dict]) -> list[dict]:
         source_id = segment["source_id"]
         media_start = _seg_media_start(segment)
@@ -1427,41 +1537,28 @@ class VideoSegmentDB:
         limit: int = 25,
         before: float | None = None,
     ) -> list[dict]:
-        """Newest appearance/detection episodes for the thumbnail wall.
-
-        Unlike ``list_events``, this deliberately excludes object-permanence
-        ``disappeared`` rows and accepts several classes in one indexed query.
-        """
-        use_objects = self.object_events_available(
-            source_id, None, before
-        )
-        table = "object_events" if use_objects else "video_events"
-        clock = "e.display_ts" if use_objects else "e.abs_ts"
-        join = "LEFT JOIN" if use_objects else "JOIN"
-        where, params = ["e.source_id=?"], [source_id]
-        if use_objects:
-            where.append("e.event_type='appeared'")
-        else:
-            where.append("e.event_type!='disappeared'")
+        """Newest persisted group encounters for the thumbnail wall."""
+        where, params = [
+            "e.source_id=?",
+            "e.event_type!='disappeared'",
+        ], [source_id]
         if classes:
             placeholders = ",".join("?" for _ in classes)
             where.append(f"e.class IN ({placeholders})")
             params.extend(classes)
         if before is not None:
-            where.append(f"{clock}<?")
+            where.append("e.abs_ts<?")
             params.append(before)
         params.append(max(1, int(limit)))
         sql = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
             " s.media_epoch as seg_media_epoch"
-            f" FROM {table} e {join} segments s ON s.id=e.segment_id"
+            " FROM video_events e JOIN segments s ON s.id=e.segment_id"
             f" WHERE {' AND '.join(where)}"
-            f" ORDER BY {clock} DESC, e.id DESC LIMIT ?"
+            " ORDER BY e.abs_ts DESC, e.id DESC LIMIT ?"
         )
         with self._connect() as conn:
             rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
-        if use_objects:
-            return [_public_object_event(_worldize_event_row(row)) for row in rows]
         return [_worldize_event_row(row) for row in rows]
 
     def detection_class_counts(
@@ -1475,16 +1572,8 @@ class VideoSegmentDB:
         ``polygons=None`` means whole frame. A non-empty list applies union
         semantics using the same box-centre rule as timeline activity areas.
         """
-        table = (
-            "object_events"
-            if self.object_events_available(source_id)
-            else "video_events"
-        )
-        where, params = [], []
-        if table == "object_events":
-            where.append("event_type='appeared'")
-        else:
-            where.append("event_type!='disappeared'")
+        table = "video_events"
+        where, params = ["event_type!='disappeared'"], []
         if source_id and source_id != "all":
             where.append("source_id=?")
             params.append(source_id)
@@ -1511,7 +1600,7 @@ class VideoSegmentDB:
                     counts[cls] = counts.get(cls, 0) + 1
 
         if include_provisional:
-            provisional = self.provisional_events(
+            provisional = self.provisional_detection_events(
                 source_id, zone_id="none"
             )
             if polygons is not None:
@@ -1680,6 +1769,35 @@ class VideoSegmentDB:
                 return None
             seg = dict(seg_row)
             for row in self._provisional_tracklets_for_segment(seg):
+                if row.get("class") != cls:
+                    continue
+                if round(float(row.get("start_off", -1.0)), 1) != round(start_off, 1):
+                    continue
+                row["id"] = raw_id
+                row["provisional"] = True
+                row["seg_path"] = seg["path"]
+                row["spritesheet"] = seg.get("spritesheet")
+                row["seg_media_epoch"] = seg.get("media_epoch")
+                row["seg_end_ts"] = seg.get("end_ts")
+                return _worldize_event_row(row)
+            return None
+
+        if raw_id.startswith("g:"):
+            try:
+                _prefix, segment_id_raw, cls, start_off_raw = raw_id.split(":", 3)
+                segment_id = int(segment_id_raw)
+                start_off = float(start_off_raw)
+            except ValueError:
+                return None
+            with self._connect() as conn:
+                seg_row = conn.execute(
+                    "SELECT * FROM segments WHERE id=?",
+                    (segment_id,),
+                ).fetchone()
+            if not seg_row:
+                return None
+            seg = dict(seg_row)
+            for row in self._provisional_encounters_for_segment(seg):
                 if row.get("class") != cls:
                     continue
                 if round(float(row.get("start_off", -1.0)), 1) != round(start_off, 1):
@@ -1919,6 +2037,68 @@ class VideoSegmentDB:
     def provisional_events(self, source_id: str | None = None,
                            since: float | None = None,
                            zone_id=None) -> list[dict]:
+        segs = self._provisional_segments(source_id, since)
+        if not source_id or source_id == "all":
+            qualifying_ids = {int(seg["id"]) for seg in segs}
+            with self._provisional_tracklet_cache_lock:
+                for cache in (
+                    self._provisional_tracklet_cache,
+                    self._provisional_encounter_cache,
+                ):
+                    for seg_id in list(cache):
+                        if seg_id not in qualifying_ids:
+                            cache.pop(seg_id, None)
+
+        polygons = self.zone_polygons(source_id, zone_id)
+        events: list[dict] = []
+        for seg in segs:
+            rows = self._provisional_tracklets_for_segment(seg)
+            for row in rows:
+                if since is not None and row["abs_ts"] < since:
+                    continue
+                row["id"] = f"p:{row['segment_id']}:{row['class']}:{row['start_off']:.1f}"
+                row["provisional"] = True
+                row["seg_path"] = seg["path"]
+                row["spritesheet"] = seg.get("spritesheet")
+                row["seg_media_epoch"] = seg.get("media_epoch")
+                _worldize_event_row(row)
+                events.append(row)
+        events = _filter_with_polygons(events, polygons)
+        events.sort(key=lambda r: r["abs_ts"], reverse=True)
+        return events
+
+    def provisional_detection_events(
+        self,
+        source_id: str | None = None,
+        since: float | None = None,
+        zone_id=None,
+    ) -> list[dict]:
+        """Live group encounters used specifically by the detection wall."""
+        polygons = self.zone_polygons(source_id, zone_id)
+        events: list[dict] = []
+        for seg in self._provisional_segments(source_id, since):
+            for row in self._provisional_encounters_for_segment(seg):
+                if since is not None and row["abs_ts"] < since:
+                    continue
+                row["id"] = (
+                    f"g:{row['segment_id']}:{row['class']}:"
+                    f"{row['start_off']:.1f}"
+                )
+                row["provisional"] = True
+                row["seg_path"] = seg["path"]
+                row["spritesheet"] = seg.get("spritesheet")
+                row["seg_media_epoch"] = seg.get("media_epoch")
+                _worldize_event_row(row)
+                events.append(row)
+        events = _filter_with_polygons(events, polygons)
+        events.sort(key=lambda row: row["abs_ts"], reverse=True)
+        return events
+
+    def _provisional_segments(
+        self,
+        source_id: str | None,
+        since: float | None,
+    ) -> list[dict]:
         cutoff = time.time() - _PROVISIONAL_GRACE_SECONDS
         open_cutoff = time.time() - _LIVE_HLS_UNREFERENCED_RETENTION_SECONDS
         epoch = _segment_media_epoch_sql("s")
@@ -1941,35 +2121,7 @@ class VideoSegmentDB:
             f" ORDER BY {epoch} DESC"
         )
         with self._connect() as conn:
-            segs = [dict(r) for r in conn.execute(sql, params).fetchall()]
-
-        if not source_id or source_id == "all":
-            qualifying_ids = {int(seg["id"]) for seg in segs}
-            with self._provisional_tracklet_cache_lock:
-                for seg_id in list(self._provisional_tracklet_cache):
-                    if seg_id not in qualifying_ids:
-                        self._provisional_tracklet_cache.pop(seg_id, None)
-
-        polygons = self.zone_polygons(source_id, zone_id)
-        events: list[dict] = []
-        for seg in segs:
-            rows = self._provisional_tracklets_for_segment(seg)
-            for row in rows:
-                if since is not None and row["abs_ts"] < since:
-                    continue
-                row["id"] = f"p:{row['segment_id']}:{row['class']}:{row['start_off']:.1f}"
-                row["provisional"] = True
-                row["seg_path"] = seg["path"]
-                row["spritesheet"] = seg.get("spritesheet")
-                row["seg_media_epoch"] = seg.get("media_epoch")
-                _worldize_event_row(row)
-                events.append(row)
-        events = _filter_with_polygons(events, polygons)
-        # B4: provisional events come from the live detector's video_detections
-        # (chained into tracklets above). The HLS-tag loop is gone, so there is
-        # no separate hls_events stream to merge.
-        events.sort(key=lambda r: r["abs_ts"], reverse=True)
-        return events
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _provisional_tracklets_for_segment(self, seg: dict) -> list[dict]:
         seg_id = int(seg["id"])
@@ -1991,6 +2143,31 @@ class VideoSegmentDB:
         cached_rows = [dict(row) for row in rows]
         with self._provisional_tracklet_cache_lock:
             self._provisional_tracklet_cache[seg_id] = (watermark, cached_rows)
+        return [dict(row) for row in cached_rows]
+
+    def _provisional_encounters_for_segment(self, seg: dict) -> list[dict]:
+        seg_id = int(seg["id"])
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS watermark"
+                " FROM video_detections WHERE segment_id=?",
+                (seg_id,),
+            ).fetchone()
+        watermark = int(row["watermark"]) if row else 0
+        with self._provisional_tracklet_cache_lock:
+            cached = self._provisional_encounter_cache.get(seg_id)
+            if cached and cached[0] == watermark:
+                return [dict(row) for row in cached[1]]
+
+        rows = _encounter_events_from_detections(
+            seg, self.detections_for_segment(seg_id)
+        )
+        cached_rows = [dict(row) for row in rows]
+        with self._provisional_tracklet_cache_lock:
+            self._provisional_encounter_cache[seg_id] = (
+                watermark,
+                cached_rows,
+            )
         return [dict(row) for row in cached_rows]
 
     def live_status(self, source_id: str | None = None, zone_id=None,
@@ -2279,17 +2456,19 @@ def backfill_events(db: VideoSegmentDB, video_dir: Path | None = None,
 def extract_events(segment: dict, detections: list[dict], db: VideoSegmentDB) -> int:
     """Group detections into events and store them."""
     tracklets = _object_tracklets_from_detections(segment, detections)
-    rows = db.track_object_events(segment, tracklets)
-    if rows:
-        db.insert_object_events(rows)
-        db.insert_events(_legacy_events_from_object_events(rows))
+    object_rows = db.track_object_events(segment, tracklets)
+    if object_rows:
+        db.insert_object_events(object_rows)
+    encounter_rows = _encounter_events_from_detections(segment, detections)
+    if encounter_rows:
+        db.insert_encounter_events(encounter_rows)
     media_start = _seg_media_start(segment)
     duration = _seg_duration(segment)
     if media_start is not None and duration is not None:
         db.mark_object_derivation(
             segment["source_id"], media_start, media_start + duration
         )
-    return len(rows)
+    return len(object_rows)
 
 
 def rebuild_events(
@@ -2415,6 +2594,59 @@ def derive_object_events(
         "segments_with_detections": detection_segments,
         "events": event_count,
         "sources": sources,
+    }
+
+
+def derive_encounter_events(
+    db: VideoSegmentDB,
+    source_id: str | None = None,
+    since: float | None = None,
+    until: float | None = None,
+) -> dict:
+    """Rebuild persisted wall encounters from already-stored detections."""
+    where = ["s.end_ts IS NOT NULL"]
+    params: list = []
+    if source_id and source_id != "all":
+        where.append("s.source_id=?")
+        params.append(source_id)
+    if since is not None:
+        where.append("s.end_ts>=?")
+        params.append(since)
+    if until is not None:
+        where.append("s.start_ts<=?")
+        params.append(until)
+
+    with db._connect() as conn:
+        segments = [
+            dict(row) for row in conn.execute(
+                "SELECT s.* FROM segments s"
+                f" WHERE {' AND '.join(where)}"
+                " ORDER BY s.source_id, s.start_ts",
+                params,
+            ).fetchall()
+        ]
+        segment_ids = [int(segment["id"]) for segment in segments]
+        for chunk in _chunks(segment_ids, 500):
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"DELETE FROM video_events WHERE segment_id IN ({placeholders})",
+                chunk,
+            )
+
+    event_count = 0
+    detection_segments = 0
+    for segment in segments:
+        detections = db.detections_for_segment(segment["id"])
+        if detections:
+            detection_segments += 1
+        rows = _encounter_events_from_detections(segment, detections)
+        if rows:
+            db.insert_encounter_events(rows)
+            event_count += len(rows)
+    return {
+        "segments": len(segments),
+        "segments_with_detections": detection_segments,
+        "events": event_count,
     }
 
 
@@ -2570,23 +2802,248 @@ def _object_tracklets_from_detections(segment: dict, detections: list[dict]) -> 
     return rows
 
 
-def _legacy_events_from_object_events(events: list[dict]) -> list[dict]:
-    return [
-        {
-            "segment_id": event["segment_id"],
-            "source_id": event["source_id"],
-            "abs_ts": event["abs_ts"],
-            "class": event["class"],
-            "start_off": event["start_off"],
-            "end_off": event["end_off"],
-            "confidence": event["confidence"],
-            "boxes_json": event["boxes_json"],
-            "event_type": event["event_type"],
-            "track_id": str(event["track_id"]),
+def _encounter_events_from_detections(
+    segment: dict,
+    detections: list[dict],
+) -> list[dict]:
+    """Collapse nearby same-class objects into spatial-temporal encounters."""
+    if not detections:
+        return []
+    media_start = _seg_media_start(segment)
+    if media_start is None:
+        return []
+
+    tracks: list[dict] = []
+    active_indices: list[int] = []
+    for detection in detections:
+        off = float(detection.get("ts_offset", 0.0))
+        if off < 0:
+            continue
+        abs_ts = float(detection.get("abs_ts", media_start + off))
+        groups = _encounter_frame_groups([
+            box for box in (detection.get("boxes") or [])
+            if isinstance(box, dict) and box.get("cls")
+        ])
+        active_indices = [
+            index for index in active_indices
+            if abs_ts - float(tracks[index]["last_abs_ts"])
+            <= _ENCOUNTER_GAP_SECONDS
+        ]
+        used_tracks: set[int] = set()
+        for group in sorted(
+            groups,
+            key=lambda item: float(item["confidence"]),
+            reverse=True,
+        ):
+            cx, cy = _box_center(group["union"])
+            area = _box_area(group["union"])
+            best_index: int | None = None
+            best_score = float("inf")
+            for index in active_indices:
+                if index in used_tracks:
+                    continue
+                track = tracks[index]
+                if track["class"] != group["class"]:
+                    continue
+                gap = abs_ts - float(track["last_abs_ts"])
+                if gap < 0 or gap > _ENCOUNTER_GAP_SECONDS:
+                    continue
+                ratio = _area_ratio_values(area, float(track["area"]))
+                if ratio is None or ratio > _ENCOUNTER_MAX_AREA_RATIO:
+                    continue
+                predicted_x = float(track["cx"]) + float(track["vx"]) * gap
+                predicted_y = float(track["cy"]) + float(track["vy"]) * gap
+                distance = _center_distance(cx, cy, predicted_x, predicted_y)
+                max_distance = min(
+                    0.5,
+                    _ENCOUNTER_MOTION_BASE_DISTANCE
+                    + _ENCOUNTER_MOTION_SPEED_DISTANCE * gap,
+                )
+                if distance > max_distance:
+                    continue
+                shared_tokens = (
+                    set(track["tracker_ids"]) & set(group["tracker_ids"])
+                )
+                score = (
+                    distance
+                    + abs(math.log(ratio)) * 0.015
+                    - (0.04 if shared_tokens else 0.0)
+                )
+                if score < best_score:
+                    best_score = score
+                    best_index = index
+
+            if best_index is None:
+                tracks.append({
+                    "class": group["class"],
+                    "first": off,
+                    "last": off,
+                    "first_abs_ts": abs_ts,
+                    "last_abs_ts": abs_ts,
+                    "cx": cx,
+                    "cy": cy,
+                    "vx": 0.0,
+                    "vy": 0.0,
+                    "area": area,
+                    "seen": 1,
+                    "confidence": float(group["confidence"]),
+                    "representative_boxes": group["boxes"],
+                    "first_box": dict(group["union"]),
+                    "last_box": dict(group["union"]),
+                    "tracker_ids": set(group["tracker_ids"]),
+                })
+                index = len(tracks) - 1
+                active_indices.append(index)
+                used_tracks.add(index)
+                continue
+
+            track = tracks[best_index]
+            used_tracks.add(best_index)
+            elapsed = abs_ts - float(track["last_abs_ts"])
+            if elapsed > 0:
+                measured_vx = (cx - float(track["cx"])) / elapsed
+                measured_vy = (cy - float(track["cy"])) / elapsed
+                track["vx"] = float(track["vx"]) * 0.4 + measured_vx * 0.6
+                track["vy"] = float(track["vy"]) * 0.4 + measured_vy * 0.6
+            track["last"] = off
+            track["last_abs_ts"] = abs_ts
+            track["cx"] = cx
+            track["cy"] = cy
+            track["area"] = area
+            track["seen"] += 1
+            track["last_box"] = dict(group["union"])
+            track["tracker_ids"].update(group["tracker_ids"])
+            track["confidence"] = max(
+                float(track["confidence"]),
+                float(group["confidence"]),
+            )
+
+    rows: list[dict] = []
+    for track in tracks:
+        if int(track["seen"]) < _OBJECT_MIN_OBSERVATIONS:
+            continue
+        state = {
+            "kind": "encounter-v1",
+            "last_abs_ts": float(track["last_abs_ts"]),
+            "last_box": track["last_box"],
+            "vx": float(track["vx"]),
+            "vy": float(track["vy"]),
+            "tracker_ids": sorted(track["tracker_ids"]),
         }
-        for event in events
-        if event.get("segment_id") is not None
-    ]
+        rows.append({
+            "segment_id": segment["id"],
+            "source_id": segment["source_id"],
+            "abs_ts": float(track["first_abs_ts"]),
+            "class": track["class"],
+            "start_off": float(track["first"]),
+            "end_off": float(track["last"]),
+            "confidence": float(track["confidence"]),
+            "boxes_json": json.dumps(
+                track["representative_boxes"],
+                separators=(",", ":"),
+            ),
+            "event_type": "detection",
+            "track_id": json.dumps(state, separators=(",", ":")),
+            "_encounter_first_abs_ts": float(track["first_abs_ts"]),
+            "_encounter_first_box": track["first_box"],
+            "_encounter_tracker_ids": sorted(track["tracker_ids"]),
+        })
+    rows.sort(key=lambda row: (row["abs_ts"], row["class"]))
+    return rows
+
+
+def _encounter_frame_groups(boxes: list[dict]) -> list[dict]:
+    components: list[list[dict]] = []
+    for box in sorted(
+        boxes,
+        key=lambda item: float(item.get("conf", 0.0)),
+        reverse=True,
+    ):
+        matching = [
+            index for index, component in enumerate(components)
+            if component[0].get("cls") == box.get("cls")
+            and any(_encounter_boxes_near(box, other) for other in component)
+        ]
+        if not matching:
+            components.append([dict(box)])
+            continue
+        target = matching[0]
+        components[target].append(dict(box))
+        for index in reversed(matching[1:]):
+            components[target].extend(components.pop(index))
+
+    groups = []
+    for component in components:
+        cls = str(component[0]["cls"])
+        confidence = max(float(box.get("conf", 0.0)) for box in component)
+        union = {
+            "cls": cls,
+            "conf": confidence,
+            "x1": min(float(box["x1"]) for box in component),
+            "y1": min(float(box["y1"]) for box in component),
+            "x2": max(float(box["x2"]) for box in component),
+            "y2": max(float(box["y2"]) for box in component),
+            "group_size": len(component),
+        }
+        tracker_ids = {
+            tracker_id for tracker_id in (
+                _box_tracker_id(box) for box in component
+            )
+            if tracker_id
+        }
+        groups.append({
+            "class": cls,
+            "confidence": confidence,
+            "union": union,
+            "boxes": (
+                [union]
+                if len(component) == 1
+                else [union, *component]
+            ),
+            "tracker_ids": tracker_ids,
+        })
+    return groups
+
+
+def _encounter_boxes_near(first: dict, second: dict) -> bool:
+    try:
+        first_cx, first_cy = _box_center(first)
+        second_cx, second_cy = _box_center(second)
+        first_size = max(
+            float(first["x2"]) - float(first["x1"]),
+            float(first["y2"]) - float(first["y1"]),
+        )
+        second_size = max(
+            float(second["x2"]) - float(second["x1"]),
+            float(second["y2"]) - float(second["y1"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return _center_distance(
+        first_cx, first_cy, second_cx, second_cy
+    ) <= max(
+        _ENCOUNTER_GROUP_BASE_DISTANCE,
+        _ENCOUNTER_GROUP_SIZE_FACTOR * max(first_size, second_size),
+    )
+
+
+def _area_ratio_values(first: float, second: float) -> float | None:
+    smaller, larger = sorted((float(first), float(second)))
+    if smaller <= 0:
+        return None
+    return larger / smaller
+
+
+def _encounter_state(raw) -> dict | None:
+    if not raw:
+        return None
+    try:
+        state = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(state, dict) or state.get("kind") != "encounter-v1":
+        return None
+    return state
 
 
 def _public_object_event(event: dict) -> dict:

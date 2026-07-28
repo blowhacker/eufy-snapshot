@@ -148,7 +148,12 @@ def _detection_wall_camera(
             source["id"], classes, fetch_limit, before
         )
 
-    provisional = video_db.provisional_events(source["id"])
+    provisional_getter = getattr(
+        video_db,
+        "provisional_detection_events",
+        video_db.provisional_events,
+    )
+    provisional = provisional_getter(source["id"])
     if zone_filter_active:
         from .video import _filter_with_polygons
         provisional = (
