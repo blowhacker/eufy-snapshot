@@ -72,7 +72,6 @@
           x: boxCenter.x,
           y: boxCenter.y,
           used: false,
-          bestHead: null,
         };
       });
       const predictions = heads.map(track => {
@@ -91,52 +90,38 @@
           x,
           y,
           gate,
-          best: null,
-          bestDistance: Infinity,
+          used: false,
         };
       });
 
+      const pairs = [];
       for (const prediction of predictions) {
         for (const candidate of candidates) {
           const distance = Math.hypot(
             candidate.x - prediction.x,
             candidate.y - prediction.y
           );
-          if (distance < prediction.bestDistance) {
-            prediction.bestDistance = distance;
-            prediction.best = candidate;
+          if (distance > prediction.gate) continue;
+          if (
+            prediction.track.vx != null
+            && Math.hypot(prediction.track.vx, prediction.track.vy) > MIN_SPEED
+          ) {
+            const dx = candidate.x - prediction.head.x;
+            const dy = candidate.y - prediction.head.y;
+            if (prediction.track.vx * dx + prediction.track.vy * dy < 0) continue;
           }
+          pairs.push({ prediction, candidate, distance });
         }
       }
-      for (const candidate of candidates) {
-        let bestDistance = Infinity;
-        for (const prediction of predictions) {
-          const distance = Math.hypot(
-            candidate.x - prediction.head.x,
-            candidate.y - prediction.head.y
-          );
-          if (distance < bestDistance) {
-            bestDistance = distance;
-            candidate.bestHead = prediction;
-          }
-        }
-      }
-      for (const prediction of predictions) {
-        const candidate = prediction.best;
-        if (
-          !candidate
-          || candidate.used
-          || candidate.bestHead !== prediction
-          || prediction.bestDistance > prediction.gate
-        ) continue;
-        if (
-          prediction.track.vx != null
-          && Math.hypot(prediction.track.vx, prediction.track.vy) > MIN_SPEED
-        ) {
-          const dx = candidate.x - prediction.head.x;
-          const dy = candidate.y - prediction.head.y;
-          if (prediction.track.vx * dx + prediction.track.vy * dy < 0) continue;
-        }
+      // Assign the strongest constant-velocity match first, then give the
+      // remaining track the remaining box. Requiring mutual nearest heads
+      // fragments parallel walkers: the trailing box can be nearer the
+      // leading person's old position even though that person's prediction
+      // already has an almost-perfect match farther ahead.
+      pairs.sort((a, b) => a.distance - b.distance);
+      for (const { prediction, candidate } of pairs) {
+        if (prediction.used || candidate.used) continue;
+        prediction.used = true;
         prediction.track.vx = (candidate.x - prediction.head.x) / prediction.dt;
         prediction.track.vy = (candidate.y - prediction.head.y) / prediction.dt;
         prediction.track.points.push({

@@ -260,6 +260,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
   transition: opacity 100ms ease;
 }
 .dw-card.preview-playing .dw-preview-video { opacity: 1; }
+.dw-card.preview-playing.preview-looping .dw-preview-video { opacity: 0; }
 .dw-thumb.missing img { display: none; }
 .dw-thumb-fallback {
   position: absolute;

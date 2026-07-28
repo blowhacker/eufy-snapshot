@@ -333,9 +333,11 @@ function stopPreview(card = null, failed = false) {
     panFrameKind,
     trackAbort,
     trackRefreshTimer,
+    loopTimer,
   } = activePreview;
   activePreview = null;
   clearTimeout(trackRefreshTimer);
+  clearTimeout(loopTimer);
   trackAbort?.abort();
   if (panFrame != null) {
     if (panFrameKind === "video") video.cancelVideoFrameCallback?.(panFrame);
@@ -343,7 +345,11 @@ function stopPreview(card = null, failed = false) {
   }
   resizeObserver?.disconnect();
   hls?.destroy();
-  activeCard.classList.remove("preview-loading", "preview-playing");
+  activeCard.classList.remove(
+    "preview-loading",
+    "preview-playing",
+    "preview-looping"
+  );
   if (failed) activeCard.dataset.previewFailed = "1";
   try {
     video.pause();
@@ -351,6 +357,34 @@ function stopPreview(card = null, failed = false) {
     video.load();
   } catch {}
   video.remove();
+}
+
+function restartPreview(item) {
+  if (activePreview !== item || item.looping) return;
+  item.looping = true;
+  item.video.pause();
+  item.card.classList.add("preview-looping");
+  item.loopTimer = setTimeout(() => {
+    item.loopTimer = null;
+    if (activePreview !== item) return;
+    item.panMediaTime = null;
+    const reveal = () => {
+      if (activePreview !== item) return;
+      updatePreviewPan(item, item.video.currentTime);
+      item.video.play().catch(() => {});
+      requestAnimationFrame(() => {
+        if (activePreview !== item) return;
+        item.card.classList.remove("preview-looping");
+        item.looping = false;
+      });
+    };
+    item.video.addEventListener("seeked", reveal, { once: true });
+    try {
+      item.video.currentTime = item.start;
+    } catch {
+      stopPreview(item.card, true);
+    }
+  }, 110);
 }
 
 function startMp4Preview(item, preview) {
@@ -564,6 +598,8 @@ function startPreview(card, preview) {
     track: null,
     trackAbort: null,
     trackRefreshTimer: null,
+    loopTimer: null,
+    looping: false,
     panBox: preview.box,
     panCenter: {
       x: (Number(preview.box.x1) + Number(preview.box.x2)) / 2,
@@ -589,14 +625,11 @@ function startPreview(card, preview) {
       activePreview === item
       && video.currentTime >= item.end - .05
     ) {
-      video.currentTime = item.start;
-      video.play().catch(() => {});
+      restartPreview(item);
     }
   });
   video.addEventListener("ended", () => {
-    if (activePreview !== item) return;
-    video.currentTime = item.start;
-    video.play().catch(() => {});
+    restartPreview(item);
   });
   video.addEventListener("error", () => {
     if (activePreview !== item) return;

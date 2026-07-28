@@ -34,6 +34,23 @@ test("tracks and interpolates the event subject without switching people", () =>
   assert.ok(Math.abs((sampled.x1 + sampled.x2) / 2 - .35) < .000001);
 });
 
+test("keeps close parallel people as two continuous tracks", () => {
+  const detections = [
+    { abs_ts: 30, boxes: [box("person", .45), box("person", .40)] },
+    { abs_ts: 30.5, boxes: [box("person", .50), box("person", .45)] },
+    { abs_ts: 31, boxes: [box("person", .55), box("person", .50)] },
+    { abs_ts: 31.5, boxes: [box("person", .60), box("person", .55)] },
+  ];
+  const tracks = buildTracks(detections, "person")
+    .filter(track => track.points.length > 1);
+
+  assert.equal(tracks.length, 2);
+  assert.deepEqual(
+    tracks.map(track => track.points.length).sort(),
+    [4, 4]
+  );
+});
+
 test("filters other classes and drops a stale pan target", () => {
   const tracks = buildTracks([
     { abs_ts: 20, boxes: [box("dog", .2), box("person", .6)] },
