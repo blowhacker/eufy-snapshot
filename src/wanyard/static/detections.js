@@ -58,6 +58,7 @@ let feedObserver = null;
 const feedVisibility = new Map();
 let feedActivationFrame = null;
 let feedKeyboardCard = null;
+let feedPreload = null;
 const liveWindowCache = new Map();
 const previewTracker = window.DetectionPreviewTrack;
 
@@ -493,14 +494,14 @@ function restartPreview(item) {
   }, 110);
 }
 
-function startMp4Preview(item, preview) {
+function startMp4Preview(item, preview, { sourceLoaded = false } = {}) {
   const { card, video } = item;
   item.mode = "mp4";
   item.preview = preview;
   item.start = Math.max(0, Number(preview.start) || 0);
   item.end = Math.max(0, Number(preview.end) || 0);
   const requestedStart = item.start;
-  video.addEventListener("loadedmetadata", () => {
+  const ready = () => {
     if (
       activePreview !== item
       || item.mode !== "mp4"
@@ -520,14 +521,25 @@ function startMp4Preview(item, preview) {
       }
     };
     if (item.start > .01) {
-      video.addEventListener("seeked", play, { once: true });
-      video.currentTime = item.start;
+      if (Math.abs(video.currentTime - item.start) <= .05) {
+        play();
+      } else {
+        video.addEventListener("seeked", play, { once: true });
+        video.currentTime = item.start;
+      }
     } else {
       play();
     }
-  }, { once: true });
-  video.src = preview.url;
-  video.load();
+  };
+  if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+    ready();
+  } else {
+    video.addEventListener("loadedmetadata", ready, { once: true });
+  }
+  if (!sourceLoaded) {
+    video.src = preview.url;
+    video.load();
+  }
 }
 
 async function fallbackToRecordedPreview(item) {
@@ -704,11 +716,14 @@ function startPreview(card, preview, { force = false } = {}) {
     card.classList.remove("preview-loading");
     return;
   }
-  const video = document.createElement("video");
+  const preloadedVideo = force && state.view === "feed"
+    ? takeFeedPreload(card, preview)
+    : null;
+  const video = preloadedVideo || document.createElement("video");
   video.className = "dw-preview-video";
   video.muted = true;
   video.playsInline = true;
-  video.preload = "metadata";
+  video.preload = state.view === "feed" ? "auto" : "metadata";
   video.setAttribute("muted", "");
   video.setAttribute("playsinline", "");
   const item = {
@@ -782,7 +797,9 @@ function startPreview(card, preview, { force = false } = {}) {
   );
   loadPreviewTrack(item, preview.kind === "hls" ? 2 : 0);
   if (preview.kind === "hls") startHlsPreview(item);
-  else startMp4Preview(item, preview);
+  else startMp4Preview(item, preview, {
+    sourceLoaded: Boolean(preloadedVideo),
+  });
 }
 
 function queuePreview(card, preview) {
@@ -806,12 +823,91 @@ function stopFeedObserver() {
   feedObserver = null;
   feedVisibility.clear();
   feedKeyboardCard = null;
+  clearFeedPreload();
   if (feedActivationFrame != null) {
     cancelAnimationFrame(feedActivationFrame);
     feedActivationFrame = null;
   }
   document.querySelector(".dw-card.feed-current")
     ?.classList.remove("feed-current");
+}
+
+function clearFeedPreload() {
+  if (!feedPreload) return;
+  const { video } = feedPreload;
+  feedPreload = null;
+  try {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  } catch {}
+}
+
+function takeFeedPreload(card, preview) {
+  if (
+    !feedPreload
+    || feedPreload.card !== card
+    || feedPreload.url !== preview?.url
+    || feedPreload.video.error
+  ) {
+    clearFeedPreload();
+    return null;
+  }
+  const { video } = feedPreload;
+  feedPreload = null;
+  return video;
+}
+
+function preloadNextFeedCard(card) {
+  if (state.view !== "feed" || document.hidden) {
+    clearFeedPreload();
+    return;
+  }
+  const cards = [...dom.main.querySelectorAll(".dw-card")];
+  const nextCard = cards[cards.indexOf(card) + 1];
+  const preview = nextCard?._preview;
+  if (!nextCard || !preview?.url) {
+    clearFeedPreload();
+    return;
+  }
+  if (preview.kind === "hls") {
+    clearFeedPreload();
+    loadHlsJs().catch(() => {});
+    return;
+  }
+  if (
+    feedPreload?.card === nextCard
+    && feedPreload.url === preview.url
+  ) return;
+
+  clearFeedPreload();
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+  video.setAttribute("muted", "");
+  video.setAttribute("playsinline", "");
+  feedPreload = { card: nextCard, url: preview.url, video };
+  video.addEventListener("loadedmetadata", () => {
+    if (feedPreload?.video !== video) return;
+    const start = Math.max(
+      0,
+      Math.min(
+        Number.isFinite(video.duration)
+          ? Math.max(0, video.duration - .1)
+          : Infinity,
+        Number(preview.start) || 0
+      )
+    );
+    try {
+      video.currentTime = start;
+    } catch {}
+  }, { once: true });
+  video.addEventListener("error", () => {
+    if (feedPreload?.video === video) clearFeedPreload();
+  }, { once: true });
+  video.src = preview.url;
+  video.load();
 }
 
 function activateVisibleFeedCard() {
@@ -836,6 +932,7 @@ function activateVisibleFeedCard() {
   }
   feedKeyboardCard = bestCard;
   if (activePreview?.card === bestCard || pendingPreview?.card === bestCard) {
+    preloadNextFeedCard(bestCard);
     return;
   }
   stopPreview();
@@ -843,6 +940,7 @@ function activateVisibleFeedCard() {
     bestCard.classList.add("preview-loading");
     startPreview(bestCard, bestCard._preview, { force: true });
   }
+  preloadNextFeedCard(bestCard);
 }
 
 function scheduleFeedActivation() {
@@ -1564,6 +1662,7 @@ document.addEventListener("visibilitychange", () => {
     clearTimeout(state.recentTimer);
     state.recentTimer = null;
     stopPreview();
+    clearFeedPreload();
   } else {
     scheduleFeedActivation();
     scheduleRecentRefresh(0);
