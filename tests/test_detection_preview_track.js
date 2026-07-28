@@ -5,6 +5,7 @@ const {
   buildTracks,
   selectTrack,
   sampleTrack,
+  sampleTrackSmooth,
   dampCenter,
 } = require("../src/wanyard/static/detection-preview-track.js");
 
@@ -71,4 +72,47 @@ test("damps box-centre noise and resets after a seek", () => {
     dampCenter(first, { x: .1, y: .3 }, -.5),
     { x: .1, y: .3 }
   );
+});
+
+test("smooth sampling keeps camera velocity continuous at detector samples", () => {
+  const track = {
+    points: [
+      { ts: 0, box: box("person", .1) },
+      { ts: 1, box: box("person", .3) },
+      { ts: 2, box: box("person", .8) },
+    ],
+  };
+  const centerX = sampled => (sampled.x1 + sampled.x2) / 2;
+  const before = centerX(sampleTrackSmooth(track, .999));
+  const atSample = centerX(sampleTrackSmooth(track, 1));
+  const after = centerX(sampleTrackSmooth(track, 1.001));
+  const incomingVelocity = (atSample - before) / .001;
+  const outgoingVelocity = (after - atSample) / .001;
+
+  assert.ok(Math.abs(incomingVelocity - outgoingVelocity) < .002);
+});
+
+test("upper-body anchoring reduces pan caused by changing person height", () => {
+  const track = {
+    points: [
+      {
+        ts: 0,
+        box: { cls: "person", x1: .4, x2: .5, y1: .4, y2: .5 },
+      },
+      {
+        ts: 1,
+        box: { cls: "person", x1: .4, x2: .5, y1: .4, y2: .8 },
+      },
+    ],
+  };
+  const verticalAnchor = (sampled, ratio) =>
+    sampled.y1 + (sampled.y2 - sampled.y1) * ratio;
+  const upperShift = verticalAnchor(sampleTrackSmooth(track, 1, .3), .3)
+    - verticalAnchor(sampleTrackSmooth(track, 0, .3), .3);
+  const centerShift = verticalAnchor(sampleTrackSmooth(track, 1, .5), .5)
+    - verticalAnchor(sampleTrackSmooth(track, 0, .5), .5);
+
+  assert.ok(upperShift < centerShift);
+  assert.ok(Math.abs(upperShift - .09) < .000001);
+  assert.ok(Math.abs(centerShift - .15) < .000001);
 });

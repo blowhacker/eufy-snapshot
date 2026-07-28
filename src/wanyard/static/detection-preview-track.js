@@ -196,6 +196,96 @@
     return recent?.box || null;
   }
 
+  function boxAnchor(box, verticalRatio = 0.5) {
+    const ratio = Math.max(0, Math.min(1, Number(verticalRatio)));
+    return {
+      x: (Number(box.x1) + Number(box.x2)) / 2,
+      y: Number(box.y1) + (Number(box.y2) - Number(box.y1)) * ratio,
+    };
+  }
+
+  function pointVelocity(points, index, verticalRatio) {
+    const point = points[index];
+    const previous = points[index - 1];
+    const next = points[index + 1];
+    const hasPrevious = previous && point.ts - previous.ts <= MAX_GAP;
+    const hasNext = next && next.ts - point.ts <= MAX_GAP;
+    const from = hasPrevious ? previous : point;
+    const to = hasNext ? next : point;
+    const elapsed = to.ts - from.ts;
+    if (elapsed <= 0) return { x: 0, y: 0 };
+    const fromAnchor = boxAnchor(from.box, verticalRatio);
+    const toAnchor = boxAnchor(to.box, verticalRatio);
+    return {
+      x: (toAnchor.x - fromAnchor.x) / elapsed,
+      y: (toAnchor.y - fromAnchor.y) / elapsed,
+    };
+  }
+
+  // Recorded previews have the complete track before playback starts. Use a
+  // cubic camera path so velocity remains continuous at the sparse detector
+  // samples. Box dimensions still interpolate linearly; only the framing
+  // anchor follows the smoother path.
+  function sampleTrackSmooth(track, ts, verticalRatio = 0.5) {
+    const time = Number(ts);
+    const points = track?.points || [];
+    if (!Number.isFinite(time) || !points.length) return null;
+    for (let index = 0; index + 1 < points.length; index++) {
+      const before = points[index];
+      const after = points[index + 1];
+      const elapsed = after.ts - before.ts;
+      if (
+        time < before.ts
+        || time > after.ts
+        || elapsed <= 0
+        || elapsed > MAX_GAP
+      ) continue;
+      const amount = (time - before.ts) / elapsed;
+      const base = interpolate(before.box, after.box, amount);
+      const start = boxAnchor(before.box, verticalRatio);
+      const end = boxAnchor(after.box, verticalRatio);
+      const startVelocity = pointVelocity(points, index, verticalRatio);
+      const endVelocity = pointVelocity(points, index + 1, verticalRatio);
+      const amount2 = amount * amount;
+      const amount3 = amount2 * amount;
+      const h00 = 2 * amount3 - 3 * amount2 + 1;
+      const h10 = amount3 - 2 * amount2 + amount;
+      const h01 = -2 * amount3 + 3 * amount2;
+      const h11 = amount3 - amount2;
+      const smooth = {
+        x: h00 * start.x
+          + h10 * elapsed * startVelocity.x
+          + h01 * end.x
+          + h11 * elapsed * endVelocity.x,
+        y: h00 * start.y
+          + h10 * elapsed * startVelocity.y
+          + h01 * end.y
+          + h11 * elapsed * endVelocity.y,
+      };
+      // Do not let noisy neighbouring samples make the camera overshoot the
+      // two anchors that bound the current frame.
+      smooth.x = Math.max(
+        Math.min(start.x, end.x),
+        Math.min(Math.max(start.x, end.x), smooth.x)
+      );
+      smooth.y = Math.max(
+        Math.min(start.y, end.y),
+        Math.min(Math.max(start.y, end.y), smooth.y)
+      );
+      const baseAnchor = boxAnchor(base, verticalRatio);
+      const dx = smooth.x - baseAnchor.x;
+      const dy = smooth.y - baseAnchor.y;
+      return {
+        ...base,
+        x1: Number(base.x1) + dx,
+        x2: Number(base.x2) + dx,
+        y1: Number(base.y1) + dy,
+        y2: Number(base.y2) + dy,
+      };
+    }
+    return sampleTrack(track, time);
+  }
+
   function dampCenter(previous, target, elapsed, timeConstant = 0.22) {
     const fallback = {
       x: Number(target?.x),
@@ -219,5 +309,11 @@
     };
   }
 
-  return { buildTracks, selectTrack, sampleTrack, dampCenter };
+  return {
+    buildTracks,
+    selectTrack,
+    sampleTrack,
+    sampleTrackSmooth,
+    dampCenter,
+  };
 });

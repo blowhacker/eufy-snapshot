@@ -172,11 +172,18 @@ function previewAbsoluteTime(item, mediaTime = item.video.currentTime) {
 function updatePreviewPan(item, mediaTime) {
   if (activePreview !== item || !item.track) return;
   const ts = previewAbsoluteTime(item, mediaTime);
-  const box = previewTracker?.sampleTrack(item.track, ts);
+  const stabilize = state.view !== "feed";
+  const verticalAnchor = stabilize && item.trackingPreview?.class === "person"
+    ? 0.3
+    : 0.5;
+  const box = stabilize && previewTracker?.sampleTrackSmooth
+    ? previewTracker.sampleTrackSmooth(item.track, ts, verticalAnchor)
+    : previewTracker?.sampleTrack(item.track, ts);
   if (!box) return;
   const target = {
     x: (Number(box.x1) + Number(box.x2)) / 2,
-    y: (Number(box.y1) + Number(box.y2)) / 2,
+    y: Number(box.y1)
+      + (Number(box.y2) - Number(box.y1)) * verticalAnchor,
   };
   const currentMediaTime = Number(mediaTime);
   if (item.panMediaTime == null) {
