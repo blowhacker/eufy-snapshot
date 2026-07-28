@@ -118,6 +118,26 @@ function previewCrop(
   };
 }
 
+function feedCropSize(frameWidth, frameHeight, hostWidth, hostHeight) {
+  const sourceAspect = frameWidth / frameHeight;
+  const hostAspect = hostWidth / hostHeight;
+  if (
+    ![sourceAspect, hostAspect].every(Number.isFinite)
+    || sourceAspect <= 0
+    || hostAspect <= 0
+  ) return null;
+  if (hostAspect <= sourceAspect) {
+    return {
+      width: hostAspect / sourceAspect,
+      height: 1,
+    };
+  }
+  return {
+    width: 1,
+    height: sourceAspect / hostAspect,
+  };
+}
+
 function layoutActivePreview() {
   if (!activePreview) return;
   const item = activePreview;
@@ -127,18 +147,38 @@ function layoutActivePreview() {
   const hostWidth = host.clientWidth;
   const hostHeight = host.clientHeight;
   if (!frameWidth || !frameHeight || !hostWidth || !hostHeight) return;
-  if (!item.cropSize) {
-    const initialCrop = previewCrop(
-      preview.box,
-      frameWidth,
-      frameHeight
-    );
-    if (!initialCrop) return;
-    item.cropSize = {
-      width: initialCrop.width / frameWidth,
-      height: initialCrop.height / frameHeight,
-    };
+  const feed = state.view === "feed";
+  const hostAspect = hostWidth / hostHeight;
+  if (
+    !item.cropSize
+    || (
+      feed
+      && Math.abs(Number(item.cropHostAspect) - hostAspect) > .01
+    )
+  ) {
+    if (feed) {
+      item.cropSize = feedCropSize(
+        frameWidth,
+        frameHeight,
+        hostWidth,
+        hostHeight
+      );
+      item.cropHostAspect = hostAspect;
+    } else {
+      const initialCrop = previewCrop(
+        preview.box,
+        frameWidth,
+        frameHeight
+      );
+      if (!initialCrop) return;
+      item.cropSize = {
+        width: initialCrop.width / frameWidth,
+        height: initialCrop.height / frameHeight,
+      };
+      item.cropHostAspect = null;
+    }
   }
+  if (!item.cropSize) return;
   const crop = previewCrop(
     item.panBox || preview.box,
     frameWidth,
