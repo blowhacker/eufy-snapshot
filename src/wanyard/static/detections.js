@@ -302,6 +302,18 @@ function cancelPendingPreview(card = null) {
   pendingCard.classList.remove("preview-loading");
 }
 
+// Keep this aligned with the main viewer and live wall: Safari/iOS have a
+// reliable native HLS implementation, while desktop Chromium's advertised
+// native path can aggressively reload live playlists.
+function shouldUseNativeHls() {
+  const ua = navigator.userAgent || "";
+  const isiOS = /iPad|iPhone|iPod/.test(ua)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const isSafari = /Safari/i.test(ua)
+    && !/Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android/i.test(ua);
+  return isiOS || isSafari;
+}
+
 function loadHlsJs() {
   if (window.Hls) return Promise.resolve(window.Hls);
   if (!window.__dwHlsPromise) {
@@ -370,11 +382,13 @@ function stopPreview(card = null, failed = false) {
     trackRefreshTimer,
     loopTimer,
     trackRevealTimer,
+    hlsReadyTimer,
   } = activePreview;
   activePreview = null;
   clearTimeout(trackRefreshTimer);
   clearTimeout(loopTimer);
   clearTimeout(trackRevealTimer);
+  clearTimeout(hlsReadyTimer);
   trackAbort?.abort();
   if (panFrame != null) {
     if (panFrameKind === "video") video.cancelVideoFrameCallback?.(panFrame);
@@ -471,6 +485,8 @@ async function fallbackToRecordedPreview(item) {
   ) return;
   item.fallbackStarted = true;
   item.mode = "resolving";
+  clearTimeout(item.hlsReadyTimer);
+  item.hlsReadyTimer = null;
   item.hls?.destroy();
   item.hls = null;
 
@@ -545,8 +561,22 @@ async function startHlsPreview(item) {
     return;
   }
 
+  let readyAttempts = 0;
   const ready = () => {
     if (activePreview !== item || item.mode !== "hls") return;
+    if (!video.seekable?.length) {
+      // Native HLS can fire loadedmetadata before its DVR range exists.
+      // Seeking at that point is silently clamped to zero, leaving the loop
+      // boundary on a different timeline and making the preview appear stuck.
+      if (readyAttempts++ < 30) {
+        item.hlsReadyTimer = setTimeout(ready, 50);
+      } else {
+        fallbackToRecordedPreview(item);
+      }
+      return;
+    }
+    clearTimeout(item.hlsReadyTimer);
+    item.hlsReadyTimer = null;
     item.start = liveSeekTarget(video, window, startTs);
     item.end = item.start + (endTs - startTs);
     item.timelineStartTs = startTs;
@@ -571,7 +601,7 @@ async function startHlsPreview(item) {
   const canPlayNative = Boolean(
     video.canPlayType("application/vnd.apple.mpegurl")
   );
-  if (canPlayNative) {
+  if (canPlayNative && shouldUseNativeHls()) {
     video.src = preview.url;
     video.load();
     return;
@@ -579,22 +609,30 @@ async function startHlsPreview(item) {
 
   const HlsCtor = await loadHlsJs().catch(() => null);
   if (activePreview !== item) return;
-  if (!HlsCtor?.isSupported?.()) {
-    fallbackToRecordedPreview(item);
+  if (HlsCtor?.isSupported?.()) {
+    const hls = new HlsCtor({
+      lowLatencyMode: false,
+      startPosition: Math.max(0, startTs - Number(window.start_ts)),
+      maxBufferLength: 12,
+      backBufferLength: 8,
+    });
+    item.hls = hls;
+    hls.on(HlsCtor.Events.ERROR, (_, data) => {
+      if (activePreview === item && data.fatal) {
+        fallbackToRecordedPreview(item);
+      }
+    });
+    hls.loadSource(preview.url);
+    hls.attachMedia(video);
     return;
   }
-  const hls = new HlsCtor({
-    lowLatencyMode: false,
-    startPosition: Math.max(0, startTs - Number(window.start_ts)),
-  });
-  item.hls = hls;
-  hls.on(HlsCtor.Events.ERROR, (_, data) => {
-    if (activePreview === item && data.fatal) {
-      fallbackToRecordedPreview(item);
-    }
-  });
-  hls.loadSource(preview.url);
-  hls.attachMedia(video);
+
+  if (canPlayNative) {
+    video.src = preview.url;
+    video.load();
+    return;
+  }
+  fallbackToRecordedPreview(item);
 }
 
 function startPreview(card, preview) {
@@ -642,6 +680,7 @@ function startPreview(card, preview) {
     videoPlaying: false,
     trackReady: false,
     trackRevealTimer: null,
+    hlsReadyTimer: null,
     panBox: preview.box,
     panCenter: {
       x: (Number(preview.box.x1) + Number(preview.box.x2)) / 2,
