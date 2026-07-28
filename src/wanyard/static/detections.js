@@ -57,6 +57,7 @@ let activePreview = null;
 let feedObserver = null;
 const feedVisibility = new Map();
 let feedActivationFrame = null;
+let feedKeyboardCard = null;
 const liveWindowCache = new Map();
 const previewTracker = window.DetectionPreviewTrack;
 
@@ -758,6 +759,7 @@ function stopFeedObserver() {
   feedObserver?.disconnect();
   feedObserver = null;
   feedVisibility.clear();
+  feedKeyboardCard = null;
   if (feedActivationFrame != null) {
     cancelAnimationFrame(feedActivationFrame);
     feedActivationFrame = null;
@@ -786,6 +788,7 @@ function activateVisibleFeedCard() {
     current?.classList.remove("feed-current");
     bestCard.classList.add("feed-current");
   }
+  feedKeyboardCard = bestCard;
   if (activePreview?.card === bestCard || pendingPreview?.card === bestCard) {
     return;
   }
@@ -816,6 +819,34 @@ function startFeedObserver() {
   for (const card of dom.main.querySelectorAll(".dw-card")) {
     feedObserver.observe(card);
   }
+}
+
+function moveFeed(direction) {
+  if (state.view !== "feed") return false;
+  const cards = [...dom.main.querySelectorAll(".dw-card")];
+  if (!cards.length) return false;
+  const current = feedKeyboardCard?.isConnected
+    ? feedKeyboardCard
+    : document.querySelector(".dw-card.feed-current");
+  const currentIndex = Math.max(0, cards.indexOf(current));
+  const targetIndex = Math.max(
+    0,
+    Math.min(cards.length - 1, currentIndex + direction)
+  );
+  if (targetIndex === currentIndex) return true;
+  const target = cards[targetIndex];
+  feedKeyboardCard = target;
+  const mainRect = dom.main.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const top = dom.main.scrollTop + targetRect.top - mainRect.top;
+  const reduceMotion = window.matchMedia(
+    "(prefers-reduced-motion: reduce)"
+  ).matches;
+  dom.main.scrollTo({
+    top,
+    behavior: reduceMotion ? "auto" : "smooth",
+  });
+  return true;
 }
 
 function updateViewMode() {
@@ -1455,6 +1486,28 @@ async function loadInitial() {
 dom.refresh.addEventListener("click", loadInitial);
 dom.viewToggle.addEventListener("click", () => {
   setView(state.view === "feed" ? "grid" : "feed");
+});
+document.addEventListener("keydown", event => {
+  if (
+    state.view !== "feed"
+    || event.defaultPrevented
+    || event.altKey
+    || event.ctrlKey
+    || event.metaKey
+    || event.shiftKey
+  ) return;
+  const target = event.target;
+  if (
+    target instanceof Element
+    && (
+      target.matches("input, textarea, select")
+      || target.closest("[contenteditable='true']")
+    )
+  ) return;
+  let direction = 0;
+  if (event.key === "ArrowDown" || event.key === "PageDown") direction = 1;
+  else if (event.key === "ArrowUp" || event.key === "PageUp") direction = -1;
+  if (direction && moveFeed(direction)) event.preventDefault();
 });
 window.addEventListener("scroll", () => stopPreview(), { passive: true });
 document.addEventListener("visibilitychange", () => {
