@@ -3,9 +3,11 @@ const RECENT_REFRESH_MS = 4000;
 
 function filtersFromUrl() {
   const params = new URLSearchParams(location.search);
+  const focusTs = Number(params.get("ts"));
+  const feed = params.get("view") === "feed";
   return {
     camera: params.get("camera") || "all",
-    view: params.get("view") === "feed" ? "feed" : "grid",
+    view: feed ? "feed" : "grid",
     classes: new Set(
       (params.get("classes") || "")
         .split(",")
@@ -18,6 +20,15 @@ function filtersFromUrl() {
         .map(value => value.trim())
         .filter(Boolean)
     ),
+    focus: feed && Number.isFinite(focusTs)
+      ? {
+          eventId: params.get("event") || "",
+          source: params.get("source") || "",
+          ts: focusTs,
+          cls: params.get("cls") || "",
+          zone: params.get("zone") || "none",
+        }
+      : null,
   };
 }
 
@@ -40,6 +51,7 @@ const state = {
   view: initialFilters.view,
   classes: initialFilters.classes,
   zones: initialFilters.zones,
+  focus: initialFilters.focus,
   classCounts: {},
   availableZones: [],
   sources: [],
@@ -1010,6 +1022,7 @@ function setView(view, { updateHistory = true } = {}) {
   stopPreview();
   stopFeedObserver();
   state.view = next;
+  if (next !== "feed") state.focus = null;
   updateViewMode();
   if (updateHistory) syncUrl();
   renderCameras();
@@ -1060,32 +1073,48 @@ function selectedZones() {
   return [...state.zones].sort();
 }
 
-function syncUrl({ replace = false } = {}) {
+function detectionWallUrl({ includeFocus = true } = {}) {
   const url = new URL("/detections", location.origin);
   if (state.camera && state.camera !== "all") {
     url.searchParams.set("camera", state.camera);
-  } else {
-    url.searchParams.delete("camera");
   }
   const classes = selectedClasses();
   if (classes.length) url.searchParams.set("classes", classes.join(","));
-  else url.searchParams.delete("classes");
   const zones = selectedZones();
   if (zones.length) url.searchParams.set("zones", zones.join(","));
-  else url.searchParams.delete("zones");
   if (state.view === "feed") url.searchParams.set("view", "feed");
-  else url.searchParams.delete("view");
+  if (state.view === "feed" && includeFocus && state.focus) {
+    if (state.focus.eventId) url.searchParams.set("event", state.focus.eventId);
+    if (state.focus.source) url.searchParams.set("source", state.focus.source);
+    url.searchParams.set("ts", String(state.focus.ts));
+    if (state.focus.cls) url.searchParams.set("cls", state.focus.cls);
+    url.searchParams.set("zone", state.focus.zone || "none");
+  }
+  return url;
+}
+
+function syncUrl({ replace = false } = {}) {
   history[replace ? "replaceState" : "pushState"](
     { detectionWall: true },
     "",
-    url
+    detectionWallUrl()
   );
 }
 
 function syncFeedCardUrl(card) {
   if (state.view !== "feed" || !card?.href) return;
-  const url = new URL(card.href, location.origin);
-  if (url.origin !== location.origin || url.href === location.href) return;
+  const viewerUrl = new URL(card.href, location.origin);
+  const ts = Number(viewerUrl.searchParams.get("ts"));
+  if (viewerUrl.origin !== location.origin || !Number.isFinite(ts)) return;
+  state.focus = {
+    eventId: String(card._event?.id || ""),
+    source: viewerUrl.searchParams.get("source") || "",
+    ts,
+    cls: viewerUrl.searchParams.get("cls") || "",
+    zone: viewerUrl.searchParams.get("zone") || "none",
+  };
+  const url = detectionWallUrl();
+  if (url.href === location.href) return;
   history.replaceState(
     { detectionFeedPreview: true },
     "",
@@ -1099,6 +1128,7 @@ function restoreFiltersFromUrl() {
   state.view = filters.view;
   state.classes = filters.classes;
   state.zones = filters.zones;
+  state.focus = filters.focus;
   updateViewMode();
 }
 
@@ -1149,6 +1179,7 @@ function makeTag(value, label, count, active) {
     } else {
       state.classes.add(value);
     }
+    state.focus = null;
     syncUrl();
     loadInitial();
   });
@@ -1165,6 +1196,7 @@ function makeCameraTag(value, label) {
   button.addEventListener("click", () => {
     if (state.camera === value) return;
     state.camera = value;
+    state.focus = null;
     syncUrl();
     loadInitial();
   });
@@ -1204,6 +1236,7 @@ function makeAreaTag(sourceId, value, label) {
     } else {
       state.zones.add(value);
     }
+    state.focus = null;
     syncUrl();
     loadInitial();
   });
@@ -1439,15 +1472,29 @@ function renderCameras({ preserveFeedPosition = false } = {}) {
     return;
   }
   for (const camera of cameras) dom.main.append(makeCameraSection(camera));
-  if (preservedEvent) {
+  const focus = state.view === "feed" ? state.focus : null;
+  if (preservedEvent || focus) {
     const target = [...dom.main.querySelectorAll(".dw-card")].find(card =>
-      String(card._event?.id) === String(preservedEvent.id)
-      || sameFinalizedEpisode(card._event, preservedEvent)
+      (
+        preservedEvent
+        && (
+          String(card._event?.id) === String(preservedEvent.id)
+          || sameFinalizedEpisode(card._event, preservedEvent)
+        )
+      )
+      || (
+        focus
+        && eventMatchesFeedFocus(card._event, focus)
+      )
     );
     if (target) {
       const mainRect = dom.main.getBoundingClientRect();
       const targetRect = target.getBoundingClientRect();
       dom.main.scrollTop += targetRect.top - mainRect.top;
+      if (focus) {
+        target.classList.add("feed-current");
+        feedKeyboardCard = target;
+      }
     }
   }
   startFeedObserver();
@@ -1513,6 +1560,24 @@ function sameFinalizedEpisode(a, b) {
     && a?.source_id === b?.source_id
     && a?.class === b?.class
     && Math.abs(Number(a?.abs_ts) - Number(b?.abs_ts)) < .15
+  );
+}
+
+function eventMatchesFeedFocus(event, focus = state.focus) {
+  if (!event || !focus) return false;
+  return (
+    (focus.eventId && String(event.id) === focus.eventId)
+    || (
+      (!focus.source || event.source_id === focus.source)
+      && (!focus.cls || event.class === focus.cls)
+      && Math.abs(Number(event.display_ts) - focus.ts) < .002
+    )
+  );
+}
+
+function payloadHasFeedFocus(data, focus = state.focus) {
+  return (data?.cameras || []).some(camera =>
+    (camera.events || []).some(event => eventMatchesFeedFocus(event, focus))
   );
 }
 
@@ -1637,7 +1702,27 @@ async function loadInitial() {
   dom.refresh.disabled = true;
   dom.summary.textContent = "Loading";
   try {
-    const data = await fetchWall();
+    let data;
+    if (state.view === "feed" && state.focus) {
+      const recent = await fetchWall();
+      if (payloadHasFeedFocus(recent)) {
+        data = recent;
+      } else {
+        const anchored = await fetchWall({
+          before: state.focus.ts + .001,
+          counts: false,
+        });
+        data = {
+          ...anchored,
+          classes: recent.classes,
+          zones: recent.zones,
+          selected_zones: recent.selected_zones,
+          sources: recent.sources,
+        };
+      }
+    } else {
+      data = await fetchWall();
+    }
     if (request !== state.request) return;
     state.classCounts = data.classes || {};
     state.sources = data.sources || [];
