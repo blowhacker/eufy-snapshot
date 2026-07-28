@@ -1108,7 +1108,8 @@ def make_app(
         except ValueError:
             return Response(status_code=403)
 
-        t = max(0.0, float(evt["abs_ts"]) - float(evt["seg_media_epoch"]))
+        thumb_abs_ts = float(evt.get("thumbnail_abs_ts", evt["abs_ts"]))
+        t = max(0.0, thumb_abs_ts - float(evt["seg_media_epoch"]))
         try:
             boxes = json.loads(evt["boxes_json"]) if evt.get("boxes_json") else []
         except (TypeError, json.JSONDecodeError):
@@ -1153,9 +1154,9 @@ def make_app(
             ch if ch.isalnum() or ch in {"-", "_"} else "_"
             for ch in event_id_raw
         )
-        # v4 invalidates crops cut before representative event boxes and times
-        # were guaranteed to come from the same detection observation.
-        cache_file = cache_dir / f"event_{safe_event_id}_crop_v4.jpg"
+        # v5 also repairs historical rows whose event timestamp and crop box
+        # came from different observations in the same track.
+        cache_file = cache_dir / f"event_{safe_event_id}_crop_v5.jpg"
         if not cache_file.exists():
             ok = await asyncio.to_thread(_extract_video_thumb, seg_path, cache_file, t, box)
             if not ok:

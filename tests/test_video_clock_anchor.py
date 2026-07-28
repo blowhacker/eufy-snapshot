@@ -325,6 +325,62 @@ class VideoDbLogicTests(unittest.TestCase):
             self.assertEqual(db.notification_class_for_ref("d:123"), "bird")
             self.assertIsNone(db.notification_class_for_ref("d:999"))
 
+    def test_old_object_event_thumbnail_uses_frame_that_supplied_box(self) -> None:
+        base = 1_781_600_000.0
+        with tempfile.TemporaryDirectory(prefix="wanyard-video-db-") as tmp:
+            db = VideoSegmentDB(Path(tmp) / "video.sqlite")
+            segment_id = db.open_segment("desk", "desk/segment.mp4", base)
+            db.set_segment_media_start(segment_id, base)
+            db.close_segment(segment_id, base + 60.0, None, None)
+            first_box = {
+                "cls": "person", "conf": 0.45, "track_id": "desk:test:72",
+                "x1": 0.58, "y1": 0.70, "x2": 0.63, "y2": 0.78,
+            }
+            representative_box = {
+                "cls": "person", "conf": 0.71, "track_id": "desk:test:72",
+                "x1": 0.30, "y1": 0.70, "x2": 0.33, "y2": 0.77,
+            }
+            db.insert_live_detections(segment_id, "desk", [
+                {
+                    "abs_ts": base + 39.67,
+                    "has_human": True,
+                    "confidence": 0.45,
+                    "boxes": [first_box],
+                    "classes": ["person"],
+                },
+                {
+                    "abs_ts": base + 45.0,
+                    "has_human": True,
+                    "confidence": 0.71,
+                    "boxes": [representative_box],
+                    "classes": ["person"],
+                },
+            ])
+            # Legacy construction: first observation's time, later/best box.
+            db.insert_object_events([{
+                "track_id": None,
+                "segment_id": segment_id,
+                "source_id": "desk",
+                "abs_ts": base + 39.67,
+                "display_ts": base + 39.67,
+                "class": "person",
+                "event_type": "appeared",
+                "start_off": 39.67,
+                "end_off": 45.0,
+                "confidence": 0.71,
+                "boxes_json": json.dumps([representative_box]),
+            }])
+            with db._connect() as conn:
+                event_id = conn.execute(
+                    "SELECT id FROM object_events"
+                ).fetchone()["id"]
+
+            resolved = db.get_event_with_segment(f"o:{event_id}")
+
+        assert resolved is not None
+        self.assertAlmostEqual(resolved["abs_ts"], base + 39.67)
+        self.assertAlmostEqual(resolved["thumbnail_abs_ts"], base + 45.0)
+
     def test_dead_notification_ref_re_resolves_to_nearest_detection(self) -> None:
         """Backfill's replace_detections churns detection ids; a notification's
         d:<id> ref must re-resolve via (source, time) to an equivalent row."""

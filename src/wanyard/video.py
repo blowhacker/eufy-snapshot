@@ -1656,7 +1656,13 @@ class VideoSegmentDB:
                     " WHERE e.id=?",
                     (object_event_id,),
                 ).fetchone()
-            return _worldize_event_row(dict(row)) if row else None
+                if not row:
+                    return None
+                event = _worldize_event_row(dict(row))
+                event["thumbnail_abs_ts"] = _object_event_thumbnail_abs_ts(
+                    conn, event
+                )
+            return event
 
         if raw_id.startswith("p:"):
             try:
@@ -2613,6 +2619,93 @@ def _box_tracker_id(box: dict | None) -> str | None:
 
 def _event_tracker_id(event: dict) -> str | None:
     return _box_tracker_id(_event_box(event))
+
+
+def _object_event_thumbnail_abs_ts(
+    conn: sqlite3.Connection,
+    event: dict,
+) -> float:
+    """Resolve the frame that actually supplied an object event's crop box.
+
+    Object events written before synchronized representative observations
+    could combine the track's first timestamp with its highest-confidence box
+    from a later frame.  The external tracker token survives in both the event
+    box and raw detections, so old rows can be repaired at read time without a
+    destructive backfill.
+    """
+    event_ts = float(event["abs_ts"])
+    event_box = _event_box(event)
+    tracker_id = _box_tracker_id(event_box)
+    segment_id = event.get("segment_id")
+    if not event_box or not tracker_id or segment_id is None:
+        return event_ts
+
+    best_ts = event_ts
+    best_score: tuple[float, float, float] | None = None
+
+    def consider(rows) -> None:
+        nonlocal best_score, best_ts
+        for row in rows:
+            try:
+                boxes = json.loads(row["boxes_json"]) if row["boxes_json"] else []
+            except (TypeError, json.JSONDecodeError):
+                continue
+            for candidate in boxes:
+                if not isinstance(candidate, dict):
+                    continue
+                if _box_tracker_id(candidate) != tracker_id:
+                    continue
+                if candidate.get("cls") != event_box.get("cls"):
+                    continue
+                try:
+                    coordinate_delta = sum(
+                        abs(float(candidate[key]) - float(event_box[key]))
+                        for key in ("x1", "y1", "x2", "y2")
+                    )
+                    confidence_delta = abs(
+                        float(candidate.get("conf", 0.0))
+                        - float(event_box.get("conf", 0.0))
+                    )
+                    candidate_ts = float(row["abs_ts"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                score = (
+                    coordinate_delta,
+                    confidence_delta,
+                    abs(candidate_ts - event_ts),
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_ts = candidate_ts
+
+    # Events written by the synchronized pipeline already point at the right
+    # raw observation. Keep their common thumbnail lookup to a single row.
+    nearby = conn.execute(
+        "SELECT abs_ts, boxes_json FROM video_detections"
+        " WHERE segment_id=? AND abs_ts BETWEEN ? AND ?",
+        (segment_id, event_ts - 0.001, event_ts + 0.001),
+    ).fetchall()
+    consider(nearby)
+    if (
+        best_score is not None
+        and best_score[0] < 1e-9
+        and best_score[1] < 1e-9
+    ):
+        return best_ts
+
+    escaped_tracker_id = (
+        tracker_id.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    rows = conn.execute(
+        "SELECT abs_ts, boxes_json FROM video_detections"
+        " WHERE segment_id=? AND boxes_json LIKE ? ESCAPE '\\'"
+        " ORDER BY abs_ts",
+        (segment_id, f"%{escaped_tracker_id}%"),
+    ).fetchall()
+    consider(rows)
+    return best_ts
 
 
 def _box_center(box: dict) -> tuple[float, float]:

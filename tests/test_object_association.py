@@ -69,6 +69,25 @@ class FakeTracker:
         self.frame_id = 0
 
 
+class IdentityHijackTracker(FakeTracker):
+    """Move the second tracker from a tiny false box onto the real person."""
+
+    def update(self, detections):
+        self.frame_id += 1
+        self.received_xywh.append(detections.xywh.copy())
+        if self.frame_id == 1:
+            self.tracked_stracks = [FakeTrack(1), FakeTrack(2)]
+            for index, track in enumerate(self.tracked_stracks):
+                track.frame_id = self.frame_id
+                track.idx = index
+        else:
+            track = self.tracked_stracks[1]
+            track.frame_id = self.frame_id
+            track.idx = 0
+            self.tracked_stracks = [track]
+        return np.empty((0, 8), dtype=np.float32)
+
+
 def box(cls: str, confidence: float = 0.8) -> dict:
     return {
         "cls": cls,
@@ -147,6 +166,42 @@ class ByteTrackAssociatorTests(unittest.TestCase):
         )
 
         self.assertEqual([item["cls"] for item in kept], ["person"])
+
+    def test_rescues_real_identity_from_tiny_track_hijack(self) -> None:
+        associator = ByteTrackAssociator(
+            "front",
+            2.0,
+            tracker_factory=IdentityHijackTracker,
+            session_id="test",
+        )
+        real = {
+            **box("person"),
+            "x1": 0.72, "x2": 0.78, "y1": 0.53, "y2": 0.72,
+        }
+        tiny = {
+            **box("person"),
+            "x1": 0.63, "x2": 0.64, "y1": 0.23, "y2": 0.28,
+        }
+        first = associator.annotate(
+            FakeDetections(
+                [0, 0],
+                [[75.0, 62.5, 6.0, 19.0], [63.5, 25.5, 1.0, 5.0]],
+            ),
+            [real, tiny],
+            abs_ts=100.0,
+        )
+        moved_real = {
+            **real,
+            "x1": 0.70, "x2": 0.76,
+        }
+        second = associator.annotate(
+            FakeDetections([0], [[73.0, 62.5, 6.0, 19.0]]),
+            [moved_real],
+            abs_ts=100.5,
+        )
+
+        self.assertEqual(second[0]["track_id"], first[0]["track_id"])
+        self.assertNotEqual(second[0]["track_id"], first[1]["track_id"])
 
 
 if __name__ == "__main__":
