@@ -99,6 +99,8 @@ def _detection_wall_camera(
     classes: list[str],
     limit: int,
     before: float | None,
+    polygons: list[list[dict]] | None = None,
+    zone_filter_active: bool = False,
 ) -> dict:
     """Return one camera's newest detection episodes for the thumbnail wall.
 
@@ -106,11 +108,29 @@ def _detection_wall_camera(
     cursor backwards and make the busy camera skip events.
     """
     fetch_limit = limit + 1
-    recorded = video_db.list_detection_events(
-        source["id"], classes, fetch_limit, before
-    )
+    if zone_filter_active and not polygons:
+        recorded = []
+    elif zone_filter_active:
+        recorded = _detection_wall_filtered_recorded(
+            video_db,
+            source["id"],
+            classes,
+            fetch_limit,
+            before,
+            polygons,
+        )
+    else:
+        recorded = video_db.list_detection_events(
+            source["id"], classes, fetch_limit, before
+        )
 
     provisional = video_db.provisional_events(source["id"])
+    if zone_filter_active:
+        from .video import _filter_with_polygons
+        provisional = (
+            _filter_with_polygons(provisional, polygons or [])
+            if polygons else []
+        )
     wanted = set(classes)
     candidates: dict[str, dict] = {}
     for event in [*provisional, *recorded]:
@@ -182,6 +202,40 @@ def _detection_wall_camera(
     }
 
 
+def _detection_wall_filtered_recorded(
+    video_db,
+    source_id: str,
+    classes: list[str],
+    limit: int,
+    before: float | None,
+    polygons: list[list[dict]],
+) -> list[dict]:
+    """Scan indexed time pages until ``limit`` zone-matching rows are found."""
+    from .video import _filter_with_polygons
+
+    matched: list[dict] = []
+    cursor = before
+    batch_limit = max(200, limit * 4)
+    while len(matched) < limit:
+        page = video_db.list_detection_events(
+            source_id, classes, batch_limit, cursor
+        )
+        if not page:
+            break
+        matched.extend(_filter_with_polygons(page, polygons))
+        if len(page) < batch_limit:
+            break
+        oldest = min(
+            float(event.get("display_ts", event.get("abs_ts", 0)))
+            for event in page
+        )
+        next_cursor = oldest - 0.000001
+        if cursor is not None and next_cursor >= cursor:
+            break
+        cursor = next_cursor
+    return matched[:limit]
+
+
 def _detection_wall_preview(event: dict, cls: str) -> dict | None:
     """Direct-MP4 preview metadata; the browser performs the visual crop."""
     if event.get("provisional"):
@@ -235,11 +289,19 @@ def _detection_wall_all(
     classes: list[str],
     limit: int,
     before: float | None,
+    polygons_by_source: dict[str, list[list[dict]]] | None = None,
+    zone_filter_active: bool = False,
 ) -> dict:
     """Interleave source-local pages into one newest-first camera feed."""
     source_pages = [
         _detection_wall_camera(
-            video_db, source, classes, limit + 1, before
+            video_db,
+            source,
+            classes,
+            limit + 1,
+            before,
+            (polygons_by_source or {}).get(source["id"]),
+            zone_filter_active,
         )
         for source in sources
     ]
@@ -725,6 +787,8 @@ def make_app(
             return JSONResponse({
                 "classes": {},
                 "cameras": [],
+                "zones": [],
+                "selected_zones": [],
                 "sources": [
                     {
                         "id": source["id"],
@@ -757,6 +821,22 @@ def make_app(
         if len(classes) > 80 or any(len(cls) > 80 for cls in classes):
             return JSONResponse({"error": "invalid classes"}, status_code=400)
 
+        raw_zones = request.query_params.get("zones") or ""
+        requested_zone_uids = list(dict.fromkeys(
+            uid.strip()
+            for uid in raw_zones.split(",")
+            if uid.strip()
+        ))
+        if (
+            len(requested_zone_uids) > 64
+            or any(
+                len(uid) > 80
+                or not all(ch.isalnum() or ch in {"-", "_"} for ch in uid)
+                for uid in requested_zone_uids
+            )
+        ):
+            return JSONResponse({"error": "invalid zones"}, status_code=400)
+
         try:
             limit = int(request.query_params.get("limit", "24"))
             before = _optional_float_query(request, "before")
@@ -765,29 +845,93 @@ def make_app(
         limit = min(60, max(8, limit))
 
         def _payload() -> dict:
+            selected_source_ids = {
+                source["id"] for source in selected_sources
+            }
+            source_names = {
+                source["id"]: source.get("name") or source["id"]
+                for source in all_sources
+            }
+            available_zone_rows = [
+                zone
+                for zone in video_db.list_zones()
+                if (
+                    zone.get("enabled", True)
+                    and zone.get("uid")
+                    and zone.get("source_id") in selected_source_ids
+                    and isinstance(zone.get("polygon"), list)
+                    and len(zone["polygon"]) >= 3
+                )
+            ]
+            zones_by_uid = {
+                str(zone["uid"]): zone for zone in available_zone_rows
+            }
+            selected_zone_uids = [
+                uid for uid in requested_zone_uids if uid in zones_by_uid
+            ]
+            zone_filter_active = bool(selected_zone_uids)
+            polygons_by_source: dict[str, list[list[dict]]] = {}
+            for uid in selected_zone_uids:
+                zone = zones_by_uid[uid]
+                polygons_by_source.setdefault(
+                    str(zone["source_id"]), []
+                ).append(zone["polygon"])
+
             # Counts populate the sticky object filter on an initial camera
             # selection. Pagination does not repeat the aggregation.
-            counts = (
-                {}
-                if before is not None
-                else video_db.class_counts(
-                    None if source_id == "all" else source_id,
-                    True,
-                    None,
-                )
-            )
+            counts: dict[str, int] = {}
+            if before is None:
+                if zone_filter_active:
+                    for source in selected_sources:
+                        polygons = polygons_by_source.get(source["id"])
+                        if not polygons:
+                            continue
+                        for cls, count in video_db.detection_class_counts(
+                            source["id"], polygons, True
+                        ).items():
+                            counts[cls] = counts.get(cls, 0) + count
+                else:
+                    counts = video_db.detection_class_counts(
+                        None if source_id == "all" else source_id,
+                        None,
+                        True,
+                    )
             cameras = (
                 [_detection_wall_all(
-                    video_db, selected_sources, classes, limit, before
+                    video_db,
+                    selected_sources,
+                    classes,
+                    limit,
+                    before,
+                    polygons_by_source,
+                    zone_filter_active,
                 )]
                 if source_id == "all"
                 else [_detection_wall_camera(
-                    video_db, selected_sources[0], classes, limit, before
+                    video_db,
+                    selected_sources[0],
+                    classes,
+                    limit,
+                    before,
+                    polygons_by_source.get(selected_sources[0]["id"]),
+                    zone_filter_active,
                 )]
             )
             return {
                 "classes": counts,
                 "cameras": cameras,
+                "zones": [
+                    {
+                        "uid": str(zone["uid"]),
+                        "source_id": str(zone["source_id"]),
+                        "source_name": source_names.get(
+                            str(zone["source_id"]), str(zone["source_id"])
+                        ),
+                        "name": zone.get("name") or f"Area {zone.get('id', '')}",
+                    }
+                    for zone in available_zone_rows
+                ],
+                "selected_zones": selected_zone_uids,
                 "sources": [
                     {
                         "id": source["id"],

@@ -1418,6 +1418,63 @@ class VideoSegmentDB:
             return [_public_object_event(_worldize_event_row(row)) for row in rows]
         return [_worldize_event_row(row) for row in rows]
 
+    def detection_class_counts(
+        self,
+        source_id: str | None = None,
+        polygons: list[list[dict]] | None = None,
+        include_provisional: bool = True,
+    ) -> dict[str, int]:
+        """Class counts for the detection wall, optionally inside any polygon.
+
+        ``polygons=None`` means whole frame. A non-empty list applies union
+        semantics using the same box-centre rule as timeline activity areas.
+        """
+        table = (
+            "object_events"
+            if self.object_events_available(source_id)
+            else "video_events"
+        )
+        where, params = [], []
+        if table == "object_events":
+            where.append("event_type='appeared'")
+        else:
+            where.append("event_type!='disappeared'")
+        if source_id and source_id != "all":
+            where.append("source_id=?")
+            params.append(source_id)
+        predicate = " AND ".join(where) if where else "1"
+        counts: dict[str, int] = {}
+        with self._connect() as conn:
+            if polygons is None:
+                rows = conn.execute(
+                    f"SELECT class, COUNT(*) AS n FROM {table}"
+                    f" WHERE {predicate} GROUP BY class",
+                    params,
+                ).fetchall()
+                counts = {row["class"]: int(row["n"]) for row in rows}
+            else:
+                rows = conn.execute(
+                    f"SELECT class, boxes_json FROM {table}"
+                    f" WHERE {predicate}",
+                    params,
+                ).fetchall()
+                for event in _filter_with_polygons(
+                    [dict(row) for row in rows], polygons
+                ):
+                    cls = str(event["class"])
+                    counts[cls] = counts.get(cls, 0) + 1
+
+        if include_provisional:
+            provisional = self.provisional_events(
+                source_id, zone_id="none"
+            )
+            if polygons is not None:
+                provisional = _filter_with_polygons(provisional, polygons)
+            for event in provisional:
+                cls = str(event["class"])
+                counts[cls] = counts.get(cls, 0) + 1
+        return counts
+
     def nearest_events(self, around: float, source_id: str | None = None,
                        classes: list[str] | None = None,
                        limit: int = 20, zone_id=None) -> list[dict]:

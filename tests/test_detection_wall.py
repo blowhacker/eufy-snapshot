@@ -46,6 +46,25 @@ def _event(
     }
 
 
+def _box(cx: float, cy: float, cls: str = "person") -> dict:
+    return {
+        "cls": cls,
+        "x1": cx - 0.02,
+        "y1": cy - 0.02,
+        "x2": cx + 0.02,
+        "y2": cy + 0.02,
+    }
+
+
+def _area(x1: float, y1: float, x2: float, y2: float) -> list[dict]:
+    return [
+        {"x": x1, "y": y1},
+        {"x": x2, "y": y1},
+        {"x": x2, "y": y2},
+        {"x": x1, "y": y2},
+    ]
+
+
 class FakeVideoDB:
     def __init__(self, recorded: list[dict], provisional: list[dict] | None = None):
         self.recorded = recorded
@@ -158,6 +177,68 @@ class DetectionWallCameraTests(unittest.TestCase):
         first_ids = {event["id"] for event in camera["events"]}
         next_ids = {event["id"] for event in next_camera["events"]}
         self.assertFalse(first_ids & next_ids)
+
+    def test_multiple_areas_use_union_semantics(self) -> None:
+        db = FakeVideoDB([
+            _event(1, 103.0, "person", boxes=[_box(0.15, 0.15)]),
+            _event(2, 102.0, "person", boxes=[_box(0.85, 0.85)]),
+            _event(3, 101.0, "person", boxes=[_box(0.50, 0.50)]),
+        ])
+
+        camera = _detection_wall_camera(
+            db,
+            self.source,
+            [],
+            limit=8,
+            before=None,
+            polygons=[
+                _area(0.0, 0.0, 0.3, 0.3),
+                _area(0.7, 0.7, 1.0, 1.0),
+            ],
+            zone_filter_active=True,
+        )
+
+        self.assertEqual([event["id"] for event in camera["events"]], ["1", "2"])
+
+    def test_active_area_filter_without_source_area_returns_no_events(self) -> None:
+        db = FakeVideoDB([
+            _event(1, 100.0, "person", boxes=[_box(0.5, 0.5)]),
+        ])
+
+        camera = _detection_wall_camera(
+            db,
+            self.source,
+            [],
+            limit=8,
+            before=None,
+            polygons=None,
+            zone_filter_active=True,
+        )
+
+        self.assertEqual(camera["events"], [])
+
+    def test_area_filter_scans_past_dense_nonmatching_pages(self) -> None:
+        db = FakeVideoDB([
+            *[
+                _event(index, 500.0 - index, "person", boxes=[_box(0.8, 0.8)])
+                for index in range(205)
+            ],
+            _event("older-match", 200.0, "person", boxes=[_box(0.1, 0.1)]),
+        ])
+
+        camera = _detection_wall_camera(
+            db,
+            self.source,
+            [],
+            limit=8,
+            before=None,
+            polygons=[_area(0.0, 0.0, 0.3, 0.3)],
+            zone_filter_active=True,
+        )
+
+        self.assertEqual([event["id"] for event in camera["events"]], ["older-match"])
+        recorded_calls = [call for call in db.calls if "source_id" in call]
+        self.assertGreaterEqual(len(recorded_calls), 2)
 
     def test_exposes_frontend_crop_preview_for_closed_mp4(self) -> None:
         event = _event(
@@ -305,6 +386,42 @@ class DetectionWallDatabaseTests(unittest.TestCase):
 
             self.assertEqual([row["abs_ts"] for row in rows], [102.0, 101.0])
 
+    def test_detection_counts_respect_multiple_areas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            segment_id = db.open_segment("front", "front/segment.mp4", 100.0)
+            db.set_segment_media_start(segment_id, 100.0)
+            db.close_segment(segment_id, 130.0, None, None)
+            events = [
+                ("person", 101.0, _box(0.1, 0.1, "person")),
+                ("bird", 102.0, _box(0.9, 0.9, "bird")),
+                ("dog", 103.0, _box(0.5, 0.5, "dog")),
+            ]
+            db.insert_events([
+                {
+                    "segment_id": segment_id,
+                    "source_id": "front",
+                    "abs_ts": ts,
+                    "class": cls,
+                    "start_off": ts - 100.0,
+                    "end_off": ts - 99.0,
+                    "confidence": 0.8,
+                    "boxes_json": json.dumps([box]),
+                }
+                for cls, ts, box in events
+            ])
+
+            counts = db.detection_class_counts(
+                "front",
+                [
+                    _area(0.0, 0.0, 0.3, 0.3),
+                    _area(0.7, 0.7, 1.0, 1.0),
+                ],
+                include_provisional=False,
+            )
+
+            self.assertEqual(counts, {"person": 1, "bird": 1})
+
 
 class DetectionWallAllCameraTests(unittest.TestCase):
     sources = [
@@ -370,6 +487,33 @@ class DetectionWallAllCameraTests(unittest.TestCase):
         self.assertLess(
             second["events"][0]["display_ts"],
             first["events"][-1]["display_ts"],
+        )
+
+    def test_selected_areas_only_include_their_own_sources(self) -> None:
+        db = FakeVideoDB([
+            _event(
+                1, 100.0, "person", source_id="front", boxes=[_box(0.1, 0.1)]
+            ),
+            _event(
+                2, 101.0, "person", source_id="garden", boxes=[_box(0.1, 0.1)]
+            ),
+        ])
+
+        camera = _detection_wall_all(
+            db,
+            self.sources,
+            [],
+            limit=8,
+            before=None,
+            polygons_by_source={
+                "front": [_area(0.0, 0.0, 0.3, 0.3)],
+            },
+            zone_filter_active=True,
+        )
+
+        self.assertEqual(
+            [(event["source_id"], event["id"]) for event in camera["events"]],
+            [("front", "1")],
         )
 
 

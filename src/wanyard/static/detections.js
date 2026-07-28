@@ -10,12 +10,20 @@ function filtersFromUrl() {
         .map(value => value.trim())
         .filter(Boolean)
     ),
+    zones: new Set(
+      (params.get("zones") || "")
+        .split(",")
+        .map(value => value.trim())
+        .filter(Boolean)
+    ),
   };
 }
 
 const dom = {
   main: document.getElementById("dwMain"),
   cameras: document.getElementById("dwCameras"),
+  areas: document.getElementById("dwAreas"),
+  areasFilter: document.getElementById("dwAreasFilter"),
   tags: document.getElementById("dwTags"),
   summary: document.getElementById("dwSummary"),
   refresh: document.getElementById("dwRefresh"),
@@ -26,7 +34,9 @@ const initialFilters = filtersFromUrl();
 const state = {
   camera: initialFilters.camera,
   classes: initialFilters.classes,
+  zones: initialFilters.zones,
   classCounts: {},
+  availableZones: [],
   sources: [],
   cameras: new Map(),
   request: 0,
@@ -264,6 +274,10 @@ function selectedClasses() {
   return [...state.classes].sort();
 }
 
+function selectedZones() {
+  return [...state.zones].sort();
+}
+
 function syncUrl({ replace = false } = {}) {
   const url = new URL(location.href);
   if (state.camera && state.camera !== "all") {
@@ -274,6 +288,9 @@ function syncUrl({ replace = false } = {}) {
   const classes = selectedClasses();
   if (classes.length) url.searchParams.set("classes", classes.join(","));
   else url.searchParams.delete("classes");
+  const zones = selectedZones();
+  if (zones.length) url.searchParams.set("zones", zones.join(","));
+  else url.searchParams.delete("zones");
   history[replace ? "replaceState" : "pushState"](
     { detectionWall: true },
     "",
@@ -285,12 +302,15 @@ function restoreFiltersFromUrl() {
   const filters = filtersFromUrl();
   state.camera = filters.camera;
   state.classes = filters.classes;
+  state.zones = filters.zones;
 }
 
 function apiUrl({ source = state.camera, before = null } = {}) {
   const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
   const classes = selectedClasses();
   if (classes.length) params.set("classes", classes.join(","));
+  const zones = selectedZones();
+  if (zones.length) params.set("zones", zones.join(","));
   params.set("source", source || "all");
   if (Number.isFinite(before)) params.set("before", String(before));
   return `/api/detections/wall?${params}`;
@@ -342,6 +362,16 @@ function makeCameraTag(value, label) {
   button.addEventListener("click", () => {
     if (state.camera === value) return;
     state.camera = value;
+    if (value !== "all") {
+      const compatible = new Set(
+        state.availableZones
+          .filter(zone => zone.source_id === value)
+          .map(zone => zone.uid)
+      );
+      state.zones = new Set(
+        [...state.zones].filter(uid => compatible.has(uid))
+      );
+    }
     syncUrl();
     loadInitial();
   });
@@ -353,6 +383,43 @@ function renderCameraTags() {
   dom.cameras.append(makeCameraTag("all", "All"));
   for (const source of state.sources) {
     dom.cameras.append(makeCameraTag(source.id, source.name || source.id));
+  }
+}
+
+function makeAreaTag(value, label) {
+  const button = document.createElement("button");
+  button.type = "button";
+  const active = value ? state.zones.has(value) : state.zones.size === 0;
+  button.className = `dw-tag${active ? " active" : ""}`;
+  button.setAttribute("aria-pressed", String(active));
+  button.textContent = label;
+  button.addEventListener("click", () => {
+    if (!value) {
+      if (state.zones.size === 0) return;
+      state.zones.clear();
+    } else if (state.zones.has(value)) {
+      state.zones.delete(value);
+    } else {
+      state.zones.add(value);
+    }
+    syncUrl();
+    loadInitial();
+  });
+  return button;
+}
+
+function renderAreaTags() {
+  dom.areas.innerHTML = "";
+  dom.areasFilter.hidden = state.availableZones.length === 0;
+  if (dom.areasFilter.hidden) return;
+  dom.areas.append(makeAreaTag("", "Whole frame"));
+  const showCamera = state.camera === "all";
+  for (const zone of state.availableZones) {
+    const areaName = zone.name || "Activity area";
+    const label = showCamera
+      ? `${zone.source_name || zone.source_id} · ${areaName}`
+      : areaName;
+    dom.areas.append(makeAreaTag(zone.uid, label));
   }
 }
 
@@ -508,7 +575,7 @@ function makeCameraSection(camera) {
       ? "No matching detections across any camera."
       : camera.record_mode === "live_only"
       ? "This camera is live-only, so it does not create detection thumbnails."
-      : state.classes.size
+      : state.classes.size || state.zones.size
         ? "No matching detections for this camera."
         : "No detections for this camera yet.";
     section.append(head, empty);
@@ -606,10 +673,14 @@ async function loadInitial() {
     if (request !== state.request) return;
     state.classCounts = data.classes || {};
     state.sources = data.sources || [];
+    state.availableZones = data.zones || [];
+    state.zones = new Set(data.selected_zones || []);
+    syncUrl({ replace: true });
     state.cameras = new Map(
       (data.cameras || []).map(camera => [camera.id, camera])
     );
     renderCameraTags();
+    renderAreaTags();
     renderTags();
     renderCameras();
   } catch (error) {
