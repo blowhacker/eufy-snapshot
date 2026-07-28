@@ -297,6 +297,12 @@ class ByteTrackAssociator:
                 token,
                 area_ratio,
             ) in sorted(current_tracks, key=lambda item: item[0]):
+                if detection_index in accepted:
+                    # ByteTrack can expose both the retiring and replacement
+                    # track against one detector result during an ID handoff.
+                    # The credible existing assignment is sorted first; never
+                    # let the fresh duplicate overwrite it.
+                    continue
                 if token is None:
                     token = self._rescue_token(
                         class_id,

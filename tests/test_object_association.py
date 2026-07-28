@@ -103,6 +103,25 @@ class FreshTrackEachFrameTracker(FakeTracker):
         return np.empty((0, 8), dtype=np.float32)
 
 
+class DuplicateHandoffTracker(FakeTracker):
+    """Expose old and fresh tracks against the same detection index."""
+
+    def update(self, detections):
+        self.frame_id += 1
+        self.received_xywh.append(detections.xywh.copy())
+        if self.frame_id == 1:
+            self.established = FakeTrack(1)
+            self.tracked_stracks = [self.established]
+        else:
+            # Fresh first mirrors the dangerous order; association must still
+            # prioritize the already credible identity.
+            self.tracked_stracks = [FakeTrack(2), self.established]
+        for track in self.tracked_stracks:
+            track.frame_id = self.frame_id
+            track.idx = 0
+        return np.empty((0, 8), dtype=np.float32)
+
+
 def box(cls: str, confidence: float = 0.8) -> dict:
     return {
         "cls": cls,
@@ -283,6 +302,35 @@ class ByteTrackAssociatorTests(unittest.TestCase):
             [item["track_id"] for item in second],
             [item["track_id"] for item in first],
         )
+
+    def test_fresh_handoff_cannot_overwrite_established_assignment(self) -> None:
+        associator = ByteTrackAssociator(
+            "front",
+            2.0,
+            tracker_factory=DuplicateHandoffTracker,
+            session_id="test",
+        )
+        first_box = {
+            **box("person"),
+            "x1": 0.02, "x2": 0.06, "y1": 0.34, "y2": 0.46,
+        }
+        first = associator.annotate(
+            FakeDetections([0], [[4.0, 40.0, 4.0, 12.0]]),
+            [first_box],
+            abs_ts=100.0,
+        )
+        second_box = {
+            **first_box,
+            "x1": 0.04, "x2": 0.08,
+        }
+        second = associator.annotate(
+            FakeDetections([0], [[6.0, 40.0, 4.0, 12.0]]),
+            [second_box],
+            abs_ts=100.5,
+        )
+
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["track_id"], first[0]["track_id"])
 
 
 if __name__ == "__main__":
