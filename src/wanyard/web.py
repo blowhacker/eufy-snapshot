@@ -954,6 +954,10 @@ def make_app(
             request.query_params.get("counts", "1").strip().lower()
             not in {"0", "false", "no", "off"}
         )
+        include_events = (
+            request.query_params.get("events", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
 
         def _payload() -> dict:
             all_source_ids = {
@@ -988,7 +992,7 @@ def make_app(
                 ).append(zone["polygon"])
 
             live_windows_by_source: dict[str, dict] = {}
-            if before is None and video_dir:
+            if include_events and before is None and video_dir:
                 for source in selected_sources:
                     window = _read_live_hls_window(
                         video_dir, source["id"]
@@ -1013,28 +1017,30 @@ def make_app(
                         None,
                         True,
                     )
-            cameras = (
-                [_detection_wall_all(
-                    video_db,
-                    selected_sources,
-                    classes,
-                    limit,
-                    before,
-                    polygons_by_source,
-                    live_windows_by_source,
-                )]
-                if source_id == "all"
-                else [_detection_wall_camera(
-                    video_db,
-                    selected_sources[0],
-                    classes,
-                    limit,
-                    before,
-                    polygons_by_source.get(selected_sources[0]["id"]),
-                    selected_sources[0]["id"] in polygons_by_source,
-                    live_windows_by_source.get(selected_sources[0]["id"]),
-                )]
-            )
+            cameras = []
+            if include_events:
+                cameras = (
+                    [_detection_wall_all(
+                        video_db,
+                        selected_sources,
+                        classes,
+                        limit,
+                        before,
+                        polygons_by_source,
+                        live_windows_by_source,
+                    )]
+                    if source_id == "all"
+                    else [_detection_wall_camera(
+                        video_db,
+                        selected_sources[0],
+                        classes,
+                        limit,
+                        before,
+                        polygons_by_source.get(selected_sources[0]["id"]),
+                        selected_sources[0]["id"] in polygons_by_source,
+                        live_windows_by_source.get(selected_sources[0]["id"]),
+                    )]
+                )
             return {
                 "classes": counts,
                 "cameras": cameras,

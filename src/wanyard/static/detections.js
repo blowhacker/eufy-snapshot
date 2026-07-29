@@ -1137,6 +1137,7 @@ function apiUrl({
   before = null,
   limit = PAGE_SIZE,
   counts = true,
+  events = true,
 } = {}) {
   const params = new URLSearchParams({ limit: String(limit) });
   const classes = selectedClasses();
@@ -1145,6 +1146,7 @@ function apiUrl({
   if (zones.length) params.set("zones", zones.join(","));
   params.set("source", source || "all");
   if (!counts) params.set("counts", "0");
+  if (!events) params.set("events", "0");
   if (Number.isFinite(before)) params.set("before", String(before));
   return `/api/detections/wall?${params}`;
 }
@@ -1154,6 +1156,18 @@ async function fetchWall(options = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
+}
+
+async function loadClassCounts(request) {
+  try {
+    const data = await fetchWall({ limit: 8, events: false });
+    if (request !== state.request) return;
+    state.classCounts = data.classes || {};
+    renderTags();
+  } catch {
+    // Counts are secondary metadata. Keep the usable wall on screen and try
+    // again on the next filter change or manual refresh.
+  }
 }
 
 function makeTag(value, label, count, active) {
@@ -1286,6 +1300,14 @@ function renderTags() {
   dom.tags.append(makeTag("", "All", total, state.classes.size === 0));
   for (const [name, count] of entries) {
     dom.tags.append(makeTag(name, classLabel(name), count, state.classes.has(name)));
+  }
+}
+
+function renderPendingTags() {
+  dom.tags.innerHTML = "";
+  dom.tags.append(makeTag("", "All", "…", state.classes.size === 0));
+  for (const name of [...state.classes].sort()) {
+    dom.tags.append(makeTag(name, classLabel(name), "…", true));
   }
 }
 
@@ -1794,7 +1816,7 @@ async function loadInitial() {
   try {
     let data;
     if (state.view === "feed" && state.focus) {
-      const recent = await fetchWall();
+      const recent = await fetchWall({ counts: false });
       if (payloadHasFeedFocus(recent)) {
         data = recent;
       } else {
@@ -1811,10 +1833,9 @@ async function loadInitial() {
         };
       }
     } else {
-      data = await fetchWall();
+      data = await fetchWall({ counts: false });
     }
     if (request !== state.request) return;
-    state.classCounts = data.classes || {};
     state.sources = data.sources || [];
     state.availableZones = data.zones || [];
     state.zones = new Set(data.selected_zones || []);
@@ -1824,8 +1845,13 @@ async function loadInitial() {
     );
     renderCameraTags();
     renderAreaTags();
-    renderTags();
+    renderPendingTags();
     renderCameras();
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        if (request === state.request) void loadClassCounts(request);
+      }, 0);
+    });
   } catch (error) {
     if (request === state.request) renderFailure(error);
   } finally {

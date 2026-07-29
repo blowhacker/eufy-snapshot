@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from starlette.requests import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -17,7 +19,9 @@ from wanyard.web import (
     _detection_wall_camera,
     _detection_wall_preview,
     _gzip_path_is_excluded,
+    make_app,
 )
+from wanyard.config import AppConfig, SourceConfig
 from wanyard.video import (
     VideoSegmentDB,
     _encounter_events_from_detections,
@@ -472,6 +476,69 @@ class DetectionWallDatabaseTests(unittest.TestCase):
 
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["class"], "person")
+
+    def test_counts_only_request_skips_detection_page_work(self) -> None:
+        class SourceDB:
+            def to_source_configs(self):
+                return (SourceConfig(id="front", name="Front"),)
+
+            def get_setting(self, _key):
+                return None
+
+        class CountsDB:
+            def __init__(self):
+                self.count_calls = []
+
+            def list_zones(self):
+                return [{
+                    "uid": "nearby",
+                    "source_id": "front",
+                    "name": "Nearby",
+                    "polygon": _area(0.0, 0.0, 0.5, 0.5),
+                    "enabled": True,
+                }]
+
+            def detection_class_counts(
+                self, source_id, polygons, include_provisional
+            ):
+                self.count_calls.append(
+                    (source_id, polygons, include_provisional)
+                )
+                return {"person": 3}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_db = CountsDB()
+            app = make_app(
+                AppConfig(),
+                source_db=SourceDB(),
+                video_dir=Path(tmpdir) / "footage",
+                video_db=video_db,
+            )
+            route = next(
+                route
+                for route in app.app.routes
+                if getattr(route, "path", None) == "/api/detections/wall"
+            )
+            request = Request({
+                "type": "http",
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/api/detections/wall",
+                "raw_path": b"/api/detections/wall",
+                "query_string": b"source=front&zones=nearby&events=0",
+                "headers": [],
+                "client": ("test", 1),
+                "server": ("test", 80),
+            })
+            response = asyncio.run(route.endpoint(request))
+
+        payload = json.loads(response.body)
+        self.assertEqual(payload["classes"], {"person": 3})
+        self.assertEqual(payload["cameras"], [])
+        self.assertEqual(len(video_db.count_calls), 1)
+        self.assertEqual(video_db.count_calls[0][0], "front")
+        self.assertTrue(video_db.count_calls[0][1])
 
     def test_wall_query_uses_persisted_encounters_not_object_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
