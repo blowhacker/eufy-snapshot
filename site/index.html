@@ -2,9 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=1440">
-<title>wanyard — self-hosted NVR with YOLO detection</title>
-<meta name="description" content="Wanyard records your RTSP cameras, runs YOLO object detection in real time, and serves a clean web viewer over your LAN. Self-hosted. No cloud. No subscription.">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wanyard — find the moments in your camera footage</title>
+<meta name="description" content="A self-hosted NVR that turns RTSP camera footage into filterable encounters. Detection wall, tracked previews, mobile feed. Local, open source, no subscription.">
 <meta name="theme-color" content="#e8a558">
 
 <!-- Favicons -->
@@ -14,8 +14,8 @@
 <link rel="manifest" href="site.webmanifest">
 
 <!-- Open Graph / social -->
-<meta property="og:title" content="wanyard — self-hosted NVR with YOLO detection">
-<meta property="og:description" content="Records your RTSP cameras, runs YOLO in real time, serves a clean web viewer over your LAN. One docker compose up.">
+<meta property="og:title" content="wanyard — find the moments in your camera footage">
+<meta property="og:description" content="A self-hosted NVR with a filterable detection wall, tracked encounter previews, and a mobile feed. Your cameras, your hardware, your footage.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://wanyard.com">
 <meta property="og:image" content="https://wanyard.com/assets/og-mark.png">
@@ -39,11 +39,10 @@
       <div class="ver">v0.1.0 · self-hosted</div>
     </div>
     <nav class="tb-nav">
-      <a href="#what">what it does</a>
+      <a href="#detections">detections</a>
+      <a href="#what">underneath</a>
       <a href="#cameras">cameras</a>
-      <a href="#compare">vs.</a>
       <a href="#install">install</a>
-      <a href="#faq">faq</a>
     </nav>
     <div class="tb-r">
       <a href="#install" class="btn" style="padding:7px 12px;font-size:13px">docs</a>
@@ -59,13 +58,13 @@
     <div class="wrap">
       <div class="hero-grid">
         <div class="hero-copy">
-          <div class="eyebrow"><span class="dot"></span>open source · mit licensed · runs on your hardware</div>
+          <div class="eyebrow"><span class="dot"></span>open source · local detection · your hardware</div>
           <h1 class="h1">
             Your yard<span class="punct">,</span><br>
             on your <span class="accent">WAN</span><span class="punct">.</span>
           </h1>
           <p class="h-sub">
-            <b>Wanyard</b> records your RTSP cameras, runs YOLO object detection in real time, and serves a clean web viewer over your LAN. A few Docker containers. No cloud. No subscription. No Home Assistant required.
+            <b>Wanyard</b> records any RTSP camera and turns days of footage into encounters you can actually skim. Filter by object and area, preview the whole visit, or swipe through a private detection feed.
           </p>
 
           <div class="cta-block">
@@ -82,8 +81,8 @@
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
                 view source
               </a>
-              <a href="#install" class="btn primary">
-                read the docs
+              <a href="#detections" class="btn primary">
+                see how it finds things
                 <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
               </a>
             </div>
@@ -91,171 +90,158 @@
 
           <ul class="h-foot">
             <li><span class="tick">✓</span> any rtsp camera</li>
-            <li><span class="tick">✓</span> cpu or gpu</li>
-            <li><span class="tick">✓</span> lan-only by default</li>
+            <li><span class="tick">✓</span> tracked encounters</li>
+            <li><span class="tick">✓</span> no cloud</li>
           </ul>
         </div>
 
-        <!-- viewer mockup -->
-        <div class="viewer" data-comment-anchor="hero-viewer">
-          <div class="v-bar">
-            <div class="v-bar-l">
-              <div class="v-traffic"><span></span><span></span><span></span></div>
-              <div class="v-url"><b>wanyard.local</b>:8091<span style="color:var(--txt-4)"> /</span></div>
+        <!-- detections wall + feed mockup -->
+        <div class="product-stage" data-comment-anchor="hero-viewer" aria-label="Wanyard detections wall and feed">
+          <div class="wall-window">
+            <div class="demo-bar">
+              <div class="demo-brand"><span class="mini-mark">w</span> Detections</div>
+              <div class="view-switch"><span class="active">▦</span><span>▤</span></div>
             </div>
-            <div class="v-bar-r"><span class="pulse"></span>LIVE · 4 CAMS</div>
-          </div>
-          <div class="v-body">
-            <div class="v-stage">
-              <img src="assets/feed.jpg" alt="Live camera feed">
-              <!-- YOLO detection boxes overlaid -->
-              <div class="v-box" style="left:9%;top:38%;width:18%;height:30%">
-                <div class="lbl">car <span class="pct">94%</span></div>
-              </div>
-              <div class="v-box" style="left:30%;top:46%;width:23%;height:31%">
-                <div class="lbl">car <span class="pct">97%</span></div>
-              </div>
-              <div class="v-box" style="left:54%;top:50%;width:22%;height:29%">
-                <div class="lbl">car <span class="pct">91%</span></div>
-              </div>
-              <div class="v-box" style="left:78%;top:48%;width:20%;height:33%">
-                <div class="lbl">car <span class="pct">88%</span></div>
-              </div>
-              <div class="v-ts">
-                <span>03:09:39</span>
-                <span class="sub">2026-05-13 · driveway</span>
-              </div>
-              <div class="v-tools">
-                <div class="b active" title="Boxes">
-                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect x="3" y="3" width="10" height="10" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/></svg>
-                </div>
-                <div class="b" title="Fullscreen">
-                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M3 5.5V3h2.5M13 5.5V3h-2.5M3 10.5V13h2.5M13 10.5V13h-2.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-                </div>
-                <div class="b" title="Clip">
-                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M8 3v7M5 7.5l3 3 3-3M3 13h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                </div>
-              </div>
+            <div class="demo-filters">
+              <div><b>CAMERAS</b><span class="pill active">All</span><span class="pill">front</span><span class="pill">garden</span></div>
+              <div><b>AREAS</b><span class="pill">All</span><span class="pill active">peanut table</span></div>
+              <div><b>OBJECTS</b><span class="pill active">Bird 28</span><span class="pill">Person 14</span><span class="pill">Cat 2</span></div>
             </div>
-            <div class="v-events">
-              <div class="ev-h">
-                <h4>Activity</h4>
-                <div class="ct">142 TODAY</div>
-              </div>
-              <div class="chips">
-                <span class="chip on">all 142</span>
-                <span class="chip">car 87</span>
-                <span class="chip">person 41</span>
-                <span class="chip">cat 12</span>
-                <span class="chip">+3</span>
-              </div>
-              <div class="ev-list">
-                <div class="ev">
-                  <div class="thumb car"></div>
-                  <div class="meta"><div class="cls"><span class="sw"></span>car · 0.97</div><div class="time">03:09:39 · 4s</div></div>
-                </div>
-                <div class="ev">
-                  <div class="thumb person"></div>
-                  <div class="meta"><div class="cls"><span class="sw" style="background:var(--txt-2)"></span>person · 0.88</div><div class="time">02:54:12 · 11s</div></div>
-                </div>
-                <div class="ev">
-                  <div class="thumb cat"></div>
-                  <div class="meta"><div class="cls"><span class="sw" style="background:var(--txt-2)"></span>cat · 0.71</div><div class="time">02:31:48 · 22s</div></div>
-                </div>
-                <div class="ev">
-                  <div class="thumb car"></div>
-                  <div class="meta"><div class="cls"><span class="sw"></span>car · 0.94</div><div class="time">02:18:03 · 6s</div></div>
-                </div>
-                <div class="ev">
-                  <div class="thumb person"></div>
-                  <div class="meta"><div class="cls"><span class="sw" style="background:var(--txt-2)"></span>person · 0.92</div><div class="time">01:47:21 · 18s</div></div>
-                </div>
-              </div>
+            <div class="demo-heading"><span><i></i>All cameras</span><em>6 encounters</em></div>
+            <div class="demo-grid">
+              <article class="encounter-card">
+                <div class="demo-media scene-bird"><span class="wire"></span><span class="bird-shape"></span><b>BIRD</b><i>▶</i></div>
+                <footer>garden · 06:16:02 <span>8s</span></footer>
+              </article>
+              <article class="encounter-card">
+                <div class="demo-media scene-street media-a"><span class="person-shape"></span><b>PERSON</b><i>▶</i></div>
+                <footer>front · 07:48:14 <span>15s</span></footer>
+              </article>
+              <article class="encounter-card">
+                <div class="demo-media scene-cat"><span class="cat-shape"></span><b>CAT</b><i>▶</i></div>
+                <footer>garden · 08:03:51 <span>6s</span></footer>
+              </article>
+              <article class="encounter-card">
+                <div class="demo-media scene-street media-b"><span class="people-shape"></span><b>PERSON</b><i>▶</i></div>
+                <footer>front · 08:21:05 <span>21s</span></footer>
+              </article>
+              <article class="encounter-card">
+                <div class="demo-media scene-bird dusk"><span class="wire"></span><span class="bird-shape"></span><b>BIRD</b><i>▶</i></div>
+                <footer>garden · 08:46:40 <span>4s</span></footer>
+              </article>
+              <article class="encounter-card">
+                <div class="demo-media scene-street media-c"><b>CAR</b><i>▶</i></div>
+                <footer>front · 09:02:33 <span>11s</span></footer>
+              </article>
             </div>
           </div>
-          <div class="v-tl">
-            <div class="v-tl-h">
-              <span>TIMELINE · 24h</span>
-              <span>NOW · 03:09:39</span>
+          <div class="feed-phone">
+            <div class="phone-top"><span>9:41</span><b>•••</b></div>
+            <div class="phone-media scene-bird">
+              <span class="wire"></span><span class="bird-shape"></span>
+              <div class="feed-label"><b>BIRD</b><span>garden · peanut table</span></div>
+              <div class="feed-progress"><i></i></div>
+              <div class="feed-meta">Today, 06:16 · 8 seconds</div>
             </div>
-            <div class="v-ruler">
-              <div class="tick" style="left:0%"><span class="lbl">00</span></div>
-              <div class="tick" style="left:16.6%"><span class="lbl">04</span></div>
-              <div class="tick" style="left:33.3%"><span class="lbl">08</span></div>
-              <div class="tick" style="left:50%"><span class="lbl">12</span></div>
-              <div class="tick" style="left:66.6%"><span class="lbl">16</span></div>
-              <div class="tick" style="left:83.3%"><span class="lbl">20</span></div>
-              <div class="seg dim" style="left:2%;width:5%"></div>
-              <div class="seg" style="left:10%;width:3%"></div>
-              <div class="seg dim" style="left:14%;width:2%"></div>
-              <div class="seg" style="left:32%;width:8%"></div>
-              <div class="seg dim" style="left:42%;width:3%"></div>
-              <div class="seg" style="left:48%;width:6%"></div>
-              <div class="seg" style="left:56%;width:4%"></div>
-              <div class="seg dim" style="left:62%;width:5%"></div>
-              <div class="seg" style="left:70%;width:9%"></div>
-              <div class="seg" style="left:82%;width:6%"></div>
-              <div class="seg dim" style="left:90%;width:7%"></div>
-              <div class="playhead" style="left:13%"></div>
-            </div>
+            <div class="phone-nav"><span>⌃</span><i>2 / 6</i><span>⌄</span></div>
           </div>
         </div>
       </div>
     </div>
   </section>
 
+  <!-- ─────────── Detection experience ─────────── -->
+  <section class="sec detections-sec" id="detections" data-screen-label="02 Detections">
+    <div class="wrap">
+      <div class="sec-h detect-intro">
+        <span class="eyebrow"><span class="dot"></span>the useful bit</span>
+        <h2>Ten hours of footage.<br><span class="accent">One magpie.</span></h2>
+        <p class="lede">The detector sees frames. Wanyard turns them into visits: one walker, one card; a group moving together, one encounter. Then it gives you three good ways to find the moment.</p>
+      </div>
+
+      <div class="journey-grid">
+        <article class="journey">
+          <div class="journey-top"><span class="journey-n">01</span><span class="journey-icon">⌘</span></div>
+          <h3>Filter the wall</h3>
+          <p>Choose cameras, object classes and multiple areas. Areas belong to their camera, so “all of the front” and “peanut table in the garden” can coexist.</p>
+          <div class="journey-demo filter-demo">
+            <span>front · all</span><span>garden · peanut table</span><span>bird</span>
+          </div>
+        </article>
+        <article class="journey">
+          <div class="journey-top"><span class="journey-n">02</span><span class="journey-icon">◎</span></div>
+          <h3>Preview the whole visit</h3>
+          <p>Hover on desktop or press on touch. The preview follows the detected subject smoothly through the frame and keeps playing for the encounter, not an arbitrary second.</p>
+          <div class="journey-demo track-demo"><span class="track-box"><i>person</i></span><em></em></div>
+        </article>
+        <article class="journey">
+          <div class="journey-top"><span class="journey-n">03</span><span class="journey-icon">↕</span></div>
+          <h3>Swipe the feed</h3>
+          <p>Full-height video on mobile, arrow keys on desktop, and the next encounter preloaded. The URL follows the current item, so the exact moment is shareable.</p>
+          <div class="journey-demo swipe-demo"><span>previous</span><b>current encounter</b><span>next, preloaded</span></div>
+        </article>
+      </div>
+
+      <div class="privacy-band">
+        <span class="privacy-mark">◉</span>
+        <div><b>Object detection, not identity surveillance.</b><p>Wanyard recognises classes such as bird, cat, dog and person. It does not recognise faces, search profiles or upload footage for somebody else to analyse.</p></div>
+        <span class="privacy-status">LOCAL BY DEFAULT</span>
+      </div>
+    </div>
+  </section>
+
   <!-- ─────────── What it does ─────────── -->
-  <section class="sec" id="what" data-screen-label="02 What">
+  <section class="sec" id="what" data-screen-label="03 Underneath">
     <div class="wrap">
       <div class="sec-h">
-        <span class="eyebrow"><span class="dot"></span>what it does</span>
-        <h2>An NVR that doesn't <span class="accent">phone home</span>, doesn't charge you a subscription, and treats your old IP cameras as a feature, not a chore.</h2>
-        <p class="lede">Wanyard is opinionated about the boring parts (recording, retention, browser playback) so the interesting parts (detection, search, export) feel light.</p>
+        <span class="eyebrow"><span class="dot"></span>underneath the finding</span>
+        <h2>A recorder underneath.<br><span class="accent">A finding machine on top.</span></h2>
+        <p class="lede">Wanyard is opinionated about the boring parts—capture, timestamps, retention and browser playback—so finding the interesting parts feels light.</p>
       </div>
 
       <div class="feat-grid">
         <div class="feat">
           <div class="lbl"><span class="n">01</span> RECORDING</div>
-          <h3>Continuous capture, MP4 segments</h3>
-          <p>Every camera is recorded to disk as <b>seamless MP4 segments</b> and served live to browsers as HLS. Scrub the timeline, jump to any moment, export a clip — no transcode dance.</p>
-          <div class="gloss">RTSP H.264 / H.265 · stored on local disk</div>
+          <h3>Live wall and continuous capture</h3>
+          <p>Watch every camera live over <b>WebRTC</b>. Footage is written as timestamped MP4 segments, ready to scrub, replay and export without a cloud round-trip.</p>
+          <div class="gloss">RTSP in · WebRTC live · MP4 on disk</div>
         </div>
         <div class="feat">
           <div class="lbl"><span class="n">02</span> DETECTION</div>
-          <h3>YOLO, real-time and on backfill</h3>
-          <p>YOLO11 tags every segment with per-class detections — <b>person, car, dog, cat, bicycle, package</b>, the full COCO set — and crops a thumbnail for each event so the activity feed is scannable.</p>
-          <div class="gloss">ultralytics 8.3 · runs on CPU or CUDA</div>
+          <h3>YOLO, with classes you choose</h3>
+          <p>Select the classes worth keeping in settings. YOLO detects them in real time and can backfill recent recordings after an interruption.</p>
+          <div class="gloss">settings-selected classes · CPU or CUDA</div>
         </div>
         <div class="feat">
-          <div class="lbl"><span class="n">03</span> VIEWER</div>
-          <h3>One web UI, all your cameras</h3>
-          <p>A single-page viewer with a 24h timeline filmstrip, per-class event filtering, and clip download. Designed for a laptop on the couch, not a kiosk in a server room.</p>
-          <div class="gloss">no app · no port-forward · no auth gymnastics</div>
+          <div class="lbl"><span class="n">03</span> ENCOUNTERS</div>
+          <h3>Movement becomes a visit</h3>
+          <p>Tracking and spatial-temporal grouping join repeated boxes into <b>one useful encounter</b>, while preserving the path needed for a smooth preview.</p>
+          <div class="gloss">tracking · groups · complete encounter windows</div>
         </div>
         <div class="feat">
           <div class="lbl"><span class="n">04</span> STORAGE</div>
-          <h3>Disk auto-cleanup</h3>
-          <p>Keep <code style="font:500 11.5px var(--font-mono);background:var(--bg-2);padding:1px 5px;border-radius:3px;border:1px solid var(--line-soft);color:var(--txt)">N</code> days of footage, or cap usage at <b>X gigabytes</b>. Wanyard prunes the oldest segments first and never lets the recorder fill the drive.</p>
-          <div class="gloss">configurable per-camera · safe defaults</div>
+          <h3>Timeline, wall and feed</h3>
+          <p>Use the full recording timeline when you know when, the detection wall when you know what, and the feed when you just want to see what visited.</p>
+          <div class="gloss">desktop + mobile · shareable moments</div>
         </div>
         <div class="feat">
-          <div class="lbl"><span class="n">05</span> INSTALL</div>
-          <h3>Two containers, one compose file</h3>
-          <p>The recorder + web server is one container; the YOLO worker is another. <b>GPU is optional</b> — drop in <code style="font:500 11.5px var(--font-mono);background:var(--bg-2);padding:1px 5px;border-radius:3px;border:1px solid var(--line-soft);color:var(--txt)">docker-compose.gpu.yml</code> when you want acceleration.</p>
-          <div class="gloss">starlette · ultralytics · ffmpeg</div>
+          <div class="lbl"><span class="n">05</span> STORAGE</div>
+          <h3>Disk auto-cleanup</h3>
+          <p>Keep a chosen number of days or cap disk usage. Wanyard prunes the oldest footage first and never lets the recorder casually eat the drive.</p>
+          <div class="gloss">per-camera retention · safe defaults</div>
         </div>
         <div class="feat">
           <div class="lbl"><span class="n">06</span> DEPLOY</div>
-          <h3>Run it where you want.</h3>
-          <p>Wanyard is just two Docker containers — drop them on a <b>Synology, Raspberry Pi, or homelab box</b> on your LAN, or on a <b>Hetzner / Fly.io / DO droplet</b> and reach it over WireGuard or Tailscale. Self-hosted means <i>your</i> server, not necessarily one in your house.</p>
-          <div class="gloss">homelab · hetzner · fly.io · oracle free tier</div>
+          <h3>One Compose stack</h3>
+          <p>Bring Docker, a footage directory and an RTSP URL. The ingest, recorder, web app and detector come up together; add the GPU override when you want acceleration.</p>
+          <div class="gloss">go2rtc · mediamtx · ffmpeg · ultralytics</div>
         </div>
       </div>
     </div>
   </section>
 
   <!-- ─────────── Cameras strip ─────────── -->
-  <section class="sec thin" id="cameras" data-screen-label="03 Cameras">
+  <section class="sec thin" id="cameras" data-screen-label="04 Cameras">
     <div class="wrap">
       <div class="sec-h" style="margin-bottom:24px">
         <span class="eyebrow"><span class="dot"></span>any rtsp camera</span>
@@ -283,27 +269,32 @@
   </section>
 
   <!-- ─────────── Flow ASCII ─────────── -->
-  <section class="sec" id="how" data-screen-label="04 How">
+  <section class="sec" id="how" data-screen-label="05 How">
     <div class="wrap">
       <div class="sec-h">
         <span class="eyebrow"><span class="dot"></span>under the hood</span>
-        <h2>A timestamping relay, two workers, one disk. <span class="accent">Decoupled on purpose.</span></h2>
+        <h2>One camera pull, several useful views. <span class="accent">Decoupled on purpose.</span></h2>
       </div>
       <div class="flow-wrap">
-        <pre class="flow">  <span class="cam">+--------+</span>  rtsp   <span class="core">+---------------------+</span>  stamped  <span class="core">+----------+</span>  mp4   <span class="core">+--------+</span>
-  <span class="cam">| camera |</span> <span class="arrow">------&gt;</span>  <span class="core">|  mediamtx + stamper |</span> <span class="arrow">--------&gt;</span>  <span class="core">| recorder |</span> <span class="arrow">-----&gt;</span> <span class="core">|  disk  |</span>
-  <span class="cam">+--------+</span>         <span class="core">+---------------------+</span>           <span class="core">+----+-----+</span>         <span class="core">+--------+</span>
-                      injects SEI frame clock,              <span class="arrow">|</span> hls
-                      fans out one pull                    <span class="arrow">v</span>
-                                                      <span class="core">+----+-----+</span>          <span class="yolo">+--------+</span>
-                                             you <span class="arrow">---&gt;</span> <span class="core">|  viewer  |</span> <span class="arrow">&lt;-events-</span> <span class="yolo">|  yolo  |</span>
-                                                      <span class="core">+----------+</span>          <span class="yolo">+--------+</span></pre>
+        <pre class="flow">  <span class="cam">+--------+</span>  rtsp   <span class="core">+---------+</span>  relay  <span class="core">+--------------------+</span>
+  <span class="cam">| camera |</span> <span class="arrow">------&gt;</span>  <span class="core">| go2rtc |</span> <span class="arrow">------&gt;</span> <span class="core">| mediamtx + stamper |</span>
+  <span class="cam">+--------+</span>         <span class="core">+----+----+</span>         <span class="core">+-----+--------+-----+</span>
+                            <span class="arrow">|</span> WebRTC          <span class="arrow">|</span>        <span class="arrow">|</span>
+                            <span class="arrow">v</span>                  <span class="arrow">v</span>        <span class="arrow">v</span>
+                      <span class="core">+-----+-----+</span>      <span class="core">+--------+</span> <span class="yolo">+--------+</span>
+                      <span class="core">| live wall |</span>      <span class="core">| MP4 disk |</span> <span class="yolo">|  YOLO  |</span>
+                      <span class="core">+-----------+</span>      <span class="core">+----+---+</span> <span class="yolo">+---+----+</span>
+                                                  <span class="arrow">|</span> events <span class="arrow">|</span>
+                                                  <span class="arrow">v</span>        <span class="arrow">v</span>
+                                             <span class="core">+----------------+</span>
+                                             <span class="core">| viewer + wall  |</span>
+                                             <span class="core">+----------------+</span></pre>
 
         <div class="flow-side">
           <h3>Decoupled by design.</h3>
-          <p>An ingest relay (<b>mediamtx + stamper</b>) pulls each camera once. The stamper carries a frame-accurate clock in <b>SEI metadata</b>—codec-copy for H.264, with an H.264 re-encode fallback for other codecs. The recorder turns that stamped stream into <b>MP4</b>; the YOLO worker <b>tags segments with detections</b>. Any stage can restart without the others noticing.</p>
+          <p><b>go2rtc owns the camera connection</b> and serves low-latency WebRTC. MediaMTX relays the recording stream; the stamper carries a frame-accurate clock in <b>SEI metadata</b>. The recorder writes MP4 while YOLO tags the same timeline with detections.</p>
           <ul>
-            <li><span class="tick">→</span><span><b>Relay</b> pulls each camera once, fans the stamped stream out</span></li>
+            <li><span class="tick">→</span><span><b>go2rtc</b> pulls each camera once and fans it out</span></li>
             <li><span class="tick">→</span><span><b>Recorder</b> never blocks on inference</span></li>
             <li><span class="tick">→</span><span><b>YOLO</b> runs real-time on the stamped stream, backfills MP4</span></li>
             <li><span class="tick">→</span><span><b>Viewer</b> reads from disk; no central broker</span></li>
@@ -314,7 +305,7 @@
   </section>
 
   <!-- ─────────── Comparison ─────────── -->
-  <section class="sec" id="compare" data-screen-label="05 Compare">
+  <section class="sec" id="compare" data-screen-label="06 Compare">
     <div class="wrap">
       <div class="sec-h">
         <span class="eyebrow"><span class="dot"></span>vs. the alternatives</span>
@@ -377,7 +368,7 @@
   </section>
 
   <!-- ─────────── Quickstart ─────────── -->
-  <section class="sec" id="install" data-screen-label="06 Install">
+  <section class="sec" id="install" data-screen-label="07 Install">
     <div class="wrap">
       <div class="sec-h">
         <span class="eyebrow"><span class="dot"></span>install</span>
@@ -433,9 +424,11 @@ docker compose logs <span class="arg">wanyard-yolo</span></pre>
           <h3>What you'll see</h3>
           <dl>
             <dt>:8091</dt>
-            <dd>The viewer. Live streams, 24h timeline, event feed, clip export.</dd>
+            <dd>The live wall and viewer. Live streams, timeline, tracked playback, clip export.</dd>
+            <dt>:8091/detections</dt>
+            <dd>The filterable detection wall and full-height encounter feed.</dd>
             <dt>:8091/settings</dt>
-            <dd>Add cameras (paste an <code>rtsp://</code> URL), check system status, configure cleanup.</dd>
+            <dd>Add cameras, select detector classes, draw per-camera areas and configure retention.</dd>
             <dt>./data &amp; ./footage</dt>
             <dd>Your database and your MP4 segments. Back them up like any other folder.</dd>
           </dl>
@@ -445,7 +438,7 @@ docker compose logs <span class="arg">wanyard-yolo</span></pre>
   </section>
 
   <!-- ─────────── FAQ ─────────── -->
-  <section class="sec" id="faq" data-screen-label="07 FAQ">
+  <section class="sec" id="faq" data-screen-label="08 FAQ">
     <div class="wrap" style="max-width:1080px">
       <div class="sec-h">
         <span class="eyebrow"><span class="dot"></span>faq</span>
@@ -486,7 +479,7 @@ docker compose logs <span class="arg">wanyard-yolo</span></pre>
   </section>
 
   <!-- ─────────── Closer ─────────── -->
-  <section class="closer" data-screen-label="08 Closer">
+  <section class="closer" data-screen-label="09 Closer">
     <div class="wrap">
       <h2>It's <span class="accent">just a docker compose up</span>.</h2>
       <p>Stop renting your own footage.</p>
