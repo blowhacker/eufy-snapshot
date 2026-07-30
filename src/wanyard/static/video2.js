@@ -4453,14 +4453,8 @@ el.zoneCanvas?.addEventListener("pointerdown", e => {
     st.zoneEdit.dragPoint = hit;
   } else {
     let points = selectedPoints();
-    const draftingZone = !selectedDraftZone() || points.length < 3;
-    if (!draftingZone) {
-      const clickedZone = zoneUnderPointer(e);
-      if (clickedZone != null && clickedZone !== st.zoneEdit.selected) {
-        selectZone(clickedZone);
-        points = selectedPoints();
-      }
-    }
+    // Areas often overlap. A canvas click must never silently transfer edit
+    // ownership to an older polygon; only Previous/Next/New change selection.
     const nearEdge = zoneEdgeAt(e, 14);
     if (nearEdge != null) {
       points.splice(nearEdge + 1, 0, pt);
@@ -5179,16 +5173,6 @@ function zoneEdgeAt(evt, maxDist = Infinity) {
   return best;
 }
 
-function zoneUnderPointer(evt) {
-  const pt = canvasToNorm(evt);
-  if (!pt) return null;
-  let best = null;
-  st.zoneEdit.zones.forEach((zone, idx) => {
-    if ((zone.polygon || []).length >= 3 && pointInPoly(pt, zone.polygon)) best = idx;
-  });
-  return best;
-}
-
 function distToSegment(p, a, b) {
   const dx = b.x - a.x, dy = b.y - a.y;
   const lenSq = dx * dx + dy * dy;
@@ -5292,7 +5276,10 @@ function updateZoneChrome() {
   if (el.zoneName) {
     el.zoneName.disabled = !selected;
     const nextName = selected?.name || "";
-    if (document.activeElement !== el.zoneName && el.zoneName.value !== nextName) {
+    // Mobile browsers may keep this input focused after New/Previous/Next is
+    // tapped. Selection is authoritative, so never leave another area's name
+    // visible and able to rename the newly selected draft.
+    if (el.zoneName.value !== nextName) {
       el.zoneName.value = nextName;
     }
   }
