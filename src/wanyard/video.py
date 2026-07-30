@@ -270,6 +270,32 @@ CREATE TABLE IF NOT EXISTS notification_cursor (
     last_id   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (rule_id, kind)
 );
+
+CREATE TABLE IF NOT EXISTS notification_delivery_cursor (
+    channel              TEXT PRIMARY KEY,
+    destination_key      TEXT NOT NULL,
+    last_notification_id INTEGER NOT NULL DEFAULT 0,
+    updated_at           REAL NOT NULL DEFAULT (unixepoch('now'))
+);
+
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id               INTEGER PRIMARY KEY,
+    notification_id  INTEGER NOT NULL
+                     REFERENCES notification_events(id) ON DELETE CASCADE,
+    channel          TEXT NOT NULL,
+    destination_key  TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending',
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at  REAL NOT NULL DEFAULT 0,
+    last_error       TEXT,
+    remote_id        TEXT,
+    created_at       REAL NOT NULL DEFAULT (unixepoch('now')),
+    updated_at       REAL NOT NULL DEFAULT (unixepoch('now')),
+    delivered_at     REAL,
+    UNIQUE(notification_id, channel, destination_key)
+);
+CREATE INDEX IF NOT EXISTS ndelivery_pending
+    ON notification_deliveries(channel, destination_key, status, next_attempt_at);
 """
 
 
@@ -952,6 +978,249 @@ class VideoSegmentDB:
                 (notification_id,),
             ).fetchone()
         return bytes(row["thumb_jpeg"]) if row and row["thumb_jpeg"] else None
+
+    def configure_notification_delivery(
+        self,
+        channel: str,
+        destination_key: str,
+        *,
+        force_seed: bool = False,
+    ) -> int:
+        """Prepare a delivery channel without replaying its existing backlog."""
+        channel = str(channel).strip()
+        destination_key = str(destination_key).strip()
+        if not channel or not destination_key:
+            raise ValueError("channel and destination are required")
+        now = time.time()
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT destination_key, last_notification_id"
+                " FROM notification_delivery_cursor WHERE channel=?",
+                (channel,),
+            ).fetchone()
+            if (
+                current is not None
+                and current["destination_key"] == destination_key
+                and not force_seed
+            ):
+                return int(current["last_notification_id"])
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM notification_events"
+            ).fetchone()
+            seed = int(row[0] if row else 0)
+            conn.execute(
+                "INSERT INTO notification_delivery_cursor"
+                " (channel, destination_key, last_notification_id, updated_at)"
+                " VALUES(?,?,?,?)"
+                " ON CONFLICT(channel) DO UPDATE SET"
+                " destination_key=excluded.destination_key,"
+                " last_notification_id=excluded.last_notification_id,"
+                " updated_at=excluded.updated_at",
+                (channel, destination_key, seed, now),
+            )
+            conn.execute(
+                "UPDATE notification_deliveries SET"
+                " status='superseded', updated_at=?"
+                " WHERE channel=? AND destination_key<>?"
+                " AND status IN ('pending','retry')",
+                (now, channel, destination_key),
+            )
+        return seed
+
+    def enqueue_notification_deliveries(
+        self,
+        channel: str,
+        destination_key: str,
+        *,
+        now: float | None = None,
+        max_event_age: float = 300.0,
+        limit: int = 200,
+    ) -> int:
+        """Queue new durable notifications and advance the channel cursor."""
+        now = time.time() if now is None else float(now)
+        limit = max(1, min(2000, int(limit)))
+        cutoff = now - max(0.0, float(max_event_age))
+        inserted = 0
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT destination_key, last_notification_id"
+                " FROM notification_delivery_cursor WHERE channel=?",
+                (channel,),
+            ).fetchone()
+            if cursor is None or cursor["destination_key"] != destination_key:
+                return 0
+            rows = conn.execute(
+                "SELECT id, event_ts FROM notification_events"
+                " WHERE id>? ORDER BY id ASC LIMIT ?",
+                (int(cursor["last_notification_id"]), limit),
+            ).fetchall()
+            for row in rows:
+                if float(row["event_ts"]) < cutoff:
+                    continue
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO notification_deliveries"
+                    " (notification_id, channel, destination_key, status,"
+                    " next_attempt_at, created_at, updated_at)"
+                    " VALUES(?,?,?,'pending',?,?,?)",
+                    (
+                        int(row["id"]),
+                        channel,
+                        destination_key,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                inserted += int(cur.rowcount > 0)
+            if rows:
+                conn.execute(
+                    "UPDATE notification_delivery_cursor SET"
+                    " last_notification_id=?, updated_at=? WHERE channel=?",
+                    (int(rows[-1]["id"]), now, channel),
+                )
+        return inserted
+
+    def pending_notification_deliveries(
+        self,
+        channel: str,
+        destination_key: str,
+        *,
+        now: float | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        now = time.time() if now is None else float(now)
+        limit = max(1, min(200, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT n.*, d.id AS delivery_id, d.attempts AS delivery_attempts"
+                " FROM notification_deliveries d"
+                " JOIN notification_events n ON n.id=d.notification_id"
+                " WHERE d.channel=? AND d.destination_key=?"
+                " AND d.status IN ('pending','retry')"
+                " AND d.next_attempt_at<=?"
+                " ORDER BY d.id ASC LIMIT ?",
+                (channel, destination_key, now, limit),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = _notification_event_from_row(row)
+            item["_delivery_id"] = int(row["delivery_id"])
+            item["_delivery_attempts"] = int(row["delivery_attempts"])
+            result.append(item)
+        return result
+
+    def complete_notification_delivery(
+        self,
+        delivery_id: int,
+        remote_id: str | None,
+        *,
+        now: float | None = None,
+    ) -> None:
+        now = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE notification_deliveries SET status='delivered',"
+                " attempts=attempts+1, remote_id=?, last_error=NULL,"
+                " delivered_at=?, updated_at=? WHERE id=?",
+                (remote_id, now, now, int(delivery_id)),
+            )
+
+    def fail_notification_delivery(
+        self,
+        delivery_id: int,
+        error: str,
+        *,
+        retryable: bool,
+        retry_after: float | None = None,
+        now: float | None = None,
+    ) -> None:
+        now = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM notification_deliveries WHERE id=?",
+                (int(delivery_id),),
+            ).fetchone()
+            if row is None:
+                return
+            attempts = int(row["attempts"]) + 1
+            terminal = not retryable or attempts >= 8
+            if terminal:
+                status, next_attempt = "failed", 0.0
+            else:
+                delay = (
+                    max(1.0, float(retry_after))
+                    if retry_after is not None
+                    else min(900.0, 5.0 * (3 ** (attempts - 1)))
+                )
+                status, next_attempt = "retry", now + delay
+            conn.execute(
+                "UPDATE notification_deliveries SET status=?, attempts=?,"
+                " next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
+                (
+                    status,
+                    attempts,
+                    next_attempt,
+                    str(error)[:500],
+                    now,
+                    int(delivery_id),
+                ),
+            )
+
+    def notification_delivery_status(
+        self,
+        channel: str,
+        destination_key: str | None = None,
+    ) -> dict:
+        where = ["channel=?"]
+        params: list = [channel]
+        if destination_key:
+            where.append("destination_key=?")
+            params.append(destination_key)
+        clause = " AND ".join(where)
+        with self._connect() as conn:
+            counts = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM notification_deliveries"
+                f" WHERE {clause} GROUP BY status",
+                params,
+            ).fetchall()
+            latest = conn.execute(
+                "SELECT delivered_at FROM notification_deliveries"
+                f" WHERE {clause} AND status='delivered'"
+                " ORDER BY delivered_at DESC LIMIT 1",
+                params,
+            ).fetchone()
+            error = conn.execute(
+                "SELECT last_error, updated_at FROM notification_deliveries"
+                f" WHERE {clause} AND last_error IS NOT NULL"
+                " ORDER BY updated_at DESC LIMIT 1",
+                params,
+            ).fetchone()
+        return {
+            "counts": {str(row["status"]): int(row["n"]) for row in counts},
+            "last_delivered_at": (
+                float(latest["delivered_at"]) if latest else None
+            ),
+            # A later successful delivery is the best health signal. Do not
+            # leave Settings red forever because an older transient failed.
+            "last_error": (
+                str(error["last_error"])
+                if error and (
+                    latest is None
+                    or float(error["updated_at"])
+                    > float(latest["delivered_at"])
+                )
+                else None
+            ),
+            "last_error_at": (
+                float(error["updated_at"])
+                if error and (
+                    latest is None
+                    or float(error["updated_at"])
+                    > float(latest["delivered_at"])
+                )
+                else None
+            ),
+        }
 
     def prune_orphan_notifications(self) -> dict[str, int]:
         """Remove notifications whose referenced clock time has no footage.

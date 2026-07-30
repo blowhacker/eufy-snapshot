@@ -21,6 +21,7 @@ let _mediaHealth = null;
 let _healthHours = 24;
 let _healthSource = '';
 let _detectionConfig = null;
+let _ntfyConfig = null;
 
 async function loadStatus() {
   const d = await fetch('/api/settings/status',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}));
@@ -466,6 +467,123 @@ document.getElementById('addBtn').addEventListener('click', async () => {
   if (r.ok) { closeDrawer(); loadCameras().then(() => { loadNotificationRules(); }); }
 });
 
+// ── ntfy push delivery ───────────────────────────────
+function ntfyFormBody(extra = {}) {
+  const body = {
+    enabled: document.getElementById('ntfyEnabled').checked,
+    server: document.getElementById('ntfyServer').value.trim(),
+    topic: document.getElementById('ntfyTopic').value.trim(),
+    base_url: document.getElementById('ntfyBaseUrl').value.trim(),
+    include_thumbnail: document.getElementById('ntfyThumbnail').checked,
+    ...extra,
+  };
+  const token = document.getElementById('ntfyToken').value.trim();
+  if (token) body.token = token;
+  return body;
+}
+
+function renderNtfyConfig(config) {
+  _ntfyConfig = config || {};
+  document.getElementById('ntfyEnabled').checked = !!config?.enabled;
+  document.getElementById('ntfyTopic').value = config?.topic || '';
+  document.getElementById('ntfyServer').value = config?.server || 'https://ntfy.sh';
+  document.getElementById('ntfyBaseUrl').value = config?.base_url || location.origin;
+  document.getElementById('ntfyThumbnail').checked = config?.include_thumbnail !== false;
+  const token = document.getElementById('ntfyToken');
+  token.value = '';
+  token.placeholder = config?.token_set ? 'Saved — enter a replacement' : 'Optional';
+  document.getElementById('ntfyClearTokenBtn').hidden = !config?.token_set;
+
+  const status = document.getElementById('ntfyStatus');
+  const delivery = config?.status || {};
+  if (delivery.last_error) {
+    status.textContent = `Delivery error: ${delivery.last_error}`;
+    status.className = 's-ntfy-status err';
+  } else if (!config?.enabled) {
+    status.textContent = 'Configured but paused — test messages still work.';
+    status.className = 's-ntfy-status';
+  } else if (delivery.last_delivered_at) {
+    status.textContent = `Active · last delivered ${notificationAgeText(delivery.last_delivered_at)}`;
+    status.className = 's-ntfy-status ok';
+  } else {
+    status.textContent = 'Active · waiting for the next matching detection.';
+    status.className = 's-ntfy-status ok';
+  }
+  renderNotificationRules();
+}
+
+function notificationAgeText(ts) {
+  const seconds = Math.max(0, Date.now()/1000 - Number(ts || 0));
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s ago`;
+  if (seconds < 3600) return `${Math.round(seconds/60)}m ago`;
+  return `${Math.round(seconds/3600)}h ago`;
+}
+
+async function loadNtfyConfig() {
+  const config = await fetch('/api/settings/ntfy', {cache:'no-store'})
+    .then(r => r.json())
+    .catch(() => null);
+  if (config && !config.error) renderNtfyConfig(config);
+}
+
+async function saveNtfyConfig({ test = false, extra = {} } = {}) {
+  const msg = document.getElementById('ntfyMsg');
+  const save = document.getElementById('ntfySaveBtn');
+  const testBtn = document.getElementById('ntfyTestBtn');
+  msg.textContent = test ? 'Saving and sending…' : 'Saving…';
+  msg.className = 's-save-msg';
+  save.disabled = true;
+  testBtn.disabled = true;
+  const endpoint = test ? '/api/settings/ntfy/test' : '/api/settings/ntfy';
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(ntfyFormBody(extra)),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      msg.textContent = data.error || `Error ${response.status}`;
+      msg.className = 's-save-msg err';
+      return false;
+    }
+    renderNtfyConfig(test ? data.settings : data);
+    msg.textContent = test
+      ? 'Test sent — check the subscribed device.'
+      : 'Saved. New matching detections will use these settings.';
+    msg.className = 's-save-msg ok';
+    return true;
+  } catch {
+    msg.textContent = 'Network error';
+    msg.className = 's-save-msg err';
+    return false;
+  } finally {
+    save.disabled = false;
+    testBtn.disabled = false;
+  }
+}
+
+document.getElementById('ntfySaveBtn').addEventListener('click', () => {
+  saveNtfyConfig();
+});
+document.getElementById('ntfyTestBtn').addEventListener('click', () => {
+  saveNtfyConfig({test:true});
+});
+document.getElementById('ntfyRegenerateBtn').addEventListener('click', () => {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  const suffix = [...bytes].map(value => value.toString(16).padStart(2, '0')).join('');
+  document.getElementById('ntfyTopic').value = `wanyard-${suffix}`;
+  const msg = document.getElementById('ntfyMsg');
+  msg.textContent = 'New topic generated — subscribe to it, then save.';
+  msg.className = 's-save-msg';
+});
+document.getElementById('ntfyClearTokenBtn').addEventListener('click', async () => {
+  if (await saveNtfyConfig({extra:{clear_token:true}})) {
+    document.getElementById('ntfyMsg').textContent = 'Saved token removed.';
+  }
+});
+
 // ── Notification rules ───────────────────────────────
 const showNotifyBtn   = document.getElementById('showNotifyBtn');
 const cancelNotifyBtn = document.getElementById('cancelNotifyBtn');
@@ -614,6 +732,12 @@ function renderNotificationRules() {
     delivery.className = 's-rule-pill web';
     delivery.textContent = 'Web';
     title.append(name, state, delivery);
+    if (_ntfyConfig?.enabled) {
+      const ntfy = document.createElement('span');
+      ntfy.className = 's-rule-pill ntfy';
+      ntfy.textContent = 'ntfy';
+      title.append(ntfy);
+    }
 
     const meta = document.createElement('div');
     meta.className = 's-rule-meta';
@@ -1025,7 +1149,8 @@ sections.forEach(s => observer.observe(s));
 
 // ── Init ──────────────────────────────────────────────
 loadStatus();
-loadCameras().then(() => { loadNotificationRules(); });
+Promise.all([loadCameras(), loadNtfyConfig()])
+  .then(() => { loadNotificationRules(); });
 loadDetectionConfig();
 loadMediaHealth();
 loadCleanupConfig();

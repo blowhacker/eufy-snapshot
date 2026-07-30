@@ -31,6 +31,13 @@ from .detection_settings import (
     save_detection_classes,
 )
 from .media_health import MediaHealthCollector, MediaHealthStore, default_db_path
+from .ntfy import (
+    NtfyPublishError,
+    dispatch_ntfy_notifications,
+    load_ntfy_config,
+    save_ntfy_config,
+    send_ntfy_test,
+)
 from .retention import (
     RECORD_MODE_CONTINUOUS,
     cleanup_days_key,
@@ -768,6 +775,7 @@ def make_app(
         while True:
             try:
                 await asyncio.to_thread(video_db.materialize_notifications)
+                await asyncio.to_thread(dispatch_ntfy_notifications, video_db)
             except Exception:
                 LOG.exception("notification materialize loop error")
             await asyncio.sleep(interval)
@@ -2235,6 +2243,80 @@ def make_app(
         payload["applies_within_seconds"] = 3
         return JSONResponse(payload)
 
+    def _ntfy_payload(request: Request) -> dict:
+        config = load_ntfy_config(
+            video_db,
+            default_base_url=str(request.base_url).rstrip("/"),
+        )
+        status = video_db.notification_delivery_status(
+            "ntfy", config.destination_key
+        )
+        return config.public_payload(status)
+
+    async def api_settings_ntfy(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse(
+                {"error": "video db not configured"}, status_code=501
+            )
+        if request.method == "GET":
+            return JSONResponse(
+                await asyncio.to_thread(_ntfy_payload, request)
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"},
+                status_code=400,
+            )
+        try:
+            await asyncio.to_thread(
+                save_ntfy_config,
+                video_db,
+                body,
+                default_base_url=str(request.base_url).rstrip("/"),
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(await asyncio.to_thread(_ntfy_payload, request))
+
+    async def api_settings_ntfy_test(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse(
+                {"error": "video db not configured"}, status_code=501
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"},
+                status_code=400,
+            )
+        try:
+            config = await asyncio.to_thread(
+                save_ntfy_config,
+                video_db,
+                body,
+                default_base_url=str(request.base_url).rstrip("/"),
+            )
+            remote_id = await asyncio.to_thread(send_ntfy_test, config)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except NtfyPublishError as exc:
+            return JSONResponse(
+                {"error": str(exc), "status_code": exc.status_code},
+                status_code=502,
+            )
+        return JSONResponse({
+            "ok": True,
+            "remote_id": remote_id,
+            "settings": await asyncio.to_thread(_ntfy_payload, request),
+        })
+
     async def api_settings_cleanup_config(request: Request) -> JSONResponse:
         """Get or update auto-cleanup thresholds and per-camera retention.
 
@@ -2492,6 +2574,8 @@ def make_app(
         Route("/api/settings/media-health",      api_settings_media_health),
         Route("/api/settings/camera/test",       api_settings_camera_test, methods=["POST"]),
         Route("/api/settings/detection-config",  api_settings_detection_config, methods=["GET", "POST"]),
+        Route("/api/settings/ntfy",              api_settings_ntfy, methods=["GET", "POST"]),
+        Route("/api/settings/ntfy/test",         api_settings_ntfy_test, methods=["POST"]),
         Route("/api/settings/cleanup-config",    api_settings_cleanup_config, methods=["GET", "POST"]),
         Route("/api/settings/cleanup",           api_settings_cleanup,     methods=["POST"]),
         Mount("/", StaticFiles(directory=static_dir, html=True)),
