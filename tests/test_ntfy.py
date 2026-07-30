@@ -5,6 +5,8 @@ import asyncio
 import sys
 import tempfile
 import unittest
+import urllib.error
+from email.header import decode_header, make_header
 from pathlib import Path
 from unittest import mock
 
@@ -17,6 +19,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from wanyard.ntfy import (  # noqa: E402
+    NtfyConfig,
     NtfyPublishError,
     dispatch_ntfy_notifications,
     load_ntfy_config,
@@ -40,8 +43,8 @@ class _Response:
     def __exit__(self, *_args):
         return False
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, size: int = -1) -> bytes:
+        return self.body if size < 0 else self.body[:size]
 
 
 def _insert_notification(db: VideoSegmentDB, event_ts: float) -> int:
@@ -125,12 +128,13 @@ class NtfyConfigTests(unittest.TestCase):
 
 
 class NtfyPublishTests(unittest.TestCase):
-    def test_json_publish_includes_click_thumbnail_and_bearer_token(self) -> None:
-        captured = {}
+    def test_publish_uploads_thumbnail_with_metadata_and_bearer_token(self) -> None:
+        requests = []
 
         def opener(request, timeout):
-            captured["request"] = request
-            captured["timeout"] = timeout
+            requests.append(request)
+            if request.get_method() == "GET":
+                return _Response(b"\xff\xd8thumbnail-jpeg\xff\xd9")
             return _Response()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -151,23 +155,33 @@ class NtfyPublishTests(unittest.TestCase):
                 "thumb_url": "/api/video/event-thumb/d:7",
             }, opener=opener)
 
-        request = captured["request"]
-        payload = json.loads(request.data)
+        fetch, request = requests
         self.assertEqual(remote_id, "remote-1")
-        self.assertEqual(request.full_url, "https://ntfy.example/")
+        self.assertEqual(
+            fetch.full_url,
+            "https://camera.example:8091/api/video/event-thumb/d:7",
+        )
+        self.assertEqual(request.get_method(), "PUT")
+        self.assertEqual(
+            request.full_url, "https://ntfy.example/wanyard-private"
+        )
+        self.assertEqual(request.data, b"\xff\xd8thumbnail-jpeg\xff\xd9")
         self.assertEqual(
             request.get_header("Authorization"), "Bearer tk_secret"
         )
-        self.assertEqual(payload["topic"], "wanyard-private")
         self.assertEqual(
-            payload["click"],
+            request.get_header("X-click"),
             "https://camera.example:8091/?source=garden&ts=1234.5",
         )
+        self.assertEqual(request.get_header("X-title"), "Bird detected")
         self.assertEqual(
-            payload["attach"],
-            "https://camera.example:8091/api/video/event-thumb/d:7",
+            str(make_header(decode_header(request.get_header("X-message")))),
+            "Peanut table · Garden",
         )
-        self.assertEqual(payload["tags"], ["bird"])
+        self.assertEqual(request.get_header("X-tags"), "bird")
+        self.assertEqual(
+            request.get_header("X-filename"), "wanyard-bird-1234.jpg"
+        )
 
     def test_thumbnail_toggle_removes_attachment(self) -> None:
         captured = {}
@@ -193,6 +207,38 @@ class NtfyPublishTests(unittest.TestCase):
 
         self.assertNotIn("attach", captured["payload"])
         self.assertNotIn("filename", captured["payload"])
+
+    def test_thumbnail_fetch_failure_still_sends_text_notification(self) -> None:
+        captured = {}
+
+        def opener(request, timeout):
+            if request.get_method() == "GET":
+                raise urllib.error.URLError("thumbnail unavailable")
+            captured["request"] = request
+            return _Response()
+
+        config = NtfyConfig(
+            enabled=True,
+            server="https://ntfy.sh",
+            topic="wanyard-private",
+            token="",
+            include_thumbnail=True,
+            base_url="http://camera.example",
+        )
+        with self.assertLogs("wanyard.ntfy", level="WARNING"):
+            remote_id = publish_ntfy(config, {
+                "title": "Person detected",
+                "body": "Front yard",
+                "class": "person",
+                "thumb_url": "/thumb.jpg",
+            }, opener=opener)
+
+        self.assertEqual(remote_id, "remote-1")
+        request = captured["request"]
+        self.assertEqual(request.get_method(), "POST")
+        payload = json.loads(request.data)
+        self.assertNotIn("attach", payload)
+        self.assertEqual(payload["title"], "Person detected")
 
 
 class NtfyDeliveryTests(unittest.TestCase):

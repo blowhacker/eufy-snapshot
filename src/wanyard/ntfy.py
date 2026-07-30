@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from email.header import Header
 import hashlib
 import json
 import logging
@@ -10,7 +11,7 @@ import secrets
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 
 LOG = logging.getLogger(__name__)
@@ -19,6 +20,7 @@ _TOPIC_RE = re.compile(r"[-_A-Za-z0-9]{1,64}")
 _DEFAULT_SERVER = "https://ntfy.sh"
 _SETTING_PREFIX = "ntfy_"
 _MAX_BATCH = 20
+_MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
 
 
 class NtfyPublishError(RuntimeError):
@@ -212,6 +214,51 @@ def _class_tags(cls: str) -> list[str]:
     return [mapped.get(str(cls or "").lower(), "eyes")]
 
 
+def _header_value(value, *, limit: int) -> str:
+    clean = " ".join(str(value or "").splitlines()).strip()[:limit]
+    try:
+        clean.encode("ascii")
+    except UnicodeEncodeError:
+        return Header(clean, "utf-8").encode()
+    return clean
+
+
+def _thumbnail_bytes(
+    config: NtfyConfig,
+    notification: dict,
+    *,
+    timeout: float,
+    opener,
+) -> bytes | None:
+    embedded = notification.get("_thumb_jpeg")
+    if embedded:
+        data = bytes(embedded)
+        return data if len(data) <= _MAX_THUMBNAIL_BYTES else None
+
+    url = _absolute_url(config.base_url, notification.get("thumb_url"))
+    if not url:
+        return None
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "image/jpeg,image/*;q=0.9"},
+        method="GET",
+    )
+    try:
+        with opener(request, timeout=max(0.5, float(timeout))) as response:
+            status = int(getattr(response, "status", 200))
+            data = response.read(_MAX_THUMBNAIL_BYTES + 1)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        LOG.warning("could not load ntfy thumbnail %s: %s", url, exc)
+        return None
+    if status < 200 or status >= 300:
+        LOG.warning("could not load ntfy thumbnail %s: HTTP %s", url, status)
+        return None
+    if not data or len(data) > _MAX_THUMBNAIL_BYTES:
+        LOG.warning("ntfy thumbnail %s is empty or exceeds 2 MB", url)
+        return None
+    return data
+
+
 def publish_ntfy(
     config: NtfyConfig,
     notification: dict,
@@ -220,30 +267,52 @@ def publish_ntfy(
     opener=urllib.request.urlopen,
 ) -> str | None:
     click = _absolute_url(config.base_url, notification.get("target_url"))
-    attach = None
+    title = str(notification.get("title") or "Wanyard")
+    message = str(notification.get("body") or "Detection")
+    tags = _class_tags(str(notification.get("class") or ""))
+    thumbnail = None
     if config.include_thumbnail:
-        attach = _absolute_url(config.base_url, notification.get("thumb_url"))
-    payload = {
-        "topic": config.topic,
-        "title": str(notification.get("title") or "Wanyard"),
-        "message": str(notification.get("body") or "Detection"),
-        "tags": _class_tags(str(notification.get("class") or "")),
-        "priority": 3,
-    }
-    if click:
-        payload["click"] = click
-    if attach:
-        payload["attach"] = attach
-        payload["filename"] = (
+        thumbnail = _thumbnail_bytes(
+            config, notification, timeout=timeout, opener=opener
+        )
+
+    if thumbnail:
+        filename = (
             f"wanyard-{notification.get('class') or 'detection'}-"
             f"{int(float(notification.get('event_ts') or time.time()))}.jpg"
         )
-    request = urllib.request.Request(
-        f"{config.server.rstrip('/')}/",
-        data=json.dumps(payload, separators=(",", ":")).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+        headers = {
+            "Content-Type": "image/jpeg",
+            "X-Title": _header_value(title, limit=256),
+            "X-Message": _header_value(message, limit=2048),
+            "X-Tags": ",".join(tags),
+            "X-Priority": "3",
+            "X-Filename": filename,
+        }
+        if click:
+            headers["X-Click"] = click
+        request = urllib.request.Request(
+            f"{config.server.rstrip('/')}/{quote(config.topic, safe='')}",
+            data=thumbnail,
+            headers=headers,
+            method="PUT",
+        )
+    else:
+        payload = {
+            "topic": config.topic,
+            "title": title,
+            "message": message,
+            "tags": tags,
+            "priority": 3,
+        }
+        if click:
+            payload["click"] = click
+        request = urllib.request.Request(
+            f"{config.server.rstrip('/')}/",
+            data=json.dumps(payload, separators=(",", ":")).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
     if config.token:
         request.add_header("Authorization", f"Bearer {config.token}")
     try:
@@ -321,6 +390,10 @@ def dispatch_ntfy_notifications(
     delivered = failed = 0
     for delivery in deliveries:
         try:
+            if config.include_thumbnail:
+                delivery["_thumb_jpeg"] = video_db.get_notification_thumb(
+                    int(delivery["id"])
+                )
             remote_id = publisher(config, delivery)
         except NtfyPublishError as exc:
             video_db.fail_notification_delivery(

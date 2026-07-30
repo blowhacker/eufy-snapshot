@@ -346,9 +346,9 @@
                 <label class="s-switch s-switch-field">
                   <input id="ntfyThumbnail" type="checkbox" checked>
                   <span aria-hidden="true"></span>
-                  <b>Include detection crop</b>
+                  <b>Upload detection crop</b>
                 </label>
-                <span class="s-field-hint">Sent as the ntfy image attachment</span>
+                <span class="s-field-hint">Temporarily stored by ntfy (about 3 hours on ntfy.sh)</span>
               </div>
             </div>
 
@@ -364,6 +364,10 @@
                 but it remains editable. Anyone who knows an unprotected topic can subscribe or publish;
                 use an access token or a self-hosted server for stronger access control.
                 <a href="https://docs.ntfy.sh/subscribe/phone/" target="_blank" rel="noreferrer">ntfy setup guide</a>
+              </p>
+              <p>
+                When thumbnails are enabled, Wanyard uploads the detection crop to the configured ntfy server.
+                ntfy.sh normally deletes uploaded attachments after about 3 hours.
               </p>
             </div>
 
