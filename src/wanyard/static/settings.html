@@ -251,75 +251,6 @@
         </div>
 
         <div class="s-card">
-          <div class="s-card-section">
-            <div class="s-ntfy-heading">
-              <div>
-                <div class="s-card-section-head">ntfy push notifications</div>
-                <div id="ntfyStatus" class="s-ntfy-status">Loading configuration…</div>
-              </div>
-              <label class="s-switch">
-                <input id="ntfyEnabled" type="checkbox">
-                <span aria-hidden="true"></span>
-                <b>Enabled</b>
-              </label>
-            </div>
-
-            <div class="s-auto-grid s-ntfy-fields">
-              <div class="s-field-row">
-                <label for="ntfyTopic">Topic</label>
-                <input id="ntfyTopic" type="text" maxlength="64" autocomplete="off">
-                <button id="ntfyRegenerateBtn" class="s-btn" type="button">New random topic</button>
-              </div>
-              <div class="s-field-row">
-                <label for="ntfyServer">Server</label>
-                <input id="ntfyServer" type="url" placeholder="https://ntfy.sh" autocomplete="url">
-                <span class="s-field-hint">ntfy.sh or self-hosted</span>
-              </div>
-              <div class="s-field-row">
-                <label for="ntfyToken">Access token</label>
-                <input id="ntfyToken" type="password" placeholder="Optional" autocomplete="new-password">
-                <button id="ntfyClearTokenBtn" class="s-btn" type="button" hidden>Remove saved token</button>
-              </div>
-              <div class="s-field-row">
-                <label for="ntfyBaseUrl">Wanyard URL</label>
-                <input id="ntfyBaseUrl" type="url" placeholder="https://camera.example.com:8091" autocomplete="url">
-                <span class="s-field-hint">Opens the detected video</span>
-              </div>
-              <div class="s-field-row">
-                <label>Thumbnail</label>
-                <label class="s-switch s-switch-field">
-                  <input id="ntfyThumbnail" type="checkbox" checked>
-                  <span aria-hidden="true"></span>
-                  <b>Include detection crop</b>
-                </label>
-                <span class="s-field-hint">Sent as the ntfy image attachment</span>
-              </div>
-            </div>
-
-            <div class="s-ntfy-guide">
-              <b>Set up your phone</b>
-              <ol>
-                <li>Install the ntfy app and subscribe to the topic shown above.</li>
-                <li>Save these settings, then send a test notification.</li>
-                <li>Enable a rule below for the camera, area, and objects you care about.</li>
-              </ol>
-              <p>
-                On public ntfy servers the topic is effectively a password. Wanyard creates a long random one,
-                but it remains editable. Anyone who knows an unprotected topic can subscribe or publish;
-                use an access token or a self-hosted server for stronger access control.
-                <a href="https://docs.ntfy.sh/subscribe/phone/" target="_blank" rel="noreferrer">ntfy setup guide</a>
-              </p>
-            </div>
-
-            <div class="s-card-footer">
-              <button id="ntfySaveBtn" class="s-btn s-btn-primary" type="button">Save ntfy settings</button>
-              <button id="ntfyTestBtn" class="s-btn" type="button">Send test</button>
-              <span id="ntfyMsg" class="s-save-msg"></span>
-            </div>
-          </div>
-        </div>
-
-        <div class="s-card">
           <div class="s-rule-summary">
             <div>
               <div class="s-card-section-head">Rules</div>
@@ -371,6 +302,75 @@
                 <button id="saveNotifyBtn" class="s-btn s-btn-primary" type="button">Save rule</button>
                 <span id="notifyMsg" class="s-save-msg"></span>
               </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="s-card">
+          <div class="s-card-section">
+            <div class="s-ntfy-heading">
+              <div>
+                <div class="s-card-section-head">ntfy push notifications</div>
+                <div id="ntfyStatus" class="s-ntfy-status">Loading configuration…</div>
+              </div>
+              <label class="s-switch">
+                <input id="ntfyEnabled" type="checkbox">
+                <span aria-hidden="true"></span>
+                <b>Enabled</b>
+              </label>
+            </div>
+
+            <div class="s-auto-grid s-ntfy-fields">
+              <div class="s-field-row">
+                <label for="ntfyTopic">Topic</label>
+                <input id="ntfyTopic" type="text" maxlength="64" autocomplete="off">
+                <button id="ntfyRegenerateBtn" class="s-btn" type="button">New random topic</button>
+              </div>
+              <div class="s-field-row">
+                <label for="ntfyServer">Server</label>
+                <input id="ntfyServer" type="url" placeholder="https://ntfy.sh" autocomplete="url">
+                <span class="s-field-hint">ntfy.sh or self-hosted</span>
+              </div>
+              <div class="s-field-row">
+                <label for="ntfyToken">Access token</label>
+                <input id="ntfyToken" type="password" placeholder="Optional" autocomplete="new-password">
+                <button id="ntfyClearTokenBtn" class="s-btn" type="button" hidden>Remove saved token</button>
+              </div>
+              <div class="s-field-row">
+                <label for="ntfyBaseUrl">Wanyard URL</label>
+                <input id="ntfyBaseUrl" type="url" placeholder="https://camera.example.com:8091" autocomplete="url">
+                <span class="s-field-hint">Opens the detected video</span>
+              </div>
+              <div class="s-field-row">
+                <label>Thumbnail</label>
+                <label class="s-switch s-switch-field">
+                  <input id="ntfyThumbnail" type="checkbox" checked>
+                  <span aria-hidden="true"></span>
+                  <b>Include detection crop</b>
+                </label>
+                <span class="s-field-hint">Sent as the ntfy image attachment</span>
+              </div>
+            </div>
+
+            <div class="s-ntfy-guide">
+              <b>Set up your phone</b>
+              <ol>
+                <li>Enable a rule above for the camera, area, and objects you care about.</li>
+                <li>Install the ntfy app and subscribe to the topic shown above.</li>
+                <li>Save these settings, then send a test notification.</li>
+              </ol>
+              <p>
+                On public ntfy servers the topic is effectively a password. Wanyard creates a long random one,
+                but it remains editable. Anyone who knows an unprotected topic can subscribe or publish;
+                use an access token or a self-hosted server for stronger access control.
+                <a href="https://docs.ntfy.sh/subscribe/phone/" target="_blank" rel="noreferrer">ntfy setup guide</a>
+              </p>
+            </div>
+
+            <div class="s-card-footer">
+              <button id="ntfySaveBtn" class="s-btn s-btn-primary" type="button">Save ntfy settings</button>
+              <button id="ntfyTestBtn" class="s-btn" type="button">Send test</button>
+              <span id="ntfyMsg" class="s-save-msg"></span>
             </div>
           </div>
         </div>
