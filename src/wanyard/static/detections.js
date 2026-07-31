@@ -53,6 +53,9 @@ const state = {
   zones: initialFilters.zones,
   focus: initialFilters.focus,
   classCounts: {},
+  availableClasses: [],
+  countedClasses: new Set(),
+  classCountsComplete: false,
   availableZones: [],
   sources: [],
   cameras: new Map(),
@@ -1163,6 +1166,9 @@ async function loadClassCounts(request) {
     const data = await fetchWall({ limit: 8, events: false });
     if (request !== state.request) return;
     state.classCounts = data.classes || {};
+    state.availableClasses = data.available_classes || state.availableClasses;
+    state.countedClasses = new Set(data.counted_classes || []);
+    state.classCountsComplete = data.class_counts_complete === true;
     renderTags();
   } catch {
     // Counts are secondary metadata. Keep the usable wall on screen and try
@@ -1179,10 +1185,13 @@ function makeTag(value, label, count, active) {
 
   const text = document.createElement("span");
   text.textContent = label;
-  const number = document.createElement("span");
-  number.className = "dw-tag-count";
-  number.textContent = String(count);
-  button.append(text, number);
+  button.append(text);
+  if (count !== null && count !== undefined && count !== "") {
+    const number = document.createElement("span");
+    number.className = "dw-tag-count";
+    number.textContent = String(count);
+    button.append(number);
+  }
 
   button.addEventListener("click", () => {
     if (!value) {
@@ -1293,10 +1302,26 @@ function renderAreaTags() {
 
 function renderTags() {
   dom.tags.innerHTML = "";
-  const entries = Object.entries(state.classCounts)
-    .filter(([name, count]) => name && Number(count) > 0)
-    .sort((a, b) => Number(b[1]) - Number(a[1]) || a[0].localeCompare(b[0]));
-  const total = entries.reduce((sum, [, count]) => sum + Number(count), 0);
+  const universe = [...new Set([
+    ...state.availableClasses,
+    ...state.classes,
+  ])].filter(Boolean);
+  const configuredOrder = new Map(
+    state.availableClasses.map((name, index) => [name, index])
+  );
+  const entries = universe.map(name => {
+    const counted = state.classCountsComplete || state.countedClasses.has(name);
+    return [name, counted ? Number(state.classCounts[name] || 0) : null];
+  }).sort((a, b) => {
+    if (a[1] !== null && b[1] !== null && a[1] !== b[1]) return b[1] - a[1];
+    if (a[1] !== null && b[1] === null) return -1;
+    if (a[1] === null && b[1] !== null) return 1;
+    return (configuredOrder.get(a[0]) ?? 999) - (configuredOrder.get(b[0]) ?? 999)
+      || a[0].localeCompare(b[0]);
+  });
+  const total = state.classCountsComplete
+    ? entries.reduce((sum, [, count]) => sum + Number(count || 0), 0)
+    : null;
   dom.tags.append(makeTag("", "All", total, state.classes.size === 0));
   for (const [name, count] of entries) {
     dom.tags.append(makeTag(name, classLabel(name), count, state.classes.has(name)));
@@ -1305,9 +1330,17 @@ function renderTags() {
 
 function renderPendingTags() {
   dom.tags.innerHTML = "";
-  dom.tags.append(makeTag("", "All", "…", state.classes.size === 0));
-  for (const name of [...state.classes].sort()) {
-    dom.tags.append(makeTag(name, classLabel(name), "…", true));
+  dom.tags.append(makeTag("", "All", null, state.classes.size === 0));
+  for (const name of [...new Set([
+    ...state.availableClasses,
+    ...state.classes,
+  ])]) {
+    dom.tags.append(makeTag(
+      name,
+      classLabel(name),
+      state.classes.has(name) ? "…" : null,
+      state.classes.has(name),
+    ));
   }
 }
 
@@ -1827,6 +1860,9 @@ async function loadInitial() {
         data = {
           ...anchored,
           classes: recent.classes,
+          available_classes: recent.available_classes,
+          counted_classes: recent.counted_classes,
+          class_counts_complete: recent.class_counts_complete,
           zones: recent.zones,
           selected_zones: recent.selected_zones,
           sources: recent.sources,
@@ -1837,6 +1873,7 @@ async function loadInitial() {
     }
     if (request !== state.request) return;
     state.sources = data.sources || [];
+    state.availableClasses = data.available_classes || [];
     state.availableZones = data.zones || [];
     state.zones = new Set(data.selected_zones || []);
     syncUrl({ replace: true });

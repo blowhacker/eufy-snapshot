@@ -1936,6 +1936,7 @@ class VideoSegmentDB:
         polygons: list[list[dict]] | None = None,
         include_provisional: bool = True,
         exclusions: list[list[dict]] | None = None,
+        classes: list[str] | None = None,
     ) -> dict[str, int]:
         """Class counts for the detection wall, optionally inside any polygon.
 
@@ -1947,6 +1948,10 @@ class VideoSegmentDB:
         if source_id and source_id != "all":
             where.append("source_id=?")
             params.append(source_id)
+        if classes:
+            placeholders = ",".join("?" for _ in classes)
+            where.append(f"class IN ({placeholders})")
+            params.extend(classes)
         predicate = " AND ".join(where) if where else "1"
         counts: dict[str, int] = {}
         with self._connect() as conn:
@@ -1973,6 +1978,12 @@ class VideoSegmentDB:
             provisional = self.provisional_detection_events(
                 source_id, zone_id="none"
             )
+            if classes:
+                wanted = set(classes)
+                provisional = [
+                    event for event in provisional
+                    if event.get("class") in wanted
+                ]
             if polygons is not None or exclusions:
                 provisional = _filter_with_zone_policy(
                     provisional, polygons or [], exclusions or []

@@ -499,11 +499,15 @@ class DetectionWallDatabaseTests(unittest.TestCase):
                     "enabled": True,
                 }]
 
+            def get_setting(self, _key):
+                return None
+
             def detection_class_counts(
-                self, source_id, polygons, include_provisional
+                self, source_id, polygons, include_provisional,
+                exclusions=None, classes=None,
             ):
                 self.count_calls.append(
-                    (source_id, polygons, include_provisional)
+                    (source_id, polygons, include_provisional, classes)
                 )
                 return {"person": 3}
 
@@ -527,7 +531,7 @@ class DetectionWallDatabaseTests(unittest.TestCase):
                 "scheme": "http",
                 "path": "/api/detections/wall",
                 "raw_path": b"/api/detections/wall",
-                "query_string": b"source=front&zones=nearby&events=0",
+                "query_string": b"source=front&zones=nearby&classes=person&events=0",
                 "headers": [],
                 "client": ("test", 1),
                 "server": ("test", 80),
@@ -540,6 +544,9 @@ class DetectionWallDatabaseTests(unittest.TestCase):
         self.assertEqual(len(video_db.count_calls), 1)
         self.assertEqual(video_db.count_calls[0][0], "front")
         self.assertTrue(video_db.count_calls[0][1])
+        self.assertEqual(video_db.count_calls[0][3], ["person"])
+        self.assertEqual(payload["counted_classes"], ["person"])
+        self.assertFalse(payload["class_counts_complete"])
 
     def test_wall_query_uses_persisted_encounters_not_object_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -689,6 +696,35 @@ class DetectionWallDatabaseTests(unittest.TestCase):
                     _area(0.7, 0.7, 1.0, 1.0),
                 ],
                 include_provisional=False,
+            )
+
+            self.assertEqual(counts, {"person": 1, "bird": 1})
+
+    def test_detection_counts_only_read_requested_classes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            segment_id = db.open_segment("front", "front/segment.mp4", 100.0)
+            db.set_segment_media_start(segment_id, 100.0)
+            db.close_segment(segment_id, 130.0, None, None)
+            db.insert_events([
+                {
+                    "segment_id": segment_id,
+                    "source_id": "front",
+                    "abs_ts": 101.0 + index,
+                    "class": cls,
+                    "start_off": 1.0 + index,
+                    "end_off": 2.0 + index,
+                    "confidence": 0.8,
+                    "boxes_json": json.dumps([_box(0.1, 0.1, cls)]),
+                }
+                for index, cls in enumerate(("person", "car", "bird"))
+            ])
+
+            counts = db.detection_class_counts(
+                "front",
+                [_area(0.0, 0.0, 0.3, 0.3)],
+                include_provisional=False,
+                classes=["person", "bird"],
             )
 
             self.assertEqual(counts, {"person": 1, "bird": 1})

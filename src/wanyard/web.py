@@ -27,6 +27,7 @@ from starlette.staticfiles import StaticFiles
 from . import native_hls
 from .config import AppConfig
 from .detection_settings import (
+    configured_detection_classes,
     detection_settings_payload,
     save_detection_classes,
 )
@@ -907,6 +908,9 @@ def make_app(
         if not video_db:
             return JSONResponse({
                 "classes": {},
+                "available_classes": [],
+                "counted_classes": [],
+                "class_counts_complete": False,
                 "cameras": [],
                 "zones": [],
                 "selected_zones": [],
@@ -974,6 +978,7 @@ def make_app(
         )
 
         def _payload() -> dict:
+            available_classes = configured_detection_classes(video_db)
             all_source_ids = {
                 source["id"] for source in all_sources
             }
@@ -1030,28 +1035,34 @@ def make_app(
             # Counts populate the sticky object filter on an initial camera
             # selection. Pagination does not repeat the aggregation.
             counts: dict[str, int] = {}
+            counted_classes: list[str] = []
+            counts_complete = False
             if before is None and include_counts:
-                if selected_zone_uids or exclusions_by_source:
-                    for source in selected_sources:
-                        polygons = polygons_by_source.get(source["id"])
-                        source_exclusions = exclusions_by_source.get(source["id"])
-                        source_counts = (
-                            video_db.detection_class_counts(
-                                source["id"], polygons, True, source_exclusions
+                zone_policy_active = bool(
+                    selected_zone_uids or exclusions_by_source
+                )
+                if zone_policy_active:
+                    counted_classes = list(classes)
+                    if counted_classes:
+                        for source in selected_sources:
+                            polygons = polygons_by_source.get(source["id"])
+                            source_exclusions = exclusions_by_source.get(source["id"])
+                            source_counts = video_db.detection_class_counts(
+                                source["id"], polygons, True,
+                                source_exclusions, counted_classes,
                             )
-                            if source_exclusions
-                            else video_db.detection_class_counts(
-                                source["id"], polygons, True
-                            )
-                        )
-                        for cls, count in source_counts.items():
-                            counts[cls] = counts.get(cls, 0) + count
+                            for cls, count in source_counts.items():
+                                counts[cls] = counts.get(cls, 0) + count
                 else:
                     counts = video_db.detection_class_counts(
                         None if source_id == "all" else source_id,
                         None,
                         True,
+                        None,
+                        available_classes,
                     )
+                    counts_complete = True
+                    counted_classes = list(available_classes)
             cameras = []
             if include_events:
                 cameras = (
@@ -1080,6 +1091,9 @@ def make_app(
                 )
             return {
                 "classes": counts,
+                "available_classes": available_classes,
+                "counted_classes": counted_classes,
+                "class_counts_complete": counts_complete,
                 "cameras": cameras,
                 "zones": [
                     {
