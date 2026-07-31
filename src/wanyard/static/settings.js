@@ -626,7 +626,9 @@ async function loadZonesForSource(sourceId, force = false) {
   const d = await fetch(`/api/video/zones?${p}`, { cache:'no-store' })
     .then(r => r.json())
     .catch(() => ({ zones: [] }));
-  _zonesBySource[sourceId] = (d.zones || []).filter(z => z.enabled !== false);
+  _zonesBySource[sourceId] = (d.zones || []).filter(z =>
+    z.enabled !== false && ["activity_area", "vehicle_event"].includes(z.type || "activity_area")
+  );
   return _zonesBySource[sourceId];
 }
 

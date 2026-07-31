@@ -696,12 +696,38 @@ body {
 .v2-zone-meta {
   display: flex;
   flex-direction: column;
-  min-width: 132px;
+  min-width: 230px;
   gap: 2px;
   color: var(--txt);
   font: 650 12px var(--font-ui);
 }
+.v2-zone-title-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.v2-zone-type-badge {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border: 1px solid rgba(232, 165, 88, 0.42);
+  border-radius: 999px;
+  background: rgba(232, 165, 88, 0.14);
+  color: #f3b46a;
+  font: 650 10px var(--font-ui);
+  letter-spacing: .02em;
+}
+.v2-zone-type-badge.exclusion {
+  border-color: rgba(235, 105, 105, 0.52);
+  background: rgba(235, 105, 105, 0.14);
+  color: #ff9898;
+}
+.v2-zone-help {
+  max-width: 280px;
+  color: var(--txt-3);
+  font: 500 10px/1.3 var(--font-ui);
+}
 .v2-zone-name {
+  flex: 1 1 auto;
   background: transparent;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 6px;
@@ -788,6 +814,16 @@ body {
 }
 .v2-zone-action.primary:disabled {
   color: #0b0d10;
+}
+.v2-zone-action.exclusion {
+  color: #ff9898;
+  border-color: rgba(235, 105, 105, 0.3);
+  background: rgba(235, 105, 105, 0.08);
+}
+.st-menu-exclusion-note {
+  padding: 7px 10px;
+  color: #ff9898;
+  font: 550 11px/1.3 var(--font-ui);
 }
 
 /* Activity panel */
@@ -1471,8 +1507,11 @@ body {
     padding: 8px;
   }
   .v2-zone-meta {
-    flex: 1 1 120px;
+    flex: 1 1 100%;
     min-width: 0;
+  }
+  .v2-zone-help {
+    max-width: none;
   }
   .v2-zone-actions {
     flex: 1 1 auto;

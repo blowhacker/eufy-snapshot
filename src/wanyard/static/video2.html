@@ -13,7 +13,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/video2.css?v=scrub-freeze-1">
+    <link rel="stylesheet" href="/video2.css?v=exclusion-areas-1">
   </head>
   <body>
     <div id="v2LoadBar" class="v2-load-bar"></div>
@@ -96,18 +96,23 @@
         </div>
         <div id="v2ZoneBar" class="v2-zone-bar" hidden>
           <div class="v2-zone-meta">
-            <input id="v2ZoneName" class="v2-zone-name" type="text" placeholder="Area name" maxlength="80" autocomplete="off">
+            <div class="v2-zone-title-row">
+              <span id="v2ZoneTypeBadge" class="v2-zone-type-badge">Activity</span>
+              <input id="v2ZoneName" class="v2-zone-name" type="text" placeholder="Area name" maxlength="80" autocomplete="off">
+            </div>
+            <span id="v2ZoneHelp" class="v2-zone-help">Events inside this area are surfaced.</span>
             <span id="v2ZoneCount">0 areas</span>
           </div>
           <div class="v2-zone-actions compact">
             <button id="v2ZonePrev" class="v2-zone-action icon" type="button" title="Previous area" aria-label="Previous area">‹</button>
             <button id="v2ZoneNext" class="v2-zone-action icon" type="button" title="Next area" aria-label="Next area">›</button>
-            <button id="v2ZoneNew" class="v2-zone-action" type="button">New</button>
+            <button id="v2ZoneNew" class="v2-zone-action" type="button">+ Activity</button>
+            <button id="v2ZoneNewExclusion" class="v2-zone-action exclusion" type="button">+ Exclusion</button>
             <button id="v2ZoneDelete" class="v2-zone-action" type="button">Delete</button>
           </div>
           <div class="v2-zone-actions">
-            <button id="v2ZoneSave" class="v2-zone-action primary" type="button">Save</button>
-            <button id="v2ZoneReset" class="v2-zone-action" type="button">Reset</button>
+            <button id="v2ZoneSave" class="v2-zone-action primary" type="button">Save area</button>
+            <button id="v2ZoneReset" class="v2-zone-action" type="button">Revert</button>
             <button id="v2ZoneCancel" class="v2-zone-action" type="button">Cancel</button>
           </div>
         </div>
@@ -181,6 +186,6 @@
     <script src="/d3.min.js?v=7.9.0"></script>
     <script src="/live-sei-clock.js?v=2"></script>
     <script src="/stage-zoom.js?v=2"></script>
-    <script src="/video2.js?v=zone-editor-1"></script>
+    <script src="/video2.js?v=exclusion-areas-1"></script>
   </body>
 </html>

@@ -26,6 +26,7 @@ from wanyard.video import (
     VideoSegmentDB,
     _encounter_events_from_detections,
     _filter_with_polygons,
+    _filter_with_zone_policy,
     _merge_encounter_area_boxes,
 )
 
@@ -790,6 +791,56 @@ class EncounterGroupingTests(unittest.TestCase):
             [event],
         )
         self.assertTrue(json.loads(merged)[1]["_zone_sample"])
+
+    def test_exclusion_suppresses_only_events_wholly_inside_it(self) -> None:
+        exclusion = _area(0.05, 0.35, 0.20, 0.55)
+        hidden = {"boxes_json": json.dumps([_box(0.10, 0.45)])}
+        entered_then_left = {
+            "boxes_json": json.dumps([
+                _box(0.10, 0.45),
+                {**_box(0.30, 0.45), "_zone_sample": True},
+            ])
+        }
+
+        self.assertEqual(
+            _filter_with_zone_policy(
+                [hidden, entered_then_left], [], [exclusion]
+            ),
+            [entered_then_left],
+        )
+
+
+class VideoZonePersistenceTests(unittest.TestCase):
+    def test_single_zone_updates_do_not_rewrite_neighbouring_areas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            activity = db.save_zone("front", {
+                "name": "Path",
+                "type": "activity_area",
+                "polygon": _area(0.1, 0.1, 0.4, 0.4),
+            })
+            exclusion = db.save_zone("front", {
+                "name": "Toy unicorn",
+                "type": "exclusion_area",
+                "polygon": _area(0.6, 0.6, 0.8, 0.9),
+            })
+
+            updated = db.save_zone("front", {
+                "name": "Front path",
+                "type": "activity_area",
+                "polygon": _area(0.12, 0.1, 0.42, 0.4),
+            }, activity["uid"])
+            zones = db.list_zones("front")
+
+            self.assertEqual(updated["uid"], activity["uid"])
+            self.assertEqual(len(zones), 2)
+            self.assertEqual(
+                next(z for z in zones if z["uid"] == exclusion["uid"])["name"],
+                "Toy unicorn",
+            )
+            self.assertEqual(db.exclusion_areas("front"), [exclusion["polygon"]])
+            self.assertTrue(db.delete_zone("front", exclusion["uid"]))
+            self.assertFalse(db.delete_zone("front", exclusion["uid"]))
 
 
 class DetectionWallAllCameraTests(unittest.TestCase):

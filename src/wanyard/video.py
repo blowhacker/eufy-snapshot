@@ -660,6 +660,53 @@ class VideoSegmentDB:
             )
         return self.list_zones(source_id)
 
+    def save_zone(self, source_id: str, zone: dict,
+                  zone_uid: str | None = None) -> dict:
+        """Create or update one camera area without rewriting its neighbours."""
+        if not source_id or source_id == "all":
+            raise ValueError("source_id is required")
+        item = _sanitize_zone(source_id, zone)
+        now = time.time()
+        with self._connect() as conn:
+            if zone_uid is None:
+                uid = _new_zone_uid()
+                conn.execute(
+                    "INSERT INTO video_zones"
+                    " (uid, source_id, name, zone_type, polygon_json, enabled, created_at, updated_at)"
+                    " VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        uid, source_id, item["name"], item["zone_type"],
+                        item["polygon_json"], item["enabled"], now, now,
+                    ),
+                )
+            else:
+                uid = _normalize_zone_uid(zone_uid)
+                if not uid:
+                    raise ValueError("invalid zone uid")
+                changed = conn.execute(
+                    "UPDATE video_zones SET name=?, zone_type=?, polygon_json=?,"
+                    " enabled=?, updated_at=? WHERE source_id=? AND uid=?",
+                    (
+                        item["name"], item["zone_type"], item["polygon_json"],
+                        item["enabled"], now, source_id, uid,
+                    ),
+                ).rowcount
+                if not changed:
+                    raise LookupError("area not found")
+        return next(z for z in self.list_zones(source_id) if z["uid"] == uid)
+
+    def delete_zone(self, source_id: str, zone_uid: str) -> bool:
+        if not source_id or source_id == "all":
+            raise ValueError("source_id is required")
+        uid = _normalize_zone_uid(zone_uid)
+        if not uid:
+            raise ValueError("invalid zone uid")
+        with self._connect() as conn:
+            return bool(conn.execute(
+                "DELETE FROM video_zones WHERE source_id=? AND uid=?",
+                (source_id, uid),
+            ).rowcount)
+
     def list_notification_rules(self, source_id: str | None = None) -> list[dict]:
         where, params = ["1"], []
         if source_id and source_id != "all":
@@ -1254,14 +1301,54 @@ class VideoSegmentDB:
     def activity_areas(self, source_id: str) -> list[list[dict]]:
         return [
             z["polygon"] for z in self.list_zones(source_id)
-            if z["enabled"] and len(z["polygon"]) >= 3
+            if z["type"] in {"activity_area", "vehicle_event"}
+            and z["enabled"] and len(z["polygon"]) >= 3
+        ]
+
+    def exclusion_areas(self, source_id: str) -> list[list[dict]]:
+        return [
+            z["polygon"] for z in self.list_zones(source_id)
+            if z["type"] == "exclusion_area"
+            and z["enabled"] and len(z["polygon"]) >= 3
         ]
 
     def has_activity_areas(self, source_id: str | None = None) -> bool:
         return any(
-            z["enabled"] and len(z["polygon"]) >= 3
+            z["type"] in {"activity_area", "vehicle_event"}
+            and z["enabled"] and len(z["polygon"]) >= 3
             for z in self.list_zones(source_id)
         )
+
+    def has_exclusion_areas(self, source_id: str | None = None) -> bool:
+        return any(
+            z["type"] == "exclusion_area"
+            and z["enabled"] and len(z["polygon"]) >= 3
+            for z in self.list_zones(source_id)
+        )
+
+    def filter_events_with_zone_policy(
+        self,
+        events: list[dict],
+        source_id: str | None,
+        polygons: list[list[dict]],
+    ) -> list[dict]:
+        if source_id and source_id != "all":
+            return _filter_with_zone_policy(
+                events, polygons, self.exclusion_areas(source_id)
+            )
+        exclusion_cache: dict[str, list[list[dict]]] = {}
+        filtered: list[dict] = []
+        for event in events:
+            event_source = str(event.get("source_id") or "")
+            if event_source not in exclusion_cache:
+                exclusion_cache[event_source] = (
+                    self.exclusion_areas(event_source) if event_source else []
+                )
+            if _event_allowed_by_zone_policy(
+                event, polygons, exclusion_cache[event_source]
+            ):
+                filtered.append(event)
+        return filtered
 
     def filter_events_by_areas(self, events: list[dict]) -> list[dict]:
         area_cache: dict[str, list[list[dict]]] = {}
@@ -1273,7 +1360,10 @@ class VideoSegmentDB:
                 continue
             if source_id not in area_cache:
                 area_cache[source_id] = self.activity_areas(source_id)
-            if _event_allowed_by_areas(event, area_cache[source_id]):
+            exclusions = self.exclusion_areas(source_id)
+            if _event_allowed_by_zone_policy(
+                event, area_cache[source_id], exclusions
+            ):
                 filtered.append(event)
         return filtered
 
@@ -1288,7 +1378,11 @@ class VideoSegmentDB:
             except (TypeError, ValueError):
                 return self.activity_areas(source_id)
             for z in self.list_zones(source_id):
-                if z["id"] == z_id and z["enabled"] and len(z["polygon"]) >= 3:
+                if (
+                    z["id"] == z_id
+                    and z["type"] in {"activity_area", "vehicle_event"}
+                    and z["enabled"] and len(z["polygon"]) >= 3
+                ):
                     return [z["polygon"]]
         return self.activity_areas(source_id) if source_id else []
 
@@ -1372,7 +1466,7 @@ class VideoSegmentDB:
             params += [lo, hi]
         polygons = self.zone_polygons(source_id, zone_id)
         query_limit = limit
-        if polygons and limit < 100000:
+        if (polygons or self.has_exclusion_areas(source_id)) and limit < 100000:
             query_limit = max(limit * 20, 200)
         sql = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
@@ -1384,8 +1478,8 @@ class VideoSegmentDB:
         params.append(query_limit)
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        events = _filter_with_polygons(
-            [_worldize_event_row(dict(r)) for r in rows], polygons)[:limit]
+        events = self.filter_events_with_zone_policy(
+            [_worldize_event_row(dict(r)) for r in rows], source_id, polygons)[:limit]
         return [_public_object_event(r) for r in events]
 
     def nearest_object_events(self, around: float, source_id: str | None = None,
@@ -1418,7 +1512,7 @@ class VideoSegmentDB:
             f" WHERE {base}"
         )
         polygons = self.zone_polygons(source_id, zone_id)
-        query_limit = max(limit * 20, 200) if polygons else limit
+        query_limit = max(limit * 20, 200) if (polygons or self.has_exclusion_areas(source_id)) else limit
         with self._connect() as conn:
             before = conn.execute(
                 f"{select} AND e.display_ts<=? ORDER BY e.display_ts DESC LIMIT ?",
@@ -1428,9 +1522,9 @@ class VideoSegmentDB:
                 f"{select} AND e.display_ts>? ORDER BY e.display_ts ASC LIMIT ?",
                 (*params, around, query_limit),
             ).fetchall()
-        rows = _filter_with_polygons(
+        rows = self.filter_events_with_zone_policy(
             [_worldize_event_row(dict(r)) for r in before]
-            + [_worldize_event_row(dict(r)) for r in after], polygons)
+            + [_worldize_event_row(dict(r)) for r in after], source_id, polygons)
         rows.sort(key=lambda r: (
             abs(float(r.get("display_ts", r["abs_ts"])) - around),
             float(r.get("display_ts", r["abs_ts"])),
@@ -1790,7 +1884,7 @@ class VideoSegmentDB:
             params += [lo, hi]
         polygons = self.zone_polygons(source_id, zone_id)
         query_limit = limit
-        if polygons and limit < 100000:
+        if (polygons or self.has_exclusion_areas(source_id)) and limit < 100000:
             query_limit = max(limit * 20, 200)
         sql = (
             "SELECT e.*, s.path as seg_path, s.spritesheet,"
@@ -1802,8 +1896,8 @@ class VideoSegmentDB:
         params.append(query_limit)
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return _filter_with_polygons(
-            [_worldize_event_row(dict(r)) for r in rows], polygons)[:limit]
+        return self.filter_events_with_zone_policy(
+            [_worldize_event_row(dict(r)) for r in rows], source_id, polygons)[:limit]
 
     def list_detection_events(
         self,
@@ -1841,6 +1935,7 @@ class VideoSegmentDB:
         source_id: str | None = None,
         polygons: list[list[dict]] | None = None,
         include_provisional: bool = True,
+        exclusions: list[list[dict]] | None = None,
     ) -> dict[str, int]:
         """Class counts for the detection wall, optionally inside any polygon.
 
@@ -1855,7 +1950,7 @@ class VideoSegmentDB:
         predicate = " AND ".join(where) if where else "1"
         counts: dict[str, int] = {}
         with self._connect() as conn:
-            if polygons is None:
+            if polygons is None and not exclusions:
                 rows = conn.execute(
                     f"SELECT class, COUNT(*) AS n FROM {table}"
                     f" WHERE {predicate} GROUP BY class",
@@ -1868,8 +1963,8 @@ class VideoSegmentDB:
                     f" WHERE {predicate}",
                     params,
                 ).fetchall()
-                for event in _filter_with_polygons(
-                    [dict(row) for row in rows], polygons
+                for event in _filter_with_zone_policy(
+                    [dict(row) for row in rows], polygons or [], exclusions or []
                 ):
                     cls = str(event["class"])
                     counts[cls] = counts.get(cls, 0) + 1
@@ -1878,8 +1973,10 @@ class VideoSegmentDB:
             provisional = self.provisional_detection_events(
                 source_id, zone_id="none"
             )
-            if polygons is not None:
-                provisional = _filter_with_polygons(provisional, polygons)
+            if polygons is not None or exclusions:
+                provisional = _filter_with_zone_policy(
+                    provisional, polygons or [], exclusions or []
+                )
             for event in provisional:
                 cls = str(event["class"])
                 counts[cls] = counts.get(cls, 0) + 1
@@ -1915,7 +2012,7 @@ class VideoSegmentDB:
             f" WHERE {base}"
         )
         polygons = self.zone_polygons(source_id, zone_id)
-        query_limit = max(limit * 20, 200) if polygons else limit
+        query_limit = max(limit * 20, 200) if (polygons or self.has_exclusion_areas(source_id)) else limit
         with self._connect() as conn:
             before = conn.execute(
                 f"{select} AND e.abs_ts<=? ORDER BY e.abs_ts DESC LIMIT ?",
@@ -1925,9 +2022,9 @@ class VideoSegmentDB:
                 f"{select} AND e.abs_ts>? ORDER BY e.abs_ts ASC LIMIT ?",
                 (*params, around, query_limit),
             ).fetchall()
-        rows = _filter_with_polygons(
+        rows = self.filter_events_with_zone_policy(
             [_worldize_event_row(dict(r)) for r in before]
-            + [_worldize_event_row(dict(r)) for r in after], polygons)
+            + [_worldize_event_row(dict(r)) for r in after], source_id, polygons)
         rows.sort(key=lambda r: (abs(r["abs_ts"] - around), r["abs_ts"]))
         return rows[:limit]
 
@@ -2127,7 +2224,8 @@ class VideoSegmentDB:
         table = "object_events" if self.object_events_available(source_id) else "video_events"
         episode_filter = "event_type='appeared'" if table == "object_events" else "1"
         polygons = self.zone_polygons(source_id, zone_id)
-        if polygons:
+        exclusions_active = self.has_exclusion_areas(source_id)
+        if polygons or exclusions_active:
             where, params = [episode_filter], []
             if source_id and source_id != "all":
                 where.append("source_id=?")
@@ -2139,7 +2237,9 @@ class VideoSegmentDB:
                     params,
                 ).fetchall()
             counts: dict[str, int] = {}
-            for event in _filter_with_polygons([dict(r) for r in rows], polygons):
+            for event in self.filter_events_with_zone_policy(
+                [dict(r) for r in rows], source_id, polygons
+            ):
                 counts[event["class"]] = counts.get(event["class"], 0) + 1
         else:
             with self._connect() as conn:
@@ -2181,7 +2281,8 @@ class VideoSegmentDB:
             where.append(("display_ts<?" if table == "object_events" else "abs_ts<?"))
             params.append(until)
         polygons = self.zone_polygons(source_id, zone_id)
-        if polygons:
+        exclusions_active = self.has_exclusion_areas(source_id)
+        if polygons or exclusions_active:
             sql = (
                 f"SELECT source_id, class, boxes_json FROM {table}"
                 f" WHERE {' AND '.join(where)}"
@@ -2189,7 +2290,9 @@ class VideoSegmentDB:
             with self._connect() as conn:
                 rows = conn.execute(sql, params).fetchall()
             classes: dict[str, int] = {}
-            for event in _filter_with_polygons([dict(r) for r in rows], polygons):
+            for event in self.filter_events_with_zone_policy(
+                [dict(r) for r in rows], source_id, polygons
+            ):
                 classes[event["class"]] = classes.get(event["class"], 0) + 1
         else:
             sql = (
@@ -2338,7 +2441,7 @@ class VideoSegmentDB:
                 row["seg_media_epoch"] = seg.get("media_epoch")
                 _worldize_event_row(row)
                 events.append(row)
-        events = _filter_with_polygons(events, polygons)
+        events = self.filter_events_with_zone_policy(events, source_id, polygons)
         events.sort(key=lambda r: r["abs_ts"], reverse=True)
         return events
 
@@ -2365,7 +2468,7 @@ class VideoSegmentDB:
                 row["seg_media_epoch"] = seg.get("media_epoch")
                 _worldize_event_row(row)
                 events.append(row)
-        events = _filter_with_polygons(events, polygons)
+        events = self.filter_events_with_zone_policy(events, source_id, polygons)
         events.sort(key=lambda row: row["abs_ts"], reverse=True)
         return events
 
@@ -3547,12 +3650,13 @@ def _sanitize_zone(source_id: str, zone: dict) -> dict:
     if not isinstance(zone, dict):
         raise ValueError("zone must be an object")
     zone_type = str(zone.get("type") or zone.get("zone_type") or "activity_area").strip()
-    if zone_type not in {"activity_area", "vehicle_event"}:
+    if zone_type not in {"activity_area", "vehicle_event", "exclusion_area"}:
         raise ValueError("unsupported zone type")
     polygon = _normalize_polygon(zone.get("polygon"))
     if zone_type == "vehicle_event":
         zone_type = "activity_area"
-    name = str(zone.get("name") or "Activity area").strip()[:80] or "Activity area"
+    default_name = "Exclusion area" if zone_type == "exclusion_area" else "Activity area"
+    name = str(zone.get("name") or default_name).strip()[:80] or default_name
     return {
         "source_id": source_id,
         "name": name,
@@ -3931,8 +4035,11 @@ def _notification_events_after(
     polygons = _notification_zone_polygons(conn, rule["source_id"], rule["zone_ref"])
     if polygons is None:
         return [], start_id
+    exclusions = _notification_exclusion_polygons(conn, rule["source_id"])
     if kind == "det":
-        return _notification_det_events_after(conn, rule, polygons, start_id, limit)
+        return _notification_det_events_after(
+            conn, rule, polygons, exclusions, start_id, limit
+        )
     return [], start_id
 
 
@@ -3940,6 +4047,7 @@ def _notification_det_events_after(
     conn: sqlite3.Connection,
     rule: dict,
     polygons: list[list[dict]],
+    exclusions: list[list[dict]],
     start_id: int,
     limit: int,
 ) -> tuple[list[dict], int]:
@@ -3984,6 +4092,8 @@ def _notification_det_events_after(
             except (KeyError, TypeError, ValueError):
                 continue
             if polygons and not _point_in_any_polygon(cx, cy, polygons):
+                continue
+            if exclusions and _point_in_any_polygon(cx, cy, exclusions):
                 continue
             if best is None or float(box.get("conf") or 0) > float(best.get("conf") or 0):
                 best = box
@@ -4046,6 +4156,27 @@ def _notification_activity_zones(
     return zones
 
 
+def _notification_exclusion_polygons(
+    conn: sqlite3.Connection,
+    source_id: str,
+) -> list[list[dict]]:
+    rows = conn.execute(
+        "SELECT polygon_json FROM video_zones"
+        " WHERE source_id=? AND zone_type='exclusion_area' AND enabled=1"
+        " ORDER BY id",
+        (source_id,),
+    ).fetchall()
+    polygons: list[list[dict]] = []
+    for row in rows:
+        try:
+            polygon = json.loads(row["polygon_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(polygon, list) and len(polygon) >= 3:
+            polygons.append(polygon)
+    return polygons
+
+
 def _notification_zone_by_uid(
     conn: sqlite3.Connection,
     source_id: str,
@@ -4053,7 +4184,8 @@ def _notification_zone_by_uid(
 ) -> dict | None:
     row = conn.execute(
         "SELECT id, uid, name, polygon_json FROM video_zones"
-        " WHERE source_id=? AND uid=? AND enabled=1 LIMIT 1",
+        " WHERE source_id=? AND uid=? AND zone_type='activity_area'"
+        " AND enabled=1 LIMIT 1",
         (source_id, uid),
     ).fetchone()
     if not row:
@@ -4186,6 +4318,29 @@ def _event_allowed_by_areas(event: dict, areas: list[list[dict]]) -> bool:
     return False
 
 
+def _event_allowed_by_zone_policy(
+    event: dict,
+    areas: list[list[dict]],
+    exclusions: list[list[dict]],
+) -> bool:
+    """Allow an event when at least one sampled box is included and not excluded.
+
+    Exclusions suppress presentation only. Detection rows, tracks and footage
+    remain intact, and an object that later leaves an exclusion can still form
+    a surfaced event.
+    """
+    for box in _event_boxes(event):
+        try:
+            cx, cy = _box_center(box)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if exclusions and _point_in_any_polygon(cx, cy, exclusions):
+            continue
+        if not areas or _point_in_any_polygon(cx, cy, areas):
+            return True
+    return False
+
+
 def _zone_filter_disabled(zone_id) -> bool:
     return zone_id is not None and str(zone_id).lower() in {"none", "off", "frame", "whole-frame"}
 
@@ -4194,6 +4349,19 @@ def _filter_with_polygons(events: list[dict], polygons: list[list[dict]]) -> lis
     if not polygons:
         return list(events)
     return [e for e in events if _event_allowed_by_areas(e, polygons)]
+
+
+def _filter_with_zone_policy(
+    events: list[dict],
+    polygons: list[list[dict]],
+    exclusions: list[list[dict]],
+) -> list[dict]:
+    if not polygons and not exclusions:
+        return list(events)
+    return [
+        event for event in events
+        if _event_allowed_by_zone_policy(event, polygons, exclusions)
+    ]
 
 
 def _point_in_any_polygon(x: float, y: float, polygons: list[list[dict]]) -> bool:

@@ -1211,6 +1211,8 @@ const el = {
   notifyReadAll: $("v2NotificationsReadAll"),
   zoneBar: $("v2ZoneBar"),
   zoneName: $("v2ZoneName"),
+  zoneTypeBadge: $("v2ZoneTypeBadge"),
+  zoneHelp: $("v2ZoneHelp"),
   zoneTriggerLabel: $("v2ZoneTriggerLabel"),
   zoneMenu: $("v2ZoneMenu"),
   zonePicker: $("v2ZonePicker"),
@@ -1218,6 +1220,7 @@ const el = {
   zonePrev:$("v2ZonePrev"),
   zoneNext:$("v2ZoneNext"),
   zoneNew:$("v2ZoneNew"),
+  zoneNewExclusion:$("v2ZoneNewExclusion"),
   zoneDelete:$("v2ZoneDelete"),
   zoneSave:$("v2ZoneSave"),
   zoneReset:$("v2ZoneReset"),
@@ -4433,7 +4436,8 @@ document.addEventListener("keydown", (e) => {
 });
 el.zonePrev?.addEventListener("click", () => selectZone(st.zoneEdit.selected - 1));
 el.zoneNext?.addEventListener("click", () => selectZone(st.zoneEdit.selected + 1));
-el.zoneNew?.addEventListener("click", addZoneDraft);
+el.zoneNew?.addEventListener("click", () => addZoneDraft("activity_area"));
+el.zoneNewExclusion?.addEventListener("click", () => addZoneDraft("exclusion_area"));
 el.zoneDelete?.addEventListener("click", deleteSelectedZoneDraft);
 el.zoneSave?.addEventListener("click", saveZoneEditor);
 el.zoneReset?.addEventListener("click", resetZoneEditor);
@@ -4916,16 +4920,31 @@ function activityZones() {
   return (st.zones || []).filter(isActivityZone);
 }
 
+function isExclusionZone(z) {
+  return z && z.type === "exclusion_area"
+    && z.enabled !== false
+    && Array.isArray(z.polygon);
+}
+
+function exclusionZones() {
+  return (st.zones || []).filter(isExclusionZone);
+}
+
+function editableZones() {
+  return (st.zones || []).filter(z => isActivityZone(z) || isExclusionZone(z));
+}
+
 function completedActivityZones() {
   return activityZones().filter(z => z.polygon.length >= 3);
 }
 
 function normalizeDraftZone(zone, idx) {
+  const type = zone?.type === "exclusion_area" ? "exclusion_area" : "activity_area";
   return {
     id: zone?.id,
     uid: zone?.uid,
-    name: zone?.name || `Area ${idx + 1}`,
-    type: "activity_area",
+    name: zone?.name || (type === "exclusion_area" ? `Exclusion ${idx + 1}` : `Area ${idx + 1}`),
+    type,
     enabled: zone?.enabled !== false,
     polygon: Array.isArray(zone?.polygon)
       ? zone.polygon.map(p => ({ x: Number(p.x), y: Number(p.y) }))
@@ -5024,16 +5043,23 @@ function renderZonePicker() {
 
   // Editing is per-camera; only offer it when a single source is selected.
   if (!singleSource) return;
-  if (zones.length > 0) {
+  const exclusions = exclusionZones().filter(z => z.source_id === st.source && z.polygon.length >= 3);
+  if (zones.length > 0 || exclusions.length > 0) {
     const div = document.createElement("div");
     div.className = "st-menu-divider";
     el.zoneMenu.appendChild(div);
+  }
+  if (exclusions.length > 0) {
+    const note = document.createElement("div");
+    note.className = "st-menu-exclusion-note";
+    note.textContent = `⊘ ${exclusions.length} exclusion ${exclusions.length === 1 ? "area" : "areas"} always applied`;
+    el.zoneMenu.appendChild(note);
   }
   const edit = document.createElement("button");
   edit.type = "button";
   edit.role = "menuitem";
   edit.className = "st-menu-item st-menu-edit";
-  edit.textContent = zones.length ? "Edit areas" : "Add area";
+  edit.textContent = (zones.length || exclusions.length) ? "Manage areas" : "Add area";
   edit.addEventListener("click", () => { closeZoneMenu(); startZoneEditor(); });
   el.zoneMenu.appendChild(edit);
 }
@@ -5230,9 +5256,14 @@ function drawZones() {
     const points = (zone.polygon || []).map(normToCanvas).filter(Boolean);
     if (!points.length) return;
     const selected = idx === st.zoneEdit.selected;
+    const excluded = zone.type === "exclusion_area";
     ctx.lineWidth = selected ? 2.5 : 1.5;
-    ctx.strokeStyle = selected ? "#e8a558" : "rgba(104, 176, 171, 0.86)";
-    ctx.fillStyle = selected ? "rgba(232, 165, 88, 0.18)" : "rgba(104, 176, 171, 0.12)";
+    ctx.strokeStyle = excluded
+      ? (selected ? "#ff8585" : "rgba(235, 105, 105, 0.8)")
+      : (selected ? "#e8a558" : "rgba(104, 176, 171, 0.86)");
+    ctx.fillStyle = excluded
+      ? (selected ? "rgba(235, 105, 105, 0.20)" : "rgba(235, 105, 105, 0.10)")
+      : (selected ? "rgba(232, 165, 88, 0.18)" : "rgba(104, 176, 171, 0.12)");
     ctx.beginPath();
     points.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
     if (points.length >= 3) {
@@ -5245,7 +5276,10 @@ function drawZones() {
   selectedPoints().map(normToCanvas).filter(Boolean).forEach((p, i) => {
     ctx.beginPath();
     ctx.arc(p.x, p.y, 5.5, 0, Math.PI * 2);
-    ctx.fillStyle = i === st.zoneEdit.dragPoint ? "#f3b46a" : "#e8a558";
+    const excluded = selectedDraftZone()?.type === "exclusion_area";
+    ctx.fillStyle = excluded
+      ? (i === st.zoneEdit.dragPoint ? "#ffaaaa" : "#ff8585")
+      : (i === st.zoneEdit.dragPoint ? "#f3b46a" : "#e8a558");
     ctx.fill();
     ctx.lineWidth = 2;
     ctx.strokeStyle = "#050709";
@@ -5265,10 +5299,7 @@ function setZoneEditing(active) {
 function updateZoneChrome() {
   const zones = st.zoneEdit.zones;
   const selected = selectedDraftZone();
-  const invalid = zones.some(z => {
-    const n = (z.polygon || []).length;
-    return n > 0 && n < 3;
-  });
+  const invalid = selected && (selected.polygon || []).length < 3;
   if (el.zoneSave) el.zoneSave.disabled = invalid;
   if (el.zoneDelete) el.zoneDelete.disabled = !selected;
   if (el.zonePrev) el.zonePrev.disabled = zones.length <= 1;
@@ -5283,11 +5314,22 @@ function updateZoneChrome() {
       el.zoneName.value = nextName;
     }
   }
+  const excluded = selected?.type === "exclusion_area";
+  if (el.zoneTypeBadge) {
+    el.zoneTypeBadge.textContent = excluded ? "Exclusion" : "Activity";
+    el.zoneTypeBadge.classList.toggle("exclusion", !!excluded);
+  }
+  if (el.zoneHelp) {
+    el.zoneHelp.textContent = excluded
+      ? "Detected and recorded, but hidden from activity, the detection wall and notifications."
+      : "Events inside this area are surfaced.";
+  }
   if (el.zoneCount) {
-    const validCount = zones.filter(z => (z.polygon || []).length >= 3).length;
+    const activityCount = zones.filter(z => z.type !== "exclusion_area" && (z.polygon || []).length >= 3).length;
+    const exclusionCount = zones.filter(z => z.type === "exclusion_area" && (z.polygon || []).length >= 3).length;
     const total = zones.length;
     el.zoneCount.textContent = total
-      ? `${Math.max(0, st.zoneEdit.selected) + 1} of ${total} · ${validCount} saved`
+      ? `${Math.max(0, st.zoneEdit.selected) + 1} of ${total} · ${activityCount} activity · ${exclusionCount} excluded`
       : "0 areas";
   }
 }
@@ -5306,14 +5348,23 @@ function selectZone(idx) {
   drawZones();
 }
 
-function addZoneDraft() {
-  const zone = normalizeDraftZone(null, st.zoneEdit.zones.length);
+function addZoneDraft(type = "activity_area") {
+  const zone = normalizeDraftZone({ type }, st.zoneEdit.zones.length);
   st.zoneEdit.zones.push(zone);
   selectZone(st.zoneEdit.zones.length - 1);
 }
 
-function deleteSelectedZoneDraft() {
-  if (!selectedDraftZone()) return;
+async function deleteSelectedZoneDraft() {
+  const selected = selectedDraftZone();
+  if (!selected) return;
+  if (selected.uid) {
+    const p = new URLSearchParams({ source: st.source });
+    const r = await fetch(`/api/video/zones/${encodeURIComponent(selected.uid)}?${p}`, {
+      method: "DELETE",
+    }).catch(() => null);
+    if (!r?.ok) return;
+    st.zones = st.zones.filter(z => z.uid !== selected.uid);
+  }
   st.zoneEdit.zones.splice(st.zoneEdit.selected, 1);
   selectZone(Math.min(st.zoneEdit.selected, st.zoneEdit.zones.length - 1));
 }
@@ -5322,7 +5373,7 @@ function startZoneEditor() {
   if (st.source === "all") return;
   player.pause();
   el.liveVideo?.pause();
-  st.zoneEdit.zones = activityZones().map(normalizeDraftZone);
+  st.zoneEdit.zones = editableZones().map(normalizeDraftZone);
   st.zoneEdit.selected = st.zoneEdit.zones.length ? 0 : -1;
   st.zoneEdit.dragPoint = null;
   st.zoneEdit.dragPoly = false;
@@ -5341,29 +5392,29 @@ function cancelZoneEditor() {
 
 async function saveZoneEditor() {
   if (st.source === "all") return;
-  if (st.zoneEdit.zones.some(z => {
-    const n = (z.polygon || []).length;
-    return n > 0 && n < 3;
-  })) return;
-  const zones = st.zoneEdit.zones
-    .filter(z => (z.polygon || []).length >= 3)
-    .map((z, idx) => ({
-      id: z.id,
-      uid: z.uid,
-      name: z.name || `Area ${idx + 1}`,
-      type: "activity_area",
-      enabled: true,
-      polygon: z.polygon,
-    }));
+  const zone = selectedDraftZone();
+  if (!zone || (zone.polygon || []).length < 3) return;
+  const payload = {
+    name: zone.name || (zone.type === "exclusion_area" ? "Exclusion area" : "Activity area"),
+    type: zone.type,
+    enabled: true,
+    polygon: zone.polygon,
+  };
   const p = new URLSearchParams({ source: st.source });
-  const r = await fetch(`/api/video/zones?${p}`, {
-    method: "PUT",
+  const endpoint = zone.uid
+    ? `/api/video/zones/${encodeURIComponent(zone.uid)}?${p}`
+    : `/api/video/zones/new?${p}`;
+  const r = await fetch(endpoint, {
+    method: zone.uid ? "PUT" : "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ zones }),
+    body: JSON.stringify(payload),
   }).catch(() => null);
   if (!r?.ok) return;
   const data = await r.json();
-  st.zones = data.zones || [];
+  const saved = data.zone;
+  st.zones = saved
+    ? [...st.zones.filter(z => z.uid !== saved.uid), saved]
+    : st.zones;
   st.zonesSource = st.source;
   cancelZoneEditor();
   st.events = [];
@@ -5372,8 +5423,17 @@ async function saveZoneEditor() {
 }
 
 function resetZoneEditor() {
-  st.zoneEdit.zones = activityZones().map(normalizeDraftZone);
-  st.zoneEdit.selected = st.zoneEdit.zones.length ? 0 : -1;
+  const selected = selectedDraftZone();
+  const original = selected?.uid
+    ? st.zones.find(z => z.uid === selected.uid)
+    : null;
+  if (original) {
+    st.zoneEdit.zones[st.zoneEdit.selected] = normalizeDraftZone(original, st.zoneEdit.selected);
+  } else if (selected) {
+    st.zoneEdit.zones[st.zoneEdit.selected] = normalizeDraftZone(
+      { type: selected.type }, st.zoneEdit.selected
+    );
+  }
   st.zoneEdit.dragPoint = null;
   st.zoneEdit.dragPoly = false;
   st.zoneEdit.last = null;

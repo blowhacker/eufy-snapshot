@@ -136,6 +136,7 @@ def _detection_wall_camera(
     polygons: list[list[dict]] | None = None,
     zone_filter_active: bool = False,
     live_window: dict | None = None,
+    exclusions: list[list[dict]] | None = None,
 ) -> dict:
     """Return one camera's newest detection episodes for the thumbnail wall.
 
@@ -143,16 +144,18 @@ def _detection_wall_camera(
     cursor backwards and make the busy camera skip events.
     """
     fetch_limit = limit + 1
+    exclusions = exclusions or []
     if zone_filter_active and not polygons:
         recorded = []
-    elif zone_filter_active:
+    elif zone_filter_active or exclusions:
         recorded = _detection_wall_filtered_recorded(
             video_db,
             source["id"],
             classes,
             fetch_limit,
             before,
-            polygons,
+            polygons or [],
+            exclusions,
         )
     else:
         recorded = video_db.list_detection_events(
@@ -165,11 +168,11 @@ def _detection_wall_camera(
         video_db.provisional_events,
     )
     provisional = provisional_getter(source["id"])
-    if zone_filter_active:
-        from .video import _filter_with_polygons
+    if zone_filter_active or exclusions:
+        from .video import _filter_with_zone_policy
         provisional = (
-            _filter_with_polygons(provisional, polygons or [])
-            if polygons else []
+            _filter_with_zone_policy(provisional, polygons or [], exclusions)
+            if (polygons or exclusions) else []
         )
     wanted = set(classes)
     candidates: dict[str, dict] = {}
@@ -249,9 +252,10 @@ def _detection_wall_filtered_recorded(
     limit: int,
     before: float | None,
     polygons: list[list[dict]],
+    exclusions: list[list[dict]] | None = None,
 ) -> list[dict]:
     """Scan indexed time pages until ``limit`` zone-matching rows are found."""
-    from .video import _filter_with_polygons
+    from .video import _filter_with_zone_policy
 
     matched: list[dict] = []
     cursor = before
@@ -262,7 +266,7 @@ def _detection_wall_filtered_recorded(
         )
         if not page:
             break
-        matched.extend(_filter_with_polygons(page, polygons))
+        matched.extend(_filter_with_zone_policy(page, polygons, exclusions or []))
         if len(page) < batch_limit:
             break
         oldest = min(
@@ -399,6 +403,7 @@ def _detection_wall_all(
     before: float | None,
     polygons_by_source: dict[str, list[list[dict]]] | None = None,
     live_windows_by_source: dict[str, dict] | None = None,
+    exclusions_by_source: dict[str, list[list[dict]]] | None = None,
 ) -> dict:
     """Interleave source-local pages into one newest-first camera feed."""
     source_pages = [
@@ -411,6 +416,7 @@ def _detection_wall_all(
             (polygons_by_source or {}).get(source["id"]),
             source["id"] in (polygons_by_source or {}),
             (live_windows_by_source or {}).get(source["id"]),
+            (exclusions_by_source or {}).get(source["id"]),
         )
         for source in sources
     ]
@@ -975,7 +981,7 @@ def make_app(
                 source["id"]: source.get("name") or source["id"]
                 for source in all_sources
             }
-            available_zone_rows = [
+            all_zone_rows = [
                 zone
                 for zone in video_db.list_zones()
                 if (
@@ -985,6 +991,14 @@ def make_app(
                     and isinstance(zone.get("polygon"), list)
                     and len(zone["polygon"]) >= 3
                 )
+            ]
+            available_zone_rows = [
+                zone for zone in all_zone_rows
+                if zone.get("type", "activity_area") in {"activity_area", "vehicle_event"}
+            ]
+            exclusion_rows = [
+                zone for zone in all_zone_rows
+                if zone.get("type") == "exclusion_area"
             ]
             zones_by_uid = {
                 str(zone["uid"]): zone for zone in available_zone_rows
@@ -996,6 +1010,11 @@ def make_app(
             for uid in selected_zone_uids:
                 zone = zones_by_uid[uid]
                 polygons_by_source.setdefault(
+                    str(zone["source_id"]), []
+                ).append(zone["polygon"])
+            exclusions_by_source: dict[str, list[list[dict]]] = {}
+            for zone in exclusion_rows:
+                exclusions_by_source.setdefault(
                     str(zone["source_id"]), []
                 ).append(zone["polygon"])
 
@@ -1012,12 +1031,20 @@ def make_app(
             # selection. Pagination does not repeat the aggregation.
             counts: dict[str, int] = {}
             if before is None and include_counts:
-                if selected_zone_uids:
+                if selected_zone_uids or exclusions_by_source:
                     for source in selected_sources:
                         polygons = polygons_by_source.get(source["id"])
-                        for cls, count in video_db.detection_class_counts(
-                            source["id"], polygons, True
-                        ).items():
+                        source_exclusions = exclusions_by_source.get(source["id"])
+                        source_counts = (
+                            video_db.detection_class_counts(
+                                source["id"], polygons, True, source_exclusions
+                            )
+                            if source_exclusions
+                            else video_db.detection_class_counts(
+                                source["id"], polygons, True
+                            )
+                        )
+                        for cls, count in source_counts.items():
                             counts[cls] = counts.get(cls, 0) + count
                 else:
                     counts = video_db.detection_class_counts(
@@ -1036,6 +1063,7 @@ def make_app(
                         before,
                         polygons_by_source,
                         live_windows_by_source,
+                        exclusions_by_source,
                     )]
                     if source_id == "all"
                     else [_detection_wall_camera(
@@ -1047,6 +1075,7 @@ def make_app(
                         polygons_by_source.get(selected_sources[0]["id"]),
                         selected_sources[0]["id"] in polygons_by_source,
                         live_windows_by_source.get(selected_sources[0]["id"]),
+                        exclusions_by_source.get(selected_sources[0]["id"]),
                     )]
                 )
             return {
@@ -1064,6 +1093,14 @@ def make_app(
                     for zone in available_zone_rows
                 ],
                 "selected_zones": selected_zone_uids,
+                "exclusions": [
+                    {
+                        "uid": str(zone["uid"]),
+                        "source_id": str(zone["source_id"]),
+                        "name": zone.get("name") or "Exclusion area",
+                    }
+                    for zone in exclusion_rows
+                ],
                 "sources": [
                     {
                         "id": source["id"],
@@ -1522,6 +1559,59 @@ def make_app(
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"zones": saved})
+
+    async def api_video_zone(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({"error": "video db not configured"}, status_code=501)
+        source_id = request.query_params.get("source") or None
+        zone_uid = request.path_params.get("zone_uid")
+        if not source_id or source_id == "all":
+            return JSONResponse({"error": "source is required"}, status_code=400)
+
+        if request.method == "DELETE":
+            try:
+                deleted = await asyncio.to_thread(
+                    video_db.delete_zone, source_id, zone_uid
+                )
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            if not deleted:
+                return JSONResponse({"error": "area not found"}, status_code=404)
+            return JSONResponse({"deleted": True})
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+        try:
+            saved = await asyncio.to_thread(
+                video_db.save_zone, source_id, body, zone_uid
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except LookupError:
+            return JSONResponse({"error": "area not found"}, status_code=404)
+        return JSONResponse({"zone": saved})
+
+    async def api_video_zone_create(request: Request) -> JSONResponse:
+        if not video_db:
+            return JSONResponse({"error": "video db not configured"}, status_code=501)
+        source_id = request.query_params.get("source") or None
+        if not source_id or source_id == "all":
+            return JSONResponse({"error": "source is required"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+        try:
+            saved = await asyncio.to_thread(video_db.save_zone, source_id, body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"zone": saved}, status_code=201)
 
     async def api_notification_rules(request: Request) -> JSONResponse:
         if not video_db:
@@ -2550,6 +2640,8 @@ def make_app(
         Route("/api/video/activity-summary", api_video_activity_summary),
         Route("/api/detections/wall",       api_detection_wall),
         Route("/api/video/zones",           api_video_zones, methods=["GET", "PUT"]),
+        Route("/api/video/zones/new",       api_video_zone_create, methods=["POST"]),
+        Route("/api/video/zones/{zone_uid}", api_video_zone, methods=["PUT", "DELETE"]),
         Route("/api/notifications",         api_notifications),
         Route("/api/notifications/unread-count", api_notifications_unread_count),
         Route("/api/notifications/read-all", api_notifications_read_all, methods=["POST"]),
