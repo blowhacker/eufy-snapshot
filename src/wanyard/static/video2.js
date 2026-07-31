@@ -5371,6 +5371,10 @@ async function deleteSelectedZoneDraft() {
 
 function startZoneEditor() {
   if (st.source === "all") return;
+  // On mobile the activity panel is a modal drawer with a full-stage
+  // backdrop. The area toolbar lives on the stage, so close the drawer before
+  // editing or its backdrop would intercept every toolbar tap.
+  setActivityOpen(false);
   player.pause();
   el.liveVideo?.pause();
   st.zoneEdit.zones = editableZones().map(normalizeDraftZone);
