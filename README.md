@@ -57,6 +57,7 @@ Main services in `docker-compose.yml`:
 wanyard serve        # web server, APIs, recording
 wanyard stamp        # SEI frame-clock stamper
 wanyard yolo-serve   # YOLO live detection + MP4 backfill
+wanyard stereo-inspect desk garden  # read-only two-camera feasibility report
 ```
 
 ## Tests

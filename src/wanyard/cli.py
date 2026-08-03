@@ -32,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_gen_mediamtx(args, config)
     if args.command == "gen-go2rtc":
         return cmd_gen_go2rtc(args, config)
+    if args.command == "stereo-inspect":
+        return cmd_stereo_inspect(args, config)
     if args.command == "stamp":
         from . import stamper
         return stamper.run(config)
@@ -67,6 +69,27 @@ def build_parser() -> argparse.ArgumentParser:
     gen_go2rtc = sub.add_parser("gen-go2rtc", help="generate go2rtc config from configured sources")
     gen_go2rtc.add_argument("--out", default="/run/go2rtc/go2rtc.yaml",
                             help="output path for go2rtc config (default: /run/go2rtc/go2rtc.yaml)")
+    stereo = sub.add_parser(
+        "stereo-inspect",
+        help="inspect timestamped two-camera overlap without opening new camera streams",
+    )
+    stereo.add_argument("left_source", help="left source id, for example desk")
+    stereo.add_argument("right_source", help="right source id, for example garden")
+    stereo.add_argument(
+        "--at", type=float, default=None,
+        help="Unix timestamp to inspect (default: latest shared recorded coverage)",
+    )
+    stereo.add_argument("--offset-min-ms", type=int, default=-300)
+    stereo.add_argument("--offset-max-ms", type=int, default=300)
+    stereo.add_argument("--offset-step-ms", type=int, default=50)
+    stereo.add_argument(
+        "--max-dimension", type=int, default=1280,
+        help="largest image dimension used for feature analysis (default: 1280)",
+    )
+    stereo.add_argument(
+        "--output-dir", default=None,
+        help="diagnostic directory (default: data/stereo-inspect/<pair>/<timestamp>)",
+    )
     sub.add_parser("stamp", help="clock stamper: attach world-time as SEI, republish <src>-stamped")
     return parser
 
@@ -134,6 +157,64 @@ def cmd_derive_episodes(args) -> int:
         f" events={stats['events']}"
         f" sources={sources}"
     )
+    return 0
+
+
+def cmd_stereo_inspect(args, config: AppConfig) -> int:
+    from .stereo import (
+        StereoInspectError,
+        build_offsets_ms,
+        inspect_pair,
+        latest_common_timestamp,
+    )
+
+    video_dir = Path(os.environ.get("VIDEO_DIR", "video"))
+    video_db = VideoSegmentDB(video_dir / "video.db")
+    try:
+        offsets = build_offsets_ms(
+            args.offset_min_ms, args.offset_max_ms, args.offset_step_ms
+        )
+        at = (
+            float(args.at) if args.at is not None
+            else latest_common_timestamp(video_db, args.left_source, args.right_source)
+        )
+        if args.output_dir:
+            output_dir = Path(args.output_dir)
+        else:
+            base = (
+                config.db_path.parent / "stereo-inspect"
+                if config.db_path else video_dir / "stereo-inspect"
+            )
+            pair = f"{args.left_source}-{args.right_source}"
+            output_dir = base / pair / f"{at:.3f}"
+        report = inspect_pair(
+            video_db,
+            video_dir,
+            args.left_source,
+            args.right_source,
+            at,
+            offsets,
+            output_dir,
+            max_dimension=args.max_dimension,
+        )
+    except StereoInspectError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    metrics = report["best_metrics"]
+    temporal = report["temporal_offset"]
+    print(
+        "stereo feasibility:"
+        f" {report['feasibility']}"
+        f" inliers={metrics['fundamental_inliers']}"
+        f" inlier_ratio={metrics['inlier_ratio']:.1%}"
+        f" coverage={min(metrics['left_grid_coverage'], metrics['right_grid_coverage']):.1%}"
+    )
+    if temporal["observable"]:
+        print(f"temporal offset: {temporal['suggested_offset_ms']:+d} ms (observable)")
+    else:
+        print(f"temporal offset: not observable ({temporal['reason']})")
+    print(f"diagnostics: {output_dir / 'report.json'}")
     return 0
 
 
