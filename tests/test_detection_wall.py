@@ -548,6 +548,86 @@ class DetectionWallDatabaseTests(unittest.TestCase):
         self.assertEqual(payload["counted_classes"], ["person"])
         self.assertFalse(payload["class_counts_complete"])
 
+    def test_multi_camera_query_interleaves_only_selected_sources(self) -> None:
+        class SourceDB:
+            def to_source_configs(self):
+                return (
+                    SourceConfig(id="front", name="Front"),
+                    SourceConfig(id="garden", name="Garden"),
+                    SourceConfig(id="side", name="Side"),
+                )
+
+            def get_setting(self, _key):
+                return None
+
+        class MultiSourceDB(FakeVideoDB):
+            def __init__(self):
+                super().__init__([
+                    _event(1, 100.0, "person", source_id="front"),
+                    _event(2, 104.0, "person", source_id="garden"),
+                    _event(3, 108.0, "person", source_id="side"),
+                ])
+                self.count_calls = []
+
+            def get_setting(self, _key):
+                return None
+
+            def list_zones(self):
+                return []
+
+            def detection_class_counts(
+                self, source_id, polygons, include_provisional,
+                exclusions=None, classes=None,
+            ):
+                self.count_calls.append(source_id)
+                return {
+                    "person": {
+                        "front": 2,
+                        "garden": 3,
+                        "side": 7,
+                    }[source_id]
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_db = MultiSourceDB()
+            app = make_app(
+                AppConfig(),
+                source_db=SourceDB(),
+                video_dir=Path(tmpdir) / "footage",
+                video_db=video_db,
+            )
+            route = next(
+                route
+                for route in app.app.routes
+                if getattr(route, "path", None) == "/api/detections/wall"
+            )
+            request = Request({
+                "type": "http",
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/api/detections/wall",
+                "raw_path": b"/api/detections/wall",
+                "query_string": b"source=garden,front&limit=8",
+                "headers": [],
+                "client": ("test", 1),
+                "server": ("test", 80),
+            })
+            response = asyncio.run(route.endpoint(request))
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["selected_source_ids"], ["front", "garden"])
+        self.assertEqual(payload["classes"]["person"], 5)
+        self.assertEqual(video_db.count_calls, ["front", "garden"])
+        self.assertEqual(len(payload["cameras"]), 1)
+        self.assertEqual(payload["cameras"][0]["id"], "all")
+        self.assertEqual(payload["cameras"][0]["name"], "Selected cameras")
+        self.assertEqual(
+            [event["source_id"] for event in payload["cameras"][0]["events"]],
+            ["garden", "front"],
+        )
+
     def test_wall_query_uses_persisted_encounters_not_object_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = VideoSegmentDB(Path(tmpdir) / "video.db")

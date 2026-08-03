@@ -1,12 +1,13 @@
 const PAGE_SIZE = 24;
 const RECENT_REFRESH_MS = 4000;
+const cameraFilters = window.DetectionWallFilters;
 
 function filtersFromUrl() {
   const params = new URLSearchParams(location.search);
   const focusTs = Number(params.get("ts"));
   const feed = params.get("view") === "feed";
   return {
-    camera: params.get("camera") || "all",
+    cameras: cameraFilters.parse(params.get("camera")),
     view: feed ? "feed" : "grid",
     classes: new Set(
       (params.get("classes") || "")
@@ -47,7 +48,7 @@ const dom = {
 
 const initialFilters = filtersFromUrl();
 const state = {
-  camera: initialFilters.camera,
+  cameraFilter: initialFilters.cameras,
   view: initialFilters.view,
   classes: initialFilters.classes,
   zones: initialFilters.zones,
@@ -1076,11 +1077,20 @@ function selectedZones() {
   return [...state.zones].sort();
 }
 
+function selectedCameraSource() {
+  return cameraFilters.serialize(state.cameraFilter) || "all";
+}
+
+function selectedCameraCount() {
+  return state.cameraFilter == null
+    ? state.sources.length
+    : state.cameraFilter.size;
+}
+
 function detectionWallUrl({ includeFocus = true } = {}) {
   const url = new URL("/detections", location.origin);
-  if (state.camera && state.camera !== "all") {
-    url.searchParams.set("camera", state.camera);
-  }
+  const cameras = cameraFilters.serialize(state.cameraFilter);
+  if (cameras) url.searchParams.set("camera", cameras);
   const classes = selectedClasses();
   if (classes.length) url.searchParams.set("classes", classes.join(","));
   const zones = selectedZones();
@@ -1127,7 +1137,7 @@ function syncFeedCardUrl(card) {
 
 function restoreFiltersFromUrl() {
   const filters = filtersFromUrl();
-  state.camera = filters.camera;
+  state.cameraFilter = filters.cameras;
   state.view = filters.view;
   state.classes = filters.classes;
   state.zones = filters.zones;
@@ -1136,7 +1146,7 @@ function restoreFiltersFromUrl() {
 }
 
 function apiUrl({
-  source = state.camera,
+  source = selectedCameraSource(),
   before = null,
   limit = PAGE_SIZE,
   counts = true,
@@ -1212,13 +1222,21 @@ function makeTag(value, label, count, active) {
 function makeCameraTag(value, label) {
   const button = document.createElement("button");
   button.type = "button";
-  const active = state.camera === value;
+  const active = cameraFilters.active(state.cameraFilter, value);
   button.className = `dw-tag${active ? " active" : ""}`;
   button.setAttribute("aria-pressed", String(active));
   button.textContent = label;
   button.addEventListener("click", () => {
-    if (state.camera === value) return;
-    state.camera = value;
+    const next = cameraFilters.toggle(
+      state.cameraFilter,
+      value,
+      state.sources.map(source => source.id)
+    );
+    if (
+      cameraFilters.serialize(next)
+      === cameraFilters.serialize(state.cameraFilter)
+    ) return;
+    state.cameraFilter = next;
     state.focus = null;
     syncUrl();
     loadInitial();
@@ -1268,9 +1286,9 @@ function makeAreaTag(sourceId, value, label) {
 
 function renderAreaTags() {
   dom.areas.innerHTML = "";
-  const visibleSources = state.camera === "all"
+  const visibleSources = state.cameraFilter == null
     ? state.sources
-    : state.sources.filter(source => source.id === state.camera);
+    : state.sources.filter(source => state.cameraFilter.has(source.id));
   const groups = visibleSources
     .map(source => ({
       source,
@@ -1486,7 +1504,9 @@ function makeCameraSection(camera) {
     const empty = document.createElement("div");
     empty.className = "dw-camera-empty";
     empty.textContent = camera.id === "all"
-      ? "No matching detections across any camera."
+      ? camera.name === "Selected cameras"
+        ? "No matching detections across the selected cameras."
+        : "No matching detections across any camera."
       : camera.record_mode === "live_only"
       ? "This camera is live-only, so it does not create detection thumbnails."
       : state.classes.size || state.zones.size
@@ -1509,7 +1529,7 @@ function renderCameras({ preserveFeedPosition = false } = {}) {
   dom.main.innerHTML = "";
   const cameras = [...state.cameras.values()];
   const visible = cameras.reduce((sum, camera) => sum + camera.events.length, 0);
-  const cameraCount = state.camera === "all" ? state.sources.length : cameras.length;
+  const cameraCount = selectedCameraCount();
   dom.summary.textContent = `${plural(cameraCount, "camera")} · ${plural(visible, "detection")} shown`;
 
   if (!state.sources.length) {
@@ -1562,7 +1582,10 @@ async function loadMore(cameraId, wrap, button) {
   button.disabled = true;
   button.textContent = "Loading…";
   try {
-    const data = await fetchWall({ source: cameraId, before: camera.next_before });
+    const data = await fetchWall({
+      source: cameraId === "all" ? selectedCameraSource() : cameraId,
+      before: camera.next_before,
+    });
     const page = data.cameras?.[0];
     if (!page) throw new Error("Camera not found");
     const section = wrap.closest(".dw-camera");
@@ -1581,9 +1604,7 @@ async function loadMore(cameraId, wrap, button) {
     updateCameraMeta(camera);
     const shown = [...state.cameras.values()]
       .reduce((sum, item) => sum + item.events.length, 0);
-    const cameraCount = state.camera === "all"
-      ? state.sources.length
-      : state.cameras.size;
+    const cameraCount = selectedCameraCount();
     dom.summary.textContent = `${plural(cameraCount, "camera")} · ${plural(shown, "detection")} shown`;
   } catch (error) {
     button.textContent = "Try again";
@@ -1819,9 +1840,7 @@ async function refreshRecent() {
         if (!reconciled) renderCameras({ preserveFeedPosition: true });
         const visible = [...state.cameras.values()]
           .reduce((sum, camera) => sum + camera.events.length, 0);
-        const cameraCount = state.camera === "all"
-          ? state.sources.length
-          : state.cameras.size;
+        const cameraCount = selectedCameraCount();
         dom.summary.textContent =
           `${plural(cameraCount, "camera")} · ${plural(visible, "detection")} shown`;
       } else {
