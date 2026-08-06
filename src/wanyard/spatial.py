@@ -178,6 +178,43 @@ class SpatialStore:
         result.sort(key=lambda scene: scene["name"].casefold())
         return result
 
+    def archive_scene(self, scene_id: str) -> dict:
+        """Remove a scene from the index while retaining its files for recovery."""
+        self._validate_identifier(scene_id, "scene")
+        root = self.root.resolve()
+        scene_dir = self.root / scene_id
+        if scene_dir.is_symlink() or not scene_dir.is_dir():
+            raise FileNotFoundError(scene_dir)
+        resolved_scene = scene_dir.resolve()
+        try:
+            resolved_scene.relative_to(root)
+        except ValueError:
+            raise SpatialStoreError("scene directory escapes spatial root") from None
+
+        manifests = list(scene_dir.glob("*/manifest.json"))
+        if not manifests:
+            raise SpatialStoreError("scene has no valid reconstruction runs")
+        for path in manifests:
+            manifest = self._read_manifest(path)
+            if manifest["scene"]["id"] != scene_id:
+                raise SpatialStoreError(
+                    "manifest location does not match its scene identifier"
+                )
+
+        archive_root = self.root / ".removed"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        archive_id = (
+            f"{scene_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            f"-{uuid.uuid4().hex[:8]}"
+        )
+        destination = archive_root / archive_id
+        os.replace(scene_dir, destination)
+        return {
+            "scene_id": scene_id,
+            "archive_id": archive_id,
+            "recoverable": True,
+        }
+
     def artifact(self, scene_id: str, run_id: str, artifact_name: str) -> tuple[Path, str]:
         for value, label in (
             (scene_id, "scene"), (run_id, "run"), (artifact_name, "artifact")

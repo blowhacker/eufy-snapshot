@@ -47,7 +47,10 @@
     }));
     const warning = run.warnings && run.warnings[0];
     if (warning) document.querySelector('#warning p').textContent = warning;
-    document.getElementById('downloadCloud').href = artifactUrl('point_cloud');
+    const download = document.getElementById('downloadCloud');
+    download.hidden = !run.artifacts.point_cloud;
+    download.href = run.artifacts.point_cloud ? artifactUrl('point_cloud') : '#';
+    document.getElementById('removeSpatialView').hidden = false;
     depthImage.src = artifactUrl('depth_preview');
     fallbackImage.src = artifactUrl('pointcloud_preview');
   }
@@ -420,9 +423,55 @@
     const response = await fetch('/api/spatial/scenes');
     if (!response.ok) throw new Error('Scene index returned ' + response.status);
     state.scenes = (await response.json()).scenes || [];
+    sceneSelect.disabled = !state.scenes.length;
     sceneSelect.replaceChildren(...state.scenes.map(scene => {
       const option = document.createElement('option'); option.value = scene.id; option.textContent = scene.name; return option;
     }));
+  }
+  function showEmptySpatial() {
+    state.scene = null; state.run = null;
+    if (state.viewer) { state.viewer.destroy(); state.viewer = null; }
+    canvas.hidden = true; depthImage.hidden = true; fallbackImage.hidden = true;
+    document.querySelector('.sp-stage-bottom').hidden = true;
+    loading.hidden = false;
+    loading.querySelector('span').hidden = true;
+    loading.querySelector('strong').textContent = 'No spatial views';
+    loadingDetail.textContent = 'Select cameras to discover a shared view';
+    sceneSelect.replaceChildren(new Option('No spatial views', ''));
+    sceneSelect.disabled = true;
+    document.getElementById('sceneName').textContent = 'Start from cameras';
+    document.getElementById('runDescription').textContent = 'Choose camera views and Wanyard will test how they connect.';
+    document.getElementById('pointCount').textContent = '—';
+    document.getElementById('cameraCount').textContent = '—';
+    document.getElementById('scaleType').textContent = '—';
+    document.getElementById('cameraList').replaceChildren();
+    document.getElementById('downloadCloud').hidden = true;
+    document.getElementById('removeSpatialView').hidden = true;
+  }
+  async function removeCurrentScene() {
+    if (!state.scene) return;
+    const scene = state.scene;
+    if (!confirm(`Remove ${scene.name} from Spatial? Its reconstruction files will be retained for recovery.`)) return;
+    const button = document.getElementById('removeSpatialView');
+    button.disabled = true; button.textContent = 'Removing…';
+    try {
+      const response = await fetch('/api/spatial/scenes/' + encodeURIComponent(scene.id), { method: 'DELETE' });
+      if (!response.ok) throw await responseError(response, 'Unable to remove spatial view');
+      await refreshScenes();
+      if (state.scenes.length) {
+        sceneSelect.disabled = false;
+        sceneSelect.value = state.scenes[0].id;
+        await openScene(state.scenes[0]);
+      } else {
+        showEmptySpatial();
+        await openCreateModal();
+      }
+    } catch (error) {
+      console.error(error);
+      alert(error.message);
+    } finally {
+      button.disabled = false; button.textContent = 'Remove spatial view';
+    }
   }
   async function createScene() {
     if (!state.feasibility || !state.feasibility.mergeable) return;
@@ -458,12 +507,16 @@
   document.querySelectorAll('[data-close-spatial-modal]').forEach(button => button.addEventListener('click', closeCreateModal));
   checkButton.addEventListener('click', checkFeasibility);
   createButton.addEventListener('click', createScene);
+  document.getElementById('removeSpatialView').addEventListener('click', removeCurrentScene);
   document.addEventListener('keydown', event => { if (event.key === 'Escape' && !createModal.hidden) closeCreateModal(); });
 
   async function init() {
     try {
       await refreshScenes();
-      if (!state.scenes.length) return showError('No reconstruction artifacts have been published yet.');
+      if (!state.scenes.length) {
+        showEmptySpatial();
+        return openCreateModal();
+      }
       sceneSelect.replaceChildren(...state.scenes.map(scene => {
         const option = document.createElement('option');
         option.value = scene.id; option.textContent = scene.name;

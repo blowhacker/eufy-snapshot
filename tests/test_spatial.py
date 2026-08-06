@@ -117,6 +117,24 @@ class SpatialStoreTests(unittest.TestCase):
 
             self.assertEqual(len(SpatialStore(root).list_scenes()), 1)
 
+    def test_archive_scene_removes_it_from_listing_but_retains_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._run(root, scene_id="front-garden")
+            store = SpatialStore(root)
+
+            result = store.archive_scene("front-garden")
+
+            self.assertEqual(store.list_scenes(), [])
+            self.assertTrue(result["recoverable"])
+            archived = root / ".removed" / result["archive_id"]
+            self.assertTrue((archived / "preview" / "cloud.ply").is_file())
+
+    def test_archive_scene_rejects_unknown_scene(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(FileNotFoundError):
+                SpatialStore(directory).archive_scene("missing")
+
 
 if __name__ == "__main__":
     unittest.main()

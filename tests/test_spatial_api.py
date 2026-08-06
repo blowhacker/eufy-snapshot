@@ -22,8 +22,8 @@ from wanyard.video import VideoSegmentDB
 from wanyard.web import make_app
 
 
-def _request(path: str, payload: dict) -> Request:
-    body = json.dumps(payload).encode()
+def _request(path: str, payload: dict | None = None, *, method="POST", path_params=None) -> Request:
+    body = json.dumps(payload).encode() if payload is not None else b""
     sent = False
 
     async def receive():
@@ -34,10 +34,11 @@ def _request(path: str, payload: dict) -> Request:
         return {"type": "http.request", "body": body, "more_body": False}
 
     return Request({
-        "type": "http", "http_version": "1.1", "method": "POST",
+        "type": "http", "http_version": "1.1", "method": method,
         "scheme": "http", "path": path, "raw_path": path.encode(),
         "query_string": b"", "headers": [(b"content-type", b"application/json")],
         "client": ("test", 1), "server": ("test", 80),
+        "path_params": path_params or {},
     }, receive)
 
 
@@ -145,6 +146,42 @@ class SpatialApiTests(unittest.TestCase):
                 {"camera_ids": ["front", "missing"]},
             )))
             self.assertEqual(response.status_code, 404)
+
+    def test_remove_scene_archives_it_from_the_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(directory)
+            check_route = self._route(app, "/api/spatial/feasibility")
+            scenes_route = self._route(app, "/api/spatial/scenes")
+            remove_route = self._route(app, "/api/spatial/scenes/{scene_id}")
+            report = {
+                "camera_ids": ["front", "garden"], "mergeable": True,
+                "status": "mergeable", "pairs": [],
+                "components": [["front", "garden"]], "checked_at": 100.0,
+            }
+            with mock.patch("wanyard.web.inspect_camera_set", return_value=report):
+                checked = asyncio.run(check_route.endpoint(_request(
+                    "/api/spatial/feasibility",
+                    {"camera_ids": ["front", "garden"]},
+                )))
+            check_id = json.loads(checked.body)["feasibility"]["id"]
+            created = asyncio.run(scenes_route.endpoint(_request(
+                "/api/spatial/scenes",
+                {"name": "Temporary", "camera_ids": ["front", "garden"],
+                 "feasibility_id": check_id},
+            )))
+            scene_id = json.loads(created.body)["scene_id"]
+
+            removed = asyncio.run(remove_route.endpoint(_request(
+                f"/api/spatial/scenes/{scene_id}", None, method="DELETE",
+                path_params={"scene_id": scene_id},
+            )))
+            listed = asyncio.run(scenes_route.endpoint(_request(
+                "/api/spatial/scenes", None, method="GET"
+            )))
+
+            self.assertEqual(removed.status_code, 200)
+            self.assertTrue(json.loads(removed.body)["recoverable"])
+            self.assertEqual(json.loads(listed.body)["scenes"], [])
 
 
 if __name__ == "__main__":

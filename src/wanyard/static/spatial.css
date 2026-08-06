@@ -278,6 +278,19 @@
 }
 .sp-download:hover { color: var(--txt); border-color: #3a404d; }
 .sp-download span { color: var(--txt-3); font: 10px var(--font-mono); }
+.sp-remove-view {
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  color: var(--txt-3);
+  border: 1px solid transparent;
+  border-radius: var(--r);
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+  text-align: left;
+}
+.sp-remove-view:hover { color: var(--red); border-color: rgba(226, 92, 76, .24); }
 
 .sp-create-modal { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 18px; }
 .sp-create-backdrop { position: absolute; inset: 0; background: rgba(2, 4, 7, .7); backdrop-filter: blur(5px); }

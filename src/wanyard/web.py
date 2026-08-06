@@ -2876,6 +2876,22 @@ def make_app(
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
+    async def api_spatial_scene(request: Request) -> Response:
+        scene_id = request.path_params.get("scene_id", "")
+        try:
+            result = await asyncio.to_thread(
+                spatial_store.archive_scene, scene_id
+            )
+        except FileNotFoundError:
+            return JSONResponse({"error": "spatial view not found"}, status_code=404)
+        except SpatialStoreError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({
+            "ok": True,
+            **result,
+            "message": "Spatial view removed; artifacts retained for recovery.",
+        })
+
     routes = [
         Route("/video/webrtc/{source_path}/whep", serve_webrtc_whep, methods=["POST"]),
         # Landing = the live wall (god view). A specific ?source (and not the
@@ -2892,6 +2908,7 @@ def make_app(
         Route("/settings",                  lambda r: FileResponse(static_dir / "settings.html", headers={"Cache-Control": "no-cache"})),
         Route("/api/health",                api_health),
         Route("/api/spatial/scenes",        api_spatial_scenes, methods=["GET", "POST"]),
+        Route("/api/spatial/scenes/{scene_id}", api_spatial_scene, methods=["DELETE"]),
         Route("/api/spatial/feasibility",   api_spatial_feasibility, methods=["POST"]),
         Route("/api/spatial/{scene_id}/{run_id}/{artifact_name}", api_spatial_artifact),
         Route("/api/thumb",                 api_thumb),
