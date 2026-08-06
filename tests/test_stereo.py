@@ -66,6 +66,28 @@ class StereoInspectTests(unittest.TestCase):
             188.0,
         )
 
+    def test_latest_common_timestamp_stays_before_wall_clock_close(self) -> None:
+        db = mock.Mock()
+        db.segment_bounds.side_effect = [
+            {"from": 100.0, "to": 200.0},
+            {"from": 100.0, "to": 200.0},
+        ]
+        db.list_segments.side_effect = [
+            [{
+                "start_ts": 100.0, "end_ts": 190.0,
+                "media_epoch": 105.0, "duration_sec": 90.0,
+            }],
+            [{
+                "start_ts": 100.0, "end_ts": 192.0,
+                "media_epoch": 104.0, "duration_sec": 92.0,
+            }],
+        ]
+
+        self.assertEqual(
+            stereo.latest_common_timestamp(db, "front", "garden"),
+            188.0,
+        )
+
     def test_latest_common_timestamp_rejects_disjoint_sources(self) -> None:
         db = mock.Mock()
         db.segment_bounds.side_effect = [

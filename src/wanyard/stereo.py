@@ -161,7 +161,15 @@ def _closed_segment_coverage(row: dict) -> tuple[float, float] | None:
     duration = row.get("duration_sec")
     if duration is None:
         duration = float(row["end_ts"]) - float(row["start_ts"])
-    end = start + max(0.0, float(duration))
+    # ``duration_sec`` currently follows the recorder's wall-clock lifetime.
+    # A stream may take a few seconds to yield its first timestamped frame, so
+    # media_epoch + duration can extend beyond the instant the file closed.
+    # Staying inside both bounds avoids selecting that synthetic tail, where
+    # the resolver quite correctly has no decodable frame.
+    end = min(
+        float(row["end_ts"]),
+        start + max(0.0, float(duration)),
+    )
     return (start, end) if end > start else None
 
 

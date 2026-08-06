@@ -343,14 +343,24 @@
     const mergeable = result.mergeable === true;
     const edges = result.edges || result.pair_edges || result.pairs || [];
     const components = result.components || result.connected_components || [];
+    const unavailable = !mergeable && edges.length > 0 && edges.every(edge => edge.status === 'error');
     feasibilityBox.hidden = false;
     feasibilityBox.className = 'sp-feasibility ' + (mergeable ? 'mergeable' : 'not-mergeable');
     feasibilityBox.replaceChildren();
     const title = document.createElement('strong');
-    title.textContent = mergeable ? 'These cameras can form one spatial view.' : 'These cameras do not yet form one connected view.';
+    title.textContent = mergeable
+      ? 'These cameras can form one spatial view.'
+      : unavailable
+        ? 'Camera frames are not ready yet.'
+        : 'These cameras do not yet form one connected view.';
     feasibilityBox.append(title);
     const detail = document.createElement('p');
-    detail.textContent = result.message || (mergeable ? 'Overlap found across the selected camera set.' : 'Choose cameras with overlapping coverage, then check again.');
+    const firstReason = edges.flatMap(edge => Array.isArray(edge.reasons) ? edge.reasons : []).find(Boolean);
+    detail.textContent = result.message || (mergeable
+      ? 'Overlap found across the selected camera set.'
+      : unavailable
+        ? (firstReason || 'Recorded frames are still becoming available. Try the check again shortly.')
+        : 'Choose cameras with overlapping coverage, then check again.');
     feasibilityBox.append(detail);
     const rows = [];
     edges.forEach(edge => {
@@ -410,7 +420,13 @@
       const payload = await response.json();
       state.feasibility = payload.feasibility || payload;
       showFeasibility(state.feasibility);
-      selectHint.textContent = state.feasibility.mergeable ? 'Ready to create a spatial view.' : 'Select a connected camera set and check again.';
+      const pairs = state.feasibility.pairs || [];
+      const unavailable = pairs.length > 0 && pairs.every(pair => pair.status === 'error');
+      selectHint.textContent = state.feasibility.mergeable
+        ? 'Ready to create a spatial view.'
+        : unavailable
+          ? 'Frames were unavailable. Check again shortly.'
+          : 'Select a connected camera set and check again.';
     } catch (error) {
       console.error(error);
       selectHint.textContent = 'Could not check overlap: ' + error.message;
