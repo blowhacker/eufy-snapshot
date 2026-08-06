@@ -463,6 +463,25 @@
     </main>
   </div>
 
-  <script src="/settings.js?v=ntfy-1"></script>
+  <dialog id="removeCameraDialog" class="s-remove-dialog" aria-labelledby="removeCameraTitle">
+    <form method="dialog">
+      <div class="s-remove-kicker">Remove camera</div>
+      <h2 id="removeCameraTitle">Remove <span id="removeCameraName"></span>?</h2>
+      <p>The camera will stop recording and disappear from Wanyard. What should happen to its existing footage?</p>
+      <div class="s-remove-options">
+        <button class="s-remove-option" type="submit" value="keep">
+          <strong>Keep recordings</strong>
+          <span>Existing footage will expire under the normal retention policy.</span>
+        </button>
+        <button class="s-remove-option danger" type="submit" value="purge">
+          <strong>Delete recordings now</strong>
+          <span>Permanently delete this camera's footage, detections, and notifications.</span>
+        </button>
+      </div>
+      <button class="s-remove-cancel" type="submit" value="cancel">Cancel</button>
+    </form>
+  </dialog>
+
+  <script src="/settings.js?v=camera-delete-1"></script>
 </body>
 </html>

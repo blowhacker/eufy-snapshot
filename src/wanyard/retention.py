@@ -229,3 +229,68 @@ def delete_before(
         segments,
         {sid: cutoff for sid in notification_sources},
     )
+
+
+def delete_source_recordings(
+    video_db,
+    video_dir: Path,
+    source_id: str,
+) -> dict[str, int]:
+    """Permanently remove every recording artifact owned by one source.
+
+    The caller must stop that source's recorder first. Unlike age-based
+    retention, this deliberately includes an open segment row so a camera
+    removal cannot strand its final clip.
+    """
+    source_id = str(source_id or "")
+    if (
+        not source_id
+        or source_id in {".", ".."}
+        or Path(source_id).name != source_id
+    ):
+        raise ValueError("invalid source id")
+
+    video_dir = Path(video_dir)
+    source_dirs = [video_dir / source_id, video_dir / "live" / source_id]
+    resolved_root = video_dir.resolve()
+    for directory in source_dirs:
+        try:
+            directory.resolve().relative_to(resolved_root)
+        except ValueError:
+            raise ValueError("source directory escapes video root") from None
+
+    bytes_on_disk = 0
+    for directory in source_dirs:
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            try:
+                if path.is_file():
+                    bytes_on_disk += path.stat().st_size
+            except OSError:
+                pass
+
+    with video_db._connect() as conn:
+        segments = [dict(row) for row in conn.execute(
+            "SELECT id, path, end_ts, source_id FROM segments"
+            " WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()]
+
+    result = delete_segments(
+        video_db,
+        video_dir,
+        segments,
+        {source_id: float("inf")},
+    )
+    for directory in source_dirs:
+        if directory.is_dir():
+            shutil.rmtree(directory, ignore_errors=True)
+
+    with video_db._connect() as conn:
+        conn.execute(
+            "DELETE FROM app_settings WHERE key = ?",
+            (cleanup_days_key(source_id),),
+        )
+    result["freed_bytes"] = max(result["freed_bytes"], bytes_on_disk)
+    return result

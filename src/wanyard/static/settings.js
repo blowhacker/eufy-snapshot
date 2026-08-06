@@ -366,6 +366,16 @@ window.addEventListener('resize', () => {
 });
 
 // ── Cameras ───────────────────────────────────────────
+function chooseCameraRemoval(source) {
+  const dialog = document.getElementById('removeCameraDialog');
+  document.getElementById('removeCameraName').textContent = source.name || source.id;
+  dialog.returnValue = 'cancel';
+  dialog.showModal();
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue), {once:true});
+  });
+}
+
 async function loadCameras() {
   const d = await fetch('/api/sources',{cache:'no-store'}).then(r=>r.json()).catch(()=>({sources:[]}));
   _sources = d.sources || [];
@@ -400,14 +410,26 @@ async function loadCameras() {
 
   list.querySelectorAll('[data-del]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      if (!confirm(
-        `Remove ${btn.dataset.del}? Camera configuration and media health history will be deleted. Recorded footage is kept.`
-      )) return;
-      const response = await fetch('/api/sources/'+btn.dataset.del,{method:'DELETE'});
-      if (!response.ok) return;
+      const source = _sources.find(item => item.id === btn.dataset.del);
+      if (!source) return;
+      const choice = await chooseCameraRemoval(source);
+      if (choice !== 'keep' && choice !== 'purge') return;
+      btn.disabled = true;
+      const response = await fetch('/api/sources/'+encodeURIComponent(source.id), {
+        method:'DELETE',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({delete_recordings: choice === 'purge'}),
+      });
+      const result = await response.json().catch(()=>({}));
+      if (!response.ok) {
+        alert(result.error || `Unable to remove camera (${response.status})`);
+        if (!result.camera_removed) btn.disabled = false;
+        if (!result.camera_removed) return;
+      }
       await loadCameras();
       loadNotificationRules();
       loadMediaHealth();
+      loadStatus();
     });
   });
 

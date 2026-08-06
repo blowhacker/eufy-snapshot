@@ -42,10 +42,7 @@ class CaptureWorker:
                       and not self._live_only(s.id)}
 
         for sid in set(self.video_workers) - set(db_sources):
-            LOG.info("source removed, stopping: %s", sid)
-            self.video_workers[sid].stop()
-            self._threads.pop(sid, None)
-            self.video_workers.pop(sid)
+            self.remove_source(sid)
 
         for sid, source in db_sources.items():
             if sid not in self.video_workers:
@@ -95,6 +92,17 @@ class CaptureWorker:
             }
             for sid, vw in workers
         }
+
+    def remove_source(self, source_id: str) -> None:
+        """Stop and join one recorder immediately after its source is removed."""
+        worker = self.video_workers.pop(source_id, None)
+        thread = self._threads.pop(source_id, None)
+        if worker is None:
+            return
+        LOG.info("source removed, stopping: %s", source_id)
+        worker.stop()
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=15)
 
     def stop(self) -> None:
         self._stop.set()

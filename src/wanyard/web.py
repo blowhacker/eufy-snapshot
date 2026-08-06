@@ -1191,14 +1191,53 @@ def make_app(
             return JSONResponse({"error": "db_path not configured"}, status_code=501)
         if source_id not in source_db.ids():
             return JSONResponse({"error": "source not found"}, status_code=404)
+        try:
+            raw_body = await request.body()
+            body = json.loads(raw_body) if raw_body else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"}, status_code=400
+            )
+        delete_recordings = body.get("delete_recordings", False)
+        if not isinstance(delete_recordings, bool):
+            return JSONResponse(
+                {"error": "delete_recordings must be a boolean"}, status_code=400
+            )
         if health_store is not None:
             await asyncio.to_thread(health_store.delete_source, source_id)
         if not source_db.delete(source_id):
             return JSONResponse({"error": "source not found"}, status_code=404)
+        source_db.delete_setting(record_mode_key(source_id))
         if health_collector is not None:
             health_collector.forget_source(source_id)
+        if capture_worker is not None:
+            await asyncio.to_thread(capture_worker.remove_source, source_id)
         await asyncio.to_thread(native_hls.unregister_source_runtime, source_id)
-        return JSONResponse({"ok": True})
+        cleanup = None
+        if delete_recordings:
+            if video_db is None or video_dir is None:
+                return JSONResponse({
+                    "error": "camera was removed but video storage is unavailable",
+                    "camera_removed": True,
+                }, status_code=500)
+            from .retention import delete_source_recordings
+            try:
+                cleanup = await asyncio.to_thread(
+                    delete_source_recordings, video_db, video_dir, source_id
+                )
+            except Exception:
+                LOG.exception("failed to purge recordings for removed source %s", source_id)
+                return JSONResponse({
+                    "error": "camera was removed but its recordings could not be deleted",
+                    "camera_removed": True,
+                }, status_code=500)
+        return JSONResponse({
+            "ok": True,
+            "recordings": "deleted" if delete_recordings else "retained",
+            "cleanup": cleanup,
+        })
 
     async def api_thumb(request: Request) -> Response:
         """Extract a single frame from a video file at timestamp t."""

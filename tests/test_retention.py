@@ -385,6 +385,44 @@ class CleanupLoopTests(unittest.TestCase):
             self.assertFalse(garden_old.exists())
             self.assertEqual(set(self._notif_ages(video_db)), {"front"})
 
+    def test_delete_source_recordings_purges_only_that_camera(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            _, front = self._seg(video_db, video_dir, "front", 1, "front")
+            _, desk = self._seg(video_db, video_dir, "desk", 1, "desk")
+            self._notif(video_db, "front", 1)
+            self._notif(video_db, "desk", 1)
+            video_db.set_setting(retention.cleanup_days_key("desk"), 3)
+            live_dir = video_dir / "live" / "desk"
+            live_dir.mkdir(parents=True)
+            (live_dir / "index.m3u8").write_bytes(b"live")
+
+            result = retention.delete_source_recordings(
+                video_db, video_dir, "desk"
+            )
+
+            self.assertEqual(result["deleted_segments"], 1)
+            self.assertTrue(front.exists())
+            self.assertFalse(desk.exists())
+            self.assertFalse((video_dir / "desk").exists())
+            self.assertFalse(live_dir.exists())
+            self.assertEqual(set(self._notif_ages(video_db)), {"front"})
+            self.assertIsNone(
+                video_db.get_setting(retention.cleanup_days_key("desk"))
+            )
+
+    def test_delete_source_recordings_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            with self.assertRaises(ValueError):
+                retention.delete_source_recordings(
+                    video_db, video_dir, "../elsewhere"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
