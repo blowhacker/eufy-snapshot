@@ -237,10 +237,14 @@ def build_vggt_cloud(
             if torch.cuda.get_device_capability()[0] >= 8
             else torch.float16
         )
-        # Cast while transferring rather than first materialising the 1B
-        # parameters as float32 on the GPU. This roughly halves the model's
-        # resident VRAM and leaves room for the detector to keep running.
-        model = model.eval().to(device="cuda", dtype=dtype)
+        # Keep the large transformer backbone compact, while preserving float32
+        # in the camera/depth heads: upstream intentionally disables autocast
+        # for those heads. Preparing dtypes on CPU also avoids ever
+        # materialising all 1B parameters as float32 on the GPU.
+        model = model.eval().to(dtype=dtype)
+        model.camera_head.float()
+        model.depth_head.float()
+        model = model.to("cuda")
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
             predictions = model(images)
         extrinsic, intrinsic = pose_encoding_to_extri_intri(
