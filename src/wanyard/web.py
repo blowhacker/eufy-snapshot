@@ -405,6 +405,7 @@ def _detection_wall_all(
     polygons_by_source: dict[str, list[list[dict]]] | None = None,
     live_windows_by_source: dict[str, dict] | None = None,
     exclusions_by_source: dict[str, list[list[dict]]] | None = None,
+    name: str = "All cameras",
 ) -> dict:
     """Interleave source-local pages into one newest-first camera feed."""
     source_pages = [
@@ -441,7 +442,7 @@ def _detection_wall_all(
     events = events[:limit]
     return {
         "id": "all",
-        "name": "All cameras",
+        "name": name,
         "record_mode": RECORD_MODE_CONTINUOUS,
         "events": events,
         "next_before": (
@@ -928,14 +929,37 @@ def make_app(
             })
 
         all_sources = _sources_list(config, source_db)
-        source_id = request.query_params.get("source") or "all"
+        source_query = request.query_params.get("source") or "all"
         selected_sources = all_sources
-        if source_id != "all":
+        if source_query != "all":
+            requested_source_ids = list(dict.fromkeys(
+                source_id.strip()
+                for source_id in source_query.split(",")
+                if source_id.strip()
+            ))
+            if (
+                not requested_source_ids
+                or len(requested_source_ids) > 64
+                or any(
+                    len(source_id) > 120
+                    for source_id in requested_source_ids
+                )
+            ):
+                return JSONResponse({"error": "invalid sources"}, status_code=400)
+            requested_set = set(requested_source_ids)
             selected_sources = [
-                source for source in all_sources if source["id"] == source_id
+                source for source in all_sources if source["id"] in requested_set
             ]
-            if not selected_sources:
-                return JSONResponse({"error": "source not found"}, status_code=404)
+            found_ids = {source["id"] for source in selected_sources}
+            missing_ids = [
+                source_id for source_id in requested_source_ids
+                if source_id not in found_ids
+            ]
+            if missing_ids:
+                return JSONResponse({
+                    "error": f"source not found: {missing_ids[0]}"
+                }, status_code=404)
+        aggregate_sources = source_query == "all" or len(selected_sources) > 1
 
         raw_classes = request.query_params.get("classes") or ""
         classes = list(dict.fromkeys(
@@ -1054,13 +1078,29 @@ def make_app(
                             for cls, count in source_counts.items():
                                 counts[cls] = counts.get(cls, 0) + count
                 else:
-                    counts = video_db.detection_class_counts(
-                        None if source_id == "all" else source_id,
-                        None,
-                        True,
-                        None,
-                        available_classes,
-                    )
+                    if source_query == "all" or len(selected_sources) <= 1:
+                        counts = video_db.detection_class_counts(
+                            (
+                                None
+                                if source_query == "all"
+                                else selected_sources[0]["id"]
+                            ),
+                            None,
+                            True,
+                            None,
+                            available_classes,
+                        )
+                    else:
+                        for source in selected_sources:
+                            source_counts = video_db.detection_class_counts(
+                                source["id"],
+                                None,
+                                True,
+                                None,
+                                available_classes,
+                            )
+                            for cls, count in source_counts.items():
+                                counts[cls] = counts.get(cls, 0) + count
                     counts_complete = True
                     counted_classes = list(available_classes)
             cameras = []
@@ -1075,8 +1115,13 @@ def make_app(
                         polygons_by_source,
                         live_windows_by_source,
                         exclusions_by_source,
+                        name=(
+                            "All cameras"
+                            if source_query == "all"
+                            else "Selected cameras"
+                        ),
                     )]
-                    if source_id == "all"
+                    if aggregate_sources
                     else [_detection_wall_camera(
                         video_db,
                         selected_sources[0],
@@ -1124,6 +1169,9 @@ def make_app(
                         ),
                     }
                     for source in all_sources
+                ],
+                "selected_source_ids": [
+                    source["id"] for source in selected_sources
                 ],
                 "generated_at": time.time(),
             }
