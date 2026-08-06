@@ -73,7 +73,7 @@ class SpatialStore:
                 "run": {
                     "id": run_id,
                     "created_at": created_at,
-                    "kind": "neural_reconstruction",
+                    "kind": "opencv_projective",
                     "metric": False,
                     "status": "queued",
                 },
@@ -91,6 +91,7 @@ class SpatialStore:
         run_id: str,
         *,
         status: str,
+        kind: str | None = None,
         artifacts: dict | None = None,
         stats: dict | None = None,
         warnings: list | None = None,
@@ -101,6 +102,8 @@ class SpatialStore:
         self._validate_identifier(run_id, "run")
         if status not in {"queued", "running", "ready", "failed"}:
             raise SpatialStoreError("invalid run status")
+        if kind is not None and (not isinstance(kind, str) or not _IDENTIFIER.fullmatch(kind)):
+            raise SpatialStoreError("invalid run kind")
         if artifacts is not None and not isinstance(artifacts, dict):
             raise SpatialStoreError("artifacts must be an object")
         if stats is not None and not isinstance(stats, dict):
@@ -116,6 +119,8 @@ class SpatialStore:
         if manifest["scene"]["id"] != scene_id or manifest["run"]["id"] != run_id:
             raise SpatialStoreError("manifest location does not match its identifiers")
         manifest["run"]["status"] = status
+        if kind is not None:
+            manifest["run"]["kind"] = kind
         manifest["run"]["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         if artifacts is not None:
             manifest["artifacts"] = artifacts
@@ -130,6 +135,38 @@ class SpatialStore:
         self._read_manifest_data(manifest)
         self._write_manifest(manifest_path, manifest)
         return manifest
+
+    def pending_runs(self) -> list[dict]:
+        """Return queued work, plus interrupted running work, oldest first."""
+        pending = []
+        if not self.root.is_dir():
+            return pending
+        for manifest_path in sorted(self.root.glob("*/*/manifest.json")):
+            try:
+                manifest = self._read_manifest(manifest_path)
+            except (OSError, json.JSONDecodeError, SpatialStoreError):
+                continue
+            if manifest["run"].get("status") not in {"queued", "running"}:
+                continue
+            pending.append({
+                "scene_id": manifest["scene"]["id"],
+                "run_id": manifest["run"]["id"],
+                "camera_ids": list(manifest["scene"]["camera_ids"]),
+                "created_at": str(manifest["run"].get("created_at", "")),
+                "feasibility": manifest.get("feasibility", {}),
+            })
+        pending.sort(key=lambda job: (job["created_at"], job["scene_id"], job["run_id"]))
+        return pending
+
+    def run_directory(self, scene_id: str, run_id: str) -> Path:
+        """Resolve a validated run directory for trusted worker output."""
+        self._validate_identifier(scene_id, "scene")
+        self._validate_identifier(run_id, "run")
+        run_dir = self.root / scene_id / run_id
+        manifest = self._read_manifest(run_dir / "manifest.json")
+        if manifest["scene"]["id"] != scene_id or manifest["run"]["id"] != run_id:
+            raise SpatialStoreError("manifest location does not match its identifiers")
+        return run_dir
 
     def fail_run(self, scene_id: str, run_id: str, error: str) -> dict:
         return self.update_run(scene_id, run_id, status="failed", error=error)
@@ -167,6 +204,7 @@ class SpatialStore:
                 "artifacts": manifest["artifacts"],
                 "stats": manifest.get("stats", {}),
                 "warnings": manifest.get("warnings", []),
+                **({"error": manifest["error"]} if manifest.get("error") else {}),
             })
 
         result = list(scenes.values())

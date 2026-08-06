@@ -7,7 +7,7 @@
   const loading = document.getElementById('loading');
   const loadingDetail = document.getElementById('loadingDetail');
   const sceneSelect = document.getElementById('sceneSelect');
-  const state = { scenes: [], scene: null, run: null, viewer: null, sources: [], feasibility: null, previousFocus: null };
+  const state = { scenes: [], scene: null, run: null, viewer: null, sources: [], feasibility: null, previousFocus: null, runPoll: null };
 
   function artifactUrl(name) {
     return ['/api/spatial', state.scene.id, state.run.id, name]
@@ -56,6 +56,7 @@
   }
 
   async function openScene(scene) {
+    if (state.runPoll) { clearTimeout(state.runPoll); state.runPoll = null; }
     state.scene = scene;
     state.run = scene.runs[0];
     if (!state.run) return showError('This scene has no reconstruction runs.');
@@ -68,9 +69,30 @@
       loading.hidden = false;
       loading.querySelector('span').hidden = true;
       loading.querySelector('strong').textContent = state.run.status === 'failed'
-        ? 'Reconstruction failed' : 'Reconstruction queued';
-      loadingDetail.textContent = state.run.error || 'Waiting for the reconstruction worker';
+        ? 'Reconstruction failed'
+        : state.run.status === 'running'
+          ? 'Building spatial view'
+          : 'Reconstruction queued';
+      loadingDetail.textContent = state.run.error || (state.run.status === 'running'
+        ? 'Matching and triangulating the shared camera view'
+        : 'Waiting for the reconstruction worker');
       document.querySelector('.sp-stage-bottom').hidden = true;
+      if (state.run.status === 'queued' || state.run.status === 'running') {
+        const sceneId = scene.id;
+        state.runPoll = setTimeout(async () => {
+          state.runPoll = null;
+          try {
+            await refreshScenes();
+            const updated = state.scenes.find(item => item.id === sceneId);
+            if (updated && state.scene && state.scene.id === sceneId) {
+              sceneSelect.value = sceneId;
+              await openScene(updated);
+            }
+          } catch (error) {
+            console.error(error);
+          }
+        }, 2000);
+      }
       return;
     }
     document.querySelector('.sp-stage-bottom').hidden = false;
@@ -445,6 +467,7 @@
     }));
   }
   function showEmptySpatial() {
+    if (state.runPoll) { clearTimeout(state.runPoll); state.runPoll = null; }
     state.scene = null; state.run = null;
     if (state.viewer) { state.viewer.destroy(); state.viewer = null; }
     canvas.hidden = true; depthImage.hidden = true; fallbackImage.hidden = true;

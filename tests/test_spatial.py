@@ -81,6 +81,25 @@ class SpatialStoreTests(unittest.TestCase):
             self.assertTrue((root / scene_id / run_id / "manifest.json").is_file())
             self.assertFalse((root.parent / "Garden").exists())
 
+    def test_pending_runs_include_interrupted_work_oldest_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpatialStore(directory)
+            first = store.create_scene("First", ["front", "garden"])
+            second = store.create_scene("Second", ["front", "garden"])
+            store.update_run(
+                first["scene"]["id"], first["run"]["id"],
+                status="running", kind="opencv_projective",
+            )
+
+            jobs = store.pending_runs()
+
+            self.assertEqual(len(jobs), 2)
+            self.assertEqual(jobs[0]["scene_id"], first["scene"]["id"])
+            self.assertEqual(jobs[1]["scene_id"], second["scene"]["id"])
+            self.assertTrue(
+                store.run_directory(jobs[0]["scene_id"], jobs[0]["run_id"]).is_dir()
+            )
+
     def test_create_scene_rejects_unsafe_camera_identifiers(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(SpatialStoreError):

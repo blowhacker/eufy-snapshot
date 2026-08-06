@@ -55,6 +55,7 @@ from .spatial_feasibility import (
     SpatialFeasibilityError,
     inspect_camera_set,
 )
+from .spatial_reconstruction import process_next_run
 
 LOG = logging.getLogger(__name__)
 
@@ -821,12 +822,26 @@ def make_app(
                 LOG.exception("media health sample failed")
             await asyncio.sleep(interval)
 
+    async def _spatial_reconstruction_loop(interval: float):
+        while True:
+            worked = False
+            try:
+                worked = await asyncio.to_thread(
+                    process_next_run, spatial_store, video_db, Path(video_dir)
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("spatial reconstruction failed")
+            await asyncio.sleep(0 if worked else interval)
+
     @asynccontextmanager
     async def lifespan(app: Starlette):
         if capture_worker:
             capture_worker.start()
         notify_task = None
         health_task = None
+        spatial_task = None
         if video_db is not None:
             try:
                 interval = float(os.environ.get("NOTIFICATION_POLL_INTERVAL", "5"))
@@ -844,10 +859,20 @@ def make_app(
             health_task = asyncio.create_task(
                 _media_health_loop(max(5.0, health_interval))
             )
+        if video_db is not None and video_dir is not None:
+            try:
+                spatial_interval = float(
+                    os.environ.get("WANYARD_SPATIAL_POLL_INTERVAL", "1")
+                )
+            except ValueError:
+                spatial_interval = 1.0
+            spatial_task = asyncio.create_task(
+                _spatial_reconstruction_loop(max(0.25, spatial_interval))
+            )
         try:
             yield
         finally:
-            for task in (notify_task, health_task):
+            for task in (notify_task, health_task, spatial_task):
                 if task is None:
                     continue
                 task.cancel()
