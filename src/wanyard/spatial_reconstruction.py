@@ -10,6 +10,7 @@ without changing the queue, manifest, artifact, or browser-viewer contracts.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import fcntl
 import gc
 import json
 import math
@@ -79,6 +80,29 @@ def process_next_run(store: SpatialStore, video_db, video_dir: Path) -> bool:
 
 
 def reconstruct_run(
+    store: SpatialStore,
+    video_db,
+    video_dir: Path,
+    scene_id: str,
+    run_id: str,
+    camera_ids: list[str],
+    feasibility: dict | None = None,
+) -> dict:
+    """Build one run while holding an inter-process ownership lock."""
+    lock_path = store.run_directory(scene_id, run_id) / ".reconstruction.lock"
+    with lock_path.open("a+b") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SpatialReconstructionError(
+                f"spatial run {run_id} is already being reconstructed"
+            ) from exc
+        return _reconstruct_run_locked(
+            store, video_db, video_dir, scene_id, run_id, camera_ids, feasibility
+        )
+
+
+def _reconstruct_run_locked(
     store: SpatialStore,
     video_db,
     video_dir: Path,
@@ -208,12 +232,15 @@ def build_vggt_cloud(
         state = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state, strict=False)
         del state
-        model = model.eval().to("cuda")
         dtype = (
             torch.bfloat16
             if torch.cuda.get_device_capability()[0] >= 8
             else torch.float16
         )
+        # Cast while transferring rather than first materialising the 1B
+        # parameters as float32 on the GPU. This roughly halves the model's
+        # resident VRAM and leaves room for the detector to keep running.
+        model = model.eval().to(device="cuda", dtype=dtype)
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
             predictions = model(images)
         extrinsic, intrinsic = pose_encoding_to_extri_intri(
