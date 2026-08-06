@@ -171,8 +171,8 @@
     const scale = Math.max(...low.map((value, axis) => high[axis] - value)) || 1;
     for (let index = 0; index < positions.length; index += 3) {
       positions[index] = (positions[index] - center[0]) / scale * 2;
-      positions[index + 1] = -(positions[index + 1] - center[1]) / scale * 2;
-      positions[index + 2] = -(positions[index + 2] - center[2]) / scale * 2;
+      positions[index + 1] = (positions[index + 1] - center[1]) / scale * 2;
+      positions[index + 2] = (positions[index + 2] - center[2]) / scale * 2;
     }
     const faceValues = [];
     let faceOffset = count * stride;
@@ -281,7 +281,7 @@
       }
       if (indexBuffer) indexCount = cloud.indices.length;
     }
-    const view = { yaw: -.35, pitch: .12, distance: 3.0, pointSize: 2.25, orbiting: true };
+    const view = { yaw: -.35, pitch: .12, distance: 3.0, pointSize: 2.25, orbiting: false };
     let pointer = null;
     let animation;
     let previousTime = performance.now();
