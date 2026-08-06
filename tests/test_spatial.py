@@ -48,6 +48,46 @@ class SpatialStoreTests(unittest.TestCase):
             self.assertEqual(len(scenes[0]["camera_ids"]), 243)
             self.assertEqual(scenes[0]["runs"][0]["stats"]["points"], 120000)
 
+    def test_create_scene_queues_an_arbitrary_camera_set_and_lists_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cameras = [f"camera-{index}" for index in range(243)]
+
+            manifest = SpatialStore(root).create_scene(
+                "  New front-garden view  ", cameras, feasibility_id="check-123"
+            )
+            scenes = SpatialStore(root).list_scenes()
+
+            self.assertEqual(manifest["scene"]["name"], "New front-garden view")
+            self.assertEqual(manifest["scene"]["camera_ids"], cameras)
+            self.assertEqual(manifest["run"]["status"], "queued")
+            self.assertEqual(manifest["artifacts"], {})
+            self.assertEqual(manifest["feasibility"], {"id": "check-123"})
+            self.assertEqual(len(scenes), 1)
+            self.assertEqual(scenes[0]["runs"][0]["status"], "queued")
+            self.assertEqual(scenes[0]["runs"][0]["artifacts"], {})
+
+    def test_create_scene_does_not_derive_paths_from_the_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = SpatialStore(root).create_scene(
+                "../../Garden / front", ["tapo-front"]
+            )
+            scene_id = manifest["scene"]["id"]
+            run_id = manifest["run"]["id"]
+
+            self.assertRegex(scene_id, r"^scene-[A-Za-z0-9._-]+$")
+            self.assertRegex(run_id, r"^run-[A-Za-z0-9._-]+$")
+            self.assertTrue((root / scene_id / run_id / "manifest.json").is_file())
+            self.assertFalse((root.parent / "Garden").exists())
+
+    def test_create_scene_rejects_unsafe_camera_identifiers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(SpatialStoreError):
+                SpatialStore(Path(directory)).create_scene(
+                    "Garden", ["tapo-front", "../../elsewhere"]
+                )
+
     def test_artifacts_must_be_declared_by_the_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

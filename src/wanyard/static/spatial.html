@@ -8,7 +8,7 @@
     <link rel="icon" href="/favicon.ico" sizes="any">
     <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/spatial.css?v=1">
+    <link rel="stylesheet" href="/spatial.css?v=2">
   </head>
   <body class="sp-body">
     <header class="sp-header">
@@ -20,6 +20,7 @@
         <span>Scene</span>
         <select id="sceneSelect" aria-label="Scene"></select>
       </div>
+      <button id="newSpatialView" class="sp-new-view" type="button">New spatial view</button>
       <nav class="sp-nav" aria-label="Wanyard">
         <a href="/?view=wall">Live</a>
         <a href="/detections">Detections</a>
@@ -97,6 +98,28 @@
       </aside>
     </main>
 
-    <script src="/spatial.js?v=1"></script>
+    <div id="spatialCreateModal" class="sp-create-modal" hidden>
+      <div class="sp-create-backdrop" data-close-spatial-modal></div>
+      <section class="sp-create-dialog" role="dialog" aria-modal="true" aria-labelledby="spatialCreateTitle" aria-describedby="spatialCreateHelp">
+        <header class="sp-create-head">
+          <div>
+            <div class="sp-eyebrow">Spatial reconstruction</div>
+            <h2 id="spatialCreateTitle">New spatial view</h2>
+          </div>
+          <button class="sp-create-close" type="button" aria-label="Close" data-close-spatial-modal>×</button>
+        </header>
+        <p id="spatialCreateHelp" class="sp-create-help">Choose at least two enabled cameras. We’ll check their shared view before creating a reconstruction.</p>
+        <label class="sp-scene-name" for="spatialSceneName">View name<input id="spatialSceneName" type="text" maxlength="80" placeholder="e.g. Front garden" autocomplete="off"></label>
+        <div id="spatialCameraList" class="sp-select-cameras" aria-live="polite"></div>
+        <p id="spatialSelectHint" class="sp-create-note">Select at least two cameras to check overlap.</p>
+        <section id="spatialFeasibility" class="sp-feasibility" hidden aria-live="polite"></section>
+        <footer class="sp-create-actions">
+          <button id="spatialCheck" class="sp-secondary-button" type="button" disabled>Check overlap</button>
+          <button id="spatialCreate" class="sp-primary-button" type="button" disabled>Create spatial view</button>
+        </footer>
+      </section>
+    </div>
+
+    <script src="/spatial.js?v=2"></script>
   </body>
 </html>

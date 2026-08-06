@@ -11,6 +11,7 @@
   overflow: hidden;
   background: #090b0f;
 }
+.sp-body.sp-modal-open { overflow: hidden; }
 
 .sp-header {
   height: 58px;
@@ -73,6 +74,16 @@
 }
 
 .sp-nav a:hover { color: var(--txt); background: var(--surf-2); }
+
+.sp-new-view, .sp-primary-button, .sp-secondary-button {
+  border-radius: var(--r);
+  cursor: pointer;
+  font: 600 11px var(--font, inherit);
+}
+.sp-new-view, .sp-primary-button { color: #081011; border: 1px solid var(--sp-cyan); background: var(--sp-cyan); }
+.sp-new-view { padding: 8px 11px; }
+.sp-new-view:hover, .sp-primary-button:hover { filter: brightness(1.06); }
+.sp-new-view:focus-visible, .sp-create-dialog button:focus-visible, .sp-camera-choice:focus-within { outline: 2px solid var(--sp-cyan); outline-offset: 2px; }
 
 .sp-shell {
   height: calc(100vh - 58px);
@@ -268,6 +279,34 @@
 .sp-download:hover { color: var(--txt); border-color: #3a404d; }
 .sp-download span { color: var(--txt-3); font: 10px var(--font-mono); }
 
+.sp-create-modal { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 18px; }
+.sp-create-backdrop { position: absolute; inset: 0; background: rgba(2, 4, 7, .7); backdrop-filter: blur(5px); }
+.sp-create-dialog { position: relative; width: min(620px, 100%); max-height: min(720px, calc(100vh - 36px)); overflow: auto; padding: 24px; border: 1px solid var(--line); border-radius: 10px; background: #151a22; box-shadow: 0 24px 80px rgba(0,0,0,.48); }
+.sp-create-head { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+.sp-create-head h2 { margin-top: 4px; font-size: 22px; letter-spacing: -.025em; }
+.sp-create-close { width: 30px; height: 30px; color: var(--txt-2); border: 0; border-radius: 5px; background: transparent; font-size: 23px; line-height: 1; cursor: pointer; }
+.sp-create-close:hover { color: var(--txt); background: var(--surf-2); }
+.sp-create-help { margin: 10px 0 18px; color: var(--txt-2); font-size: 12px; line-height: 1.5; }
+.sp-scene-name { display: grid; gap: 7px; color: var(--txt-3); font-size: 10px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; }
+.sp-scene-name input { width: 100%; box-sizing: border-box; padding: 9px 10px; color: var(--txt); border: 1px solid var(--line); border-radius: var(--r); background: #0e1218; font: 13px inherit; letter-spacing: normal; text-transform: none; }
+.sp-select-cameras { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 16px; }
+.sp-camera-choice { min-height: 48px; padding: 9px 10px; display: flex; align-items: center; gap: 9px; color: var(--txt-2); border: 1px solid var(--line); border-radius: 6px; background: var(--surf); cursor: pointer; }
+.sp-camera-choice:has(input:checked) { color: var(--txt); border-color: rgba(112, 215, 209, .5); background: var(--sp-cyan-soft); }
+.sp-camera-choice input { accent-color: var(--sp-cyan); }
+.sp-camera-choice span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.sp-create-note { min-height: 18px; margin: 11px 0 0; color: var(--txt-3); font-size: 11px; }
+.sp-feasibility { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: #10151c; }
+.sp-feasibility strong { display: block; font-size: 12px; }
+.sp-feasibility p { margin-top: 5px; color: var(--txt-2); font-size: 11px; line-height: 1.45; }
+.sp-feasibility.mergeable { border-color: rgba(112, 215, 209, .35); }
+.sp-feasibility.not-mergeable { border-color: rgba(232, 165, 88, .35); }
+.sp-feasibility-list { margin: 9px 0 0; padding: 0; list-style: none; color: var(--txt-3); font: 10px var(--font-mono); }
+.sp-feasibility-list li + li { margin-top: 4px; }
+.sp-create-actions { margin-top: 20px; display: flex; justify-content: flex-end; gap: 8px; }
+.sp-secondary-button, .sp-primary-button { padding: 9px 12px; }
+.sp-secondary-button { color: var(--txt-2); border: 1px solid var(--line); background: var(--surf); }
+.sp-create-dialog button:disabled { opacity: .45; cursor: not-allowed; }
+
 @media (max-width: 760px) {
   .sp-header { height: 52px; padding: 0 12px; gap: 14px; }
   .sp-scene-pick > span, .sp-nav a:not(:last-child) { display: none; }
@@ -279,4 +318,9 @@
   .sp-stage-bottom { left: 12px; right: 12px; bottom: 12px; }
   #interactionHint, .sp-view-tools label { display: none; }
   .sp-view-tools { margin-left: auto; }
+  .sp-new-view { margin-left: auto; padding: 7px 9px; white-space: nowrap; font-size: 10px; }
+  .sp-nav { margin-left: 0; }
+  .sp-create-modal { padding: 0; align-items: end; }
+  .sp-create-dialog { width: 100%; max-height: min(82vh, 720px); padding: 20px 16px calc(20px + env(safe-area-inset-bottom)); border-radius: 12px 12px 0 0; }
+  .sp-select-cameras { grid-template-columns: 1fr; }
 }

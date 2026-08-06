@@ -51,6 +51,10 @@ from .retention import (
     validate_record_mode,
 )
 from .spatial import SpatialStore, SpatialStoreError
+from .spatial_feasibility import (
+    SpatialFeasibilityError,
+    inspect_camera_set,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -770,6 +774,7 @@ def make_app(
     spatial_store = SpatialStore(
         Path(os.environ.get("WANYARD_SPATIAL_DIR", "data/spatial"))
     )
+    spatial_feasibility_checks: dict[str, dict] = {}
     health_store = None
     health_collector = None
     try:
@@ -2720,8 +2725,141 @@ def make_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def api_spatial_feasibility(request: Request) -> Response:
+        if video_db is None or video_dir is None:
+            return JSONResponse(
+                {"error": "recorded video is unavailable"}, status_code=501
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"}, status_code=400
+            )
+        camera_ids = body.get("camera_ids")
+        active_ids = {source["id"] for source in _sources_list(config, source_db)}
+        if not isinstance(camera_ids, list):
+            return JSONResponse({"error": "camera_ids must be a list"}, status_code=400)
+        if any(not isinstance(camera_id, str) for camera_id in camera_ids):
+            return JSONResponse(
+                {"error": "camera_ids must contain strings"}, status_code=400
+            )
+        missing = [camera_id for camera_id in camera_ids if camera_id not in active_ids]
+        if missing:
+            return JSONResponse(
+                {"error": f"camera not found: {missing[0]}"}, status_code=404
+            )
+        try:
+            report = await asyncio.to_thread(
+                inspect_camera_set, video_db, Path(video_dir), camera_ids
+            )
+        except SpatialFeasibilityError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        now = time.time()
+        for old_id, old in list(spatial_feasibility_checks.items()):
+            if now - float(old.get("checked_at", 0)) > 1800:
+                spatial_feasibility_checks.pop(old_id, None)
+        feasibility_id = f"check-{uuid.uuid4().hex}"
+        report["checked_at"] = now
+        report["id"] = feasibility_id
+        report["feasibility_id"] = feasibility_id
+        spatial_feasibility_checks[feasibility_id] = report
+        return JSONResponse({"feasibility": report})
+
     async def api_spatial_scenes(request: Request) -> Response:
-        return JSONResponse({"scenes": spatial_store.list_scenes()})
+        if request.method == "GET":
+            return JSONResponse({"scenes": spatial_store.list_scenes()})
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"}, status_code=400
+            )
+        name = body.get("name")
+        camera_ids = body.get("camera_ids")
+        feasibility_id = body.get("feasibility_id")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+            return JSONResponse(
+                {"error": "name must be between 1 and 80 characters"}, status_code=400
+            )
+        if not isinstance(camera_ids, list):
+            return JSONResponse({"error": "camera_ids must be a list"}, status_code=400)
+        if any(not isinstance(camera_id, str) for camera_id in camera_ids):
+            return JSONResponse(
+                {"error": "camera_ids must contain strings"}, status_code=400
+            )
+        if not isinstance(feasibility_id, str):
+            return JSONResponse({"error": "a feasibility check is required"}, status_code=400)
+        report = spatial_feasibility_checks.get(feasibility_id)
+        if report is None or time.time() - float(report.get("checked_at", 0)) > 1800:
+            return JSONResponse(
+                {"error": "feasibility check has expired; check overlap again"},
+                status_code=409,
+            )
+        if report.get("camera_ids") != camera_ids:
+            return JSONResponse(
+                {"error": "camera selection changed; check overlap again"},
+                status_code=409,
+            )
+        if report.get("mergeable") is not True:
+            return JSONResponse(
+                {"error": "selected cameras do not form a connected spatial view"},
+                status_code=409,
+            )
+        active_ids = {source["id"] for source in _sources_list(config, source_db)}
+        missing = [camera_id for camera_id in camera_ids if camera_id not in active_ids]
+        if missing:
+            return JSONResponse(
+                {"error": f"camera not found: {missing[0]}"}, status_code=404
+            )
+
+        # A ready view for the exact camera set is already the best answer;
+        # avoid spending GPU time recreating it unless a rebuild is requested.
+        requested = set(camera_ids)
+        for scene in spatial_store.list_scenes():
+            if len(scene["camera_ids"]) != len(camera_ids) or set(scene["camera_ids"]) != requested:
+                continue
+            if any(
+                run.get("status") == "ready"
+                and run.get("artifacts", {}).get("point_cloud")
+                for run in scene["runs"]
+            ):
+                return JSONResponse({
+                    "scene": scene,
+                    "scene_id": scene["id"],
+                    "reused": True,
+                    "message": "An existing spatial view uses this camera set.",
+                })
+
+        try:
+            manifest = await asyncio.to_thread(
+                spatial_store.create_scene,
+                name.strip(),
+                camera_ids,
+                report,
+            )
+        except SpatialStoreError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        scene = {
+            **manifest["scene"],
+            "runs": [{
+                **manifest["run"],
+                "artifacts": manifest["artifacts"],
+                "stats": manifest.get("stats", {}),
+                "warnings": manifest.get("warnings", []),
+            }],
+        }
+        return JSONResponse({
+            "scene": scene,
+            "scene_id": scene["id"],
+            "run_id": manifest["run"]["id"],
+            "message": "Spatial reconstruction queued.",
+        }, status_code=202)
 
     async def api_spatial_artifact(request: Request) -> Response:
         try:
@@ -2753,7 +2891,8 @@ def make_app(
         Route("/spatial",                  lambda r: FileResponse(static_dir / "spatial.html", headers={"Cache-Control": "no-cache"})),
         Route("/settings",                  lambda r: FileResponse(static_dir / "settings.html", headers={"Cache-Control": "no-cache"})),
         Route("/api/health",                api_health),
-        Route("/api/spatial/scenes",        api_spatial_scenes),
+        Route("/api/spatial/scenes",        api_spatial_scenes, methods=["GET", "POST"]),
+        Route("/api/spatial/feasibility",   api_spatial_feasibility, methods=["POST"]),
         Route("/api/spatial/{scene_id}/{run_id}/{artifact_name}", api_spatial_artifact),
         Route("/api/thumb",                 api_thumb),
         Route("/api/video/event-thumb/{event_id}", api_video_event_thumb),
