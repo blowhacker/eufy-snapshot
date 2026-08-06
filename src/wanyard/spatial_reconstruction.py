@@ -834,15 +834,49 @@ def _render_vggt_depth_preview(cv2, np, depth, confidence):
 
 
 def _render_cloud_preview(cv2, np, cloud: ProjectiveCloud):
-    canvas_height, canvas_width = 720, 1080
-    canvas = np.full((canvas_height, canvas_width, 3), (13, 18, 24), dtype=np.uint8)
-    points = cloud.points.astype(np.float64)
+    canvas_height, canvas_width = 640, 1920
+    panel_width = canvas_width // 3
+    canvas = np.full((canvas_height, canvas_width, 3), (7, 10, 13), dtype=np.uint8)
+    points = cloud.points.astype(np.float64).copy()
+    points[:, 0] *= -1.0
+    points[:, 1] *= -1.0
+    low = np.percentile(points, 1, axis=0)
+    high = np.percentile(points, 99, axis=0)
+    inlier = np.all((points >= low) & (points <= high), axis=1)
+    points = points[inlier]
+    colors = cloud.colors[inlier]
     low = np.percentile(points, 1, axis=0)
     high = np.percentile(points, 99, axis=0)
     center = (low + high) / 2.0
     scale = max(float((high - low).max()), 1e-9)
     view = (points - center) / scale * 2.0
-    yaw, pitch = -0.35, 0.12
+    views = [
+        ("FRONT", -0.35, 0.12),
+        ("TOP", -0.35, 1.18),
+        ("OBLIQUE", 0.55, 0.45),
+    ]
+    for panel_index, (label, yaw, pitch) in enumerate(views):
+        panel = canvas[:, panel_index * panel_width:(panel_index + 1) * panel_width]
+        _render_cloud_panel(cv2, np, panel, view, colors, yaw, pitch)
+        cv2.putText(
+            panel, label, (24, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.68,
+            (205, 215, 224), 1, cv2.LINE_AA,
+        )
+        if panel_index:
+            cv2.line(
+                canvas, (panel_index * panel_width, 24),
+                (panel_index * panel_width, canvas_height - 24),
+                (35, 43, 51), 1, cv2.LINE_AA,
+            )
+    cv2.putText(
+        canvas, "VGGT OVERVIEW  /  RELATIVE SCALE", (24, canvas_height - 22),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (116, 132, 145), 1, cv2.LINE_AA,
+    )
+    return canvas
+
+
+def _render_cloud_panel(cv2, np, canvas, view, colors, yaw, pitch):
+    canvas_height, canvas_width = canvas.shape[:2]
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
     rotated = np.column_stack([
@@ -853,16 +887,16 @@ def _render_cloud_preview(cv2, np, cloud: ProjectiveCloud):
     rotated = np.column_stack([
         rotated[:, 0],
         cp * rotated[:, 1] - sp * rotated[:, 2],
-        sp * rotated[:, 1] + cp * rotated[:, 2] - 3.0,
+        sp * rotated[:, 1] + cp * rotated[:, 2] - 3.2,
     ])
-    screen_x = (rotated[:, 0] * 1.92 / -rotated[:, 2] * 420 + canvas_width / 2).astype(int)
-    screen_y = (-rotated[:, 1] * 1.92 / -rotated[:, 2] * 420 + canvas_height / 2).astype(int)
+    focal = canvas_height * 0.43
+    screen_x = (rotated[:, 0] * 1.92 / -rotated[:, 2] * focal + canvas_width / 2).astype(int)
+    screen_y = (-rotated[:, 1] * 1.92 / -rotated[:, 2] * focal + canvas_height / 2).astype(int)
     for index in np.argsort(rotated[:, 2]):
         x, y = int(screen_x[index]), int(screen_y[index])
         if 0 <= x < canvas_width and 0 <= y < canvas_height:
-            colour = tuple(int(value) for value in cloud.colors[index, ::-1])
+            colour = tuple(int(value) for value in colors[index, ::-1])
             cv2.circle(canvas, (x, y), 1, colour, -1, cv2.LINE_AA)
-    return canvas
 
 
 def _write_image_atomic(cv2, path: Path, image) -> None:

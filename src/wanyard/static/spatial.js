@@ -109,6 +109,7 @@
       const cloud = parsePly(buffer);
       if (state.viewer) state.viewer.destroy();
       state.viewer = createViewer(canvas, cloud);
+      setArtifactView('overview');
       loading.hidden = true;
     } catch (error) {
       console.error(error);
@@ -350,16 +351,20 @@
     return { destroy() { cancelAnimationFrame(animation); gl.deleteBuffer(positionBuffer); gl.deleteBuffer(colorBuffer); if (indexBuffer) gl.deleteBuffer(indexBuffer); gl.deleteProgram(program); } };
   }
 
-  document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
-    const cloud = button.dataset.view === 'cloud';
+  function setArtifactView(viewName) {
     document.querySelectorAll('[data-view]').forEach(item => {
-      item.classList.toggle('active', item === button);
-      item.setAttribute('aria-pressed', String(item === button));
+      const selected = item.dataset.view === viewName;
+      item.classList.toggle('active', selected);
+      item.setAttribute('aria-pressed', String(selected));
     });
-    canvas.hidden = !cloud;
-    depthImage.hidden = cloud;
-    fallbackImage.hidden = true;
-    document.querySelector('.sp-stage-bottom').hidden = !cloud;
+    canvas.hidden = viewName !== 'cloud';
+    depthImage.hidden = viewName !== 'depth';
+    fallbackImage.hidden = viewName !== 'overview';
+    document.querySelector('.sp-stage-bottom').hidden = viewName !== 'cloud';
+  }
+
+  document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
+    setArtifactView(button.dataset.view);
   }));
 
   const createModal = document.getElementById('spatialCreateModal');
