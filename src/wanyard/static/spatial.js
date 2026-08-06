@@ -10,8 +10,9 @@
   const state = { scenes: [], scene: null, run: null, viewer: null, sources: [], feasibility: null, previousFocus: null, runPoll: null };
 
   function artifactUrl(name) {
-    return ['/api/spatial', state.scene.id, state.run.id, name]
+    const path = ['/api/spatial', state.scene.id, state.run.id, name]
       .map((part, index) => index ? encodeURIComponent(part) : part).join('/');
+    return path + '?v=' + encodeURIComponent(state.run.updated_at || state.run.created_at || '1');
   }
 
   function niceLabel(value) {

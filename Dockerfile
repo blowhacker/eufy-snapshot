@@ -13,6 +13,12 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt requirements.lock ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# VGGT declares NumPy <2 even though its current inference code is compatible
+# with this image's NumPy 2 runtime. Install the pinned official source without
+# package metadata so pip does not downgrade the application's numeric stack.
+COPY scripts/install_vggt.py ./scripts/install_vggt.py
+RUN python scripts/install_vggt.py a288dd0f14786c93483e45524328726ab7b1b4ce
+
 # Package metadata
 COPY pyproject.toml README.md ./
 

@@ -74,6 +74,8 @@ services:
       - WANYARD_MEDIA_HEALTH_DB=/app/data/media-health.db
       - WANYARD_MEDIA_HEALTH_INTERVAL=15
       - WANYARD_SPATIAL_DIR=/app/data/spatial
+      - WANYARD_SPATIAL_MODEL=/app/models/vggt/model.pt
+      - WANYARD_SPATIAL_ENGINE=vggt
       # App binds this (overrides config.yaml) so per-deploy ports live only in
       # the .env, never as a local edit to the tracked config.yaml. Matches the
       # published port above.
@@ -85,6 +87,7 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
+      - ./models:/app/models:ro
       - ./video:/app/video
       - yolo-run:/run/yolo
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -61,6 +62,7 @@ class SpatialReconstructionTests(unittest.TestCase):
             )
             frame = SimpleNamespace(frame=np.zeros((8, 8, 3), dtype=np.uint8), status="ok")
             with (
+                mock.patch.dict(os.environ, {"WANYARD_SPATIAL_ENGINE": "opencv"}),
                 mock.patch.object(reconstruction.stereo, "latest_common_timestamp", return_value=123.0),
                 mock.patch.object(reconstruction.stereo, "_read_frame", return_value=frame),
                 mock.patch.object(reconstruction, "build_projective_cloud", return_value=cloud),
@@ -90,6 +92,7 @@ class SpatialReconstructionTests(unittest.TestCase):
             manifest = store.create_scene("Front", ["front", "garden"])
             frame = SimpleNamespace(frame=object(), status="ok")
             with (
+                mock.patch.dict(os.environ, {"WANYARD_SPATIAL_ENGINE": "opencv"}),
                 mock.patch.object(reconstruction.stereo, "latest_common_timestamp", return_value=123.0),
                 mock.patch.object(reconstruction.stereo, "_read_frame", return_value=frame),
                 mock.patch.object(

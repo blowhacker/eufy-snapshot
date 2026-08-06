@@ -3,13 +3,14 @@
 # Deploy wanyard to the GPU host (banana): push -> pull -> build -> recreate,
 # then VERIFY the GPU actually reached the containers.
 #
-# Why this exists: the GPU device reservation for the yolo detector and the
-# stamper's NVENC lives only in docker-compose.gpu.yml (an overlay). Two ways a
+# Why this exists: the GPU device reservation for spatial reconstruction, the
+# yolo detector, and the stamper's NVENC lives only in docker-compose.gpu.yml.
+# Two ways a
 # hand-run deploy silently drops it and pins ~540% CPU on yolo (CPU inference):
 #   1. `docker compose restart` reuses the existing container config and never
 #      re-applies the device reservation.
 #   2. A deploy that forgets the gpu overlay (stale/edited .env COMPOSE_FILE)
-#      recreates yolo/stamper without GPUs.
+#      recreates app/yolo/stamper without GPUs.
 # This script removes both foot-guns: it always builds COMPOSE_FILE with the gpu
 # overlay itself (independent of .env), always uses `up -d`, never `restart`, and
 # fails the deploy if torch/CUDA or the device reservation is missing afterward.
@@ -63,7 +64,7 @@ docker compose up -d --build
 
 echo ">> verifying GPU passthrough"
 fail=0
-for svc in yolo stamper; do
+for svc in app yolo stamper; do
   cid="$(docker compose ps -q "$svc" || true)"
   if [ -z "$cid" ]; then
     echo "  ! $svc: no container" >&2; fail=1; continue
@@ -76,29 +77,31 @@ for svc in yolo stamper; do
   fi
 done
 
-# yolo can have the device but still run on CPU if torch can't see CUDA. Retry:
+# app and yolo can have the device but still have an unusable CUDA runtime. Retry:
 # the container needs a few seconds after (re)create before python is up.
 # </dev/null is load-bearing: this whole script arrives on bash's stdin (bash -s
 # heredoc), and docker compose exec inherits that stdin — without the redirect
 # it EATS the remainder of the script, silently skipping every check below.
-cuda_ok=0
-for _ in 1 2 3 4 5 6; do
-  if docker compose exec -T yolo python3 -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' </dev/null 2>/dev/null; then
-    cuda_ok=1; break
+for svc in app yolo; do
+  cuda_ok=0
+  for _ in 1 2 3 4 5 6; do
+    if docker compose exec -T "$svc" python3 -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' </dev/null 2>/dev/null; then
+      cuda_ok=1; break
+    fi
+    sleep 5
+  done
+  if [ "$cuda_ok" = 1 ]; then
+    echo "  ok $svc: torch.cuda.is_available()=True"
+  else
+    echo "  ! $svc: torch.cuda.is_available()=False" >&2; fail=1
   fi
-  sleep 5
 done
-if [ "$cuda_ok" = 1 ]; then
-  echo "  ok yolo: torch.cuda.is_available()=True"
-else
-  echo "  ! yolo: torch.cuda.is_available()=False — inference would run on CPU" >&2; fail=1
-fi
 
 if [ "$fail" -ne 0 ]; then
   echo "DEPLOY FAILED: GPU not fully wired. Fix docker-compose.gpu.yml / .env and re-run." >&2
   exit 1
 fi
-echo ">> deploy OK — GPU wired for yolo + stamper"
+echo ">> deploy OK — GPU wired for app + yolo + stamper"
 REMOTE
 
 echo ">> done"

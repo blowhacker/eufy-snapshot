@@ -10,8 +10,10 @@ without changing the queue, manifest, artifact, or browser-viewer contracts.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import gc
 import json
 import math
+import os
 from pathlib import Path
 import uuid
 
@@ -43,6 +45,21 @@ class ProjectiveCloud:
     disparity_range: tuple[int, int]
 
 
+@dataclass
+class NeuralCloud:
+    points: object
+    colors: object
+    faces: object
+    depth: object
+    confidence: object
+    timestamp: float
+    camera_ids: list[str]
+    intrinsic: object
+    extrinsic: object
+    input_shape: tuple[int, ...]
+    gpu_peak_mb: float
+
+
 def process_next_run(store: SpatialStore, video_db, video_dir: Path) -> bool:
     """Consume at most one persisted job. Returns whether work was found."""
     jobs = store.pending_runs()
@@ -71,47 +88,68 @@ def reconstruct_run(
     feasibility: dict | None = None,
 ) -> dict:
     """Build and publish one queued projective point-cloud preview."""
-    store.update_run(scene_id, run_id, status="running", kind="opencv_projective")
+    engine = os.environ.get("WANYARD_SPATIAL_ENGINE", "vggt").strip().lower()
+    kind = "vggt_neural" if engine == "vggt" else "opencv_projective"
+    store.update_run(scene_id, run_id, status="running", kind=kind)
     try:
         left_id, right_id = _choose_pair(camera_ids, feasibility or {})
         timestamp = stereo.latest_common_timestamp(video_db, left_id, right_id)
-        left_result = stereo._read_frame(video_db, video_dir, left_id, timestamp)
-        right_result = stereo._read_frame(video_db, video_dir, right_id, timestamp)
+        frames = []
+        used_camera_ids = []
         unavailable = []
-        if left_result.frame is None:
-            unavailable.append(f"{left_id}: {left_result.status}")
-        if right_result.frame is None:
-            unavailable.append(f"{right_id}: {right_result.status}")
-        if unavailable:
+        for camera_id in camera_ids:
+            result = stereo._read_frame(video_db, video_dir, camera_id, timestamp)
+            if result.frame is None:
+                unavailable.append(f"{camera_id}: {result.status}")
+                continue
+            used_camera_ids.append(camera_id)
+            frames.append(result.frame)
+        if left_id not in used_camera_ids or right_id not in used_camera_ids:
             raise SpatialReconstructionError("frame unavailable (" + "; ".join(unavailable) + ")")
-
-        cloud = build_projective_cloud(
-            left_result.frame,
-            right_result.frame,
-            timestamp=timestamp,
-            left_camera_id=left_id,
-            right_camera_id=right_id,
-        )
         run_dir = store.run_directory(scene_id, run_id)
-        artifacts = _publish_artifacts(run_dir, cloud, camera_ids)
-        warnings = [
-            "OpenCV projective geometry: shape is relative; measurements wait for camera calibration."
-        ]
-        if len(camera_ids) > 2:
+        if engine == "vggt":
+            cloud = build_vggt_cloud(
+                frames,
+                timestamp=timestamp,
+                camera_ids=used_camera_ids,
+                model_path=Path(os.environ.get(
+                    "WANYARD_SPATIAL_MODEL", "/app/models/vggt/model.pt"
+                )),
+            )
+            artifacts = _publish_vggt_artifacts(run_dir, cloud, camera_ids)
+            warnings = [
+                "VGGT neural geometry has relative scale; measurements wait for camera calibration."
+            ]
+        else:
+            left_frame = frames[used_camera_ids.index(left_id)]
+            right_frame = frames[used_camera_ids.index(right_id)]
+            cloud = build_projective_cloud(
+                left_frame,
+                right_frame,
+                timestamp=timestamp,
+                left_camera_id=left_id,
+                right_camera_id=right_id,
+            )
+            artifacts = _publish_artifacts(run_dir, cloud, camera_ids)
+            warnings = [
+                "OpenCV projective geometry: shape is relative; measurements wait for camera calibration."
+            ]
+        if unavailable:
             warnings.append(
-                f"This first preview uses {left_id} and {right_id}; multi-camera fusion is not yet enabled."
+                "Some selected cameras had no readable synchronized frame: "
+                + "; ".join(unavailable)
             )
         return store.update_run(
             scene_id,
             run_id,
             status="ready",
-            kind="opencv_projective",
+            kind=kind,
             artifacts=artifacts,
             stats={
                 "points": int(len(cloud.points)),
                 "faces": int(len(cloud.faces)),
                 "camera_count": len(camera_ids),
-                "reconstructed_camera_count": 2,
+                "reconstructed_camera_count": len(used_camera_ids),
                 "timestamp": cloud.timestamp,
             },
             warnings=warnings,
@@ -120,11 +158,163 @@ def reconstruct_run(
         message = str(exc).strip() or exc.__class__.__name__
         try:
             store.update_run(
-                scene_id, run_id, status="failed", kind="opencv_projective", error=message
+                scene_id, run_id, status="failed", kind=kind, error=message
             )
         except Exception:
             pass
         raise
+
+
+def build_vggt_cloud(
+    frames,
+    *,
+    timestamp: float,
+    camera_ids: list[str],
+    model_path: Path,
+    max_points: int = 120_000,
+) -> NeuralCloud:
+    """Infer coherent cameras and dense relative geometry with official VGGT."""
+    if len(frames) < 2 or len(frames) != len(camera_ids):
+        raise SpatialReconstructionError("VGGT requires at least two named camera frames")
+    model_path = Path(model_path)
+    if not model_path.is_file():
+        raise SpatialReconstructionError(
+            f"VGGT model is not installed at {model_path}"
+        )
+    try:
+        import torch
+        from vggt.models.vggt import VGGT
+        from vggt.utils.geometry import unproject_depth_map_to_point_map
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise SpatialReconstructionError("VGGT runtime is not installed") from exc
+    if not torch.cuda.is_available():
+        raise SpatialReconstructionError("VGGT requires the CUDA reconstruction worker")
+
+    cv2 = stereo._load_cv2()
+    np = stereo._load_numpy()
+    images = _preprocess_vggt_frames(cv2, np, torch, frames).to("cuda")
+    model = None
+    predictions = None
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    try:
+        model = VGGT(
+            enable_camera=True,
+            enable_point=False,
+            enable_depth=True,
+            enable_track=False,
+        )
+        state = torch.load(model_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state, strict=False)
+        del state
+        model = model.eval().to("cuda")
+        dtype = (
+            torch.bfloat16
+            if torch.cuda.get_device_capability()[0] >= 8
+            else torch.float16
+        )
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
+            predictions = model(images)
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(
+            predictions["pose_enc"], images.shape[-2:]
+        )
+        depth = predictions["depth"].squeeze(0).float().cpu().numpy()
+        confidence = predictions["depth_conf"].squeeze(0).float().cpu().numpy()
+        extrinsic_np = extrinsic.squeeze(0).float().cpu().numpy()
+        intrinsic_np = intrinsic.squeeze(0).float().cpu().numpy()
+        world_points = unproject_depth_map_to_point_map(
+            depth, extrinsic_np, intrinsic_np
+        )
+        rgb = (
+            images.detach().float().cpu().permute(0, 2, 3, 1).numpy() * 255.0
+        ).clip(0, 255).astype(np.uint8)
+        points, colors = _select_vggt_points(
+            np, world_points, confidence, rgb, max_points
+        )
+        if len(points) < 10_000:
+            raise SpatialReconstructionError(
+                f"VGGT retained only {len(points)} confident scene points"
+            )
+        peak = float(torch.cuda.max_memory_allocated()) / (1024.0 * 1024.0)
+        return NeuralCloud(
+            points=points.astype(np.float32),
+            colors=colors.astype(np.uint8),
+            faces=np.empty((0, 3), dtype=np.int32),
+            depth=depth,
+            confidence=confidence,
+            timestamp=float(timestamp),
+            camera_ids=list(camera_ids),
+            intrinsic=intrinsic_np,
+            extrinsic=extrinsic_np,
+            input_shape=tuple(int(value) for value in images.shape),
+            gpu_peak_mb=peak,
+        )
+    except torch.cuda.OutOfMemoryError as exc:
+        raise SpatialReconstructionError(
+            "VGGT ran out of GPU memory while reconstructing these cameras"
+        ) from exc
+    finally:
+        del predictions
+        del model
+        del images
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _preprocess_vggt_frames(cv2, np, torch, frames):
+    processed = []
+    shapes = []
+    for frame in frames:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width = rgb.shape[:2]
+        new_width = 518
+        new_height = round(height * (new_width / width) / 14) * 14
+        resized = cv2.resize(
+            rgb,
+            (new_width, new_height),
+            interpolation=cv2.INTER_AREA if new_width < width else cv2.INTER_CUBIC,
+        )
+        if new_height > 518:
+            start = (new_height - 518) // 2
+            resized = resized[start:start + 518]
+        processed.append(resized)
+        shapes.append(resized.shape[:2])
+    max_height = max(shape[0] for shape in shapes)
+    max_width = max(shape[1] for shape in shapes)
+    tensors = []
+    for image in processed:
+        height, width = image.shape[:2]
+        top = (max_height - height) // 2
+        bottom = max_height - height - top
+        left = (max_width - width) // 2
+        right = max_width - width - left
+        if top or bottom or left or right:
+            image = cv2.copyMakeBorder(
+                image, top, bottom, left, right,
+                cv2.BORDER_CONSTANT, value=(255, 255, 255),
+            )
+        tensors.append(
+            torch.from_numpy(np.ascontiguousarray(image))
+            .permute(2, 0, 1).float().div_(255.0)
+        )
+    return torch.stack(tensors)
+
+
+def _select_vggt_points(np, world_points, confidence, rgb, max_points: int):
+    points = world_points.reshape(-1, 3)
+    scores = confidence.reshape(-1)
+    colors = rgb.reshape(-1, 3)
+    valid = np.isfinite(points).all(axis=1) & np.isfinite(scores) & (scores > 1e-5)
+    if not bool(valid.any()):
+        return points[:0], colors[:0]
+    threshold = np.percentile(scores[valid], 45)
+    selected = np.flatnonzero(valid & (scores >= threshold))
+    if len(selected) > max_points:
+        selected = selected[
+            np.linspace(0, len(selected) - 1, max_points, dtype=int)
+        ]
+    return points[selected], colors[selected]
 
 
 def build_projective_cloud(
@@ -506,6 +696,44 @@ def _publish_artifacts(run_dir: Path, cloud: ProjectiveCloud, camera_ids: list[s
     }
 
 
+def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[str]) -> dict:
+    cv2 = stereo._load_cv2()
+    np = stereo._load_numpy()
+    point_cloud = run_dir / "scene.ply"
+    depth_preview = run_dir / "depth-preview.jpg"
+    cloud_preview = run_dir / "pointcloud-preview.jpg"
+    summary_path = run_dir / "model-summary.json"
+    _write_binary_ply(point_cloud, cloud.points, cloud.colors, cloud.faces, np)
+    _write_image_atomic(
+        cv2, depth_preview,
+        _render_vggt_depth_preview(cv2, np, cloud.depth, cloud.confidence),
+    )
+    _write_image_atomic(cv2, cloud_preview, _render_cloud_preview(cv2, np, cloud))
+    summary = {
+        "method": "vggt-1b-depth-unprojection",
+        "metric": False,
+        "timestamp": cloud.timestamp,
+        "camera_ids": camera_ids,
+        "reconstructed_camera_ids": cloud.camera_ids,
+        "points": int(len(cloud.points)),
+        "input_shape": list(cloud.input_shape),
+        "intrinsic": cloud.intrinsic.tolist(),
+        "extrinsic": cloud.extrinsic.tolist(),
+        "gpu_peak_mb": round(cloud.gpu_peak_mb, 2),
+        "limitations": [
+            "Depth and translation have relative, not metric, scale.",
+            "Metric measurements require camera calibration and a measured baseline.",
+        ],
+    }
+    _write_json_atomic(summary_path, summary)
+    return {
+        "point_cloud": point_cloud.name,
+        "depth_preview": depth_preview.name,
+        "pointcloud_preview": cloud_preview.name,
+        "model_summary": summary_path.name,
+    }
+
+
 def _write_binary_ply(path: Path, points, colors, faces, np) -> None:
     header = (
         "ply\nformat binary_little_endian 1.0\n"
@@ -557,6 +785,27 @@ def _render_depth_preview(cv2, np, cloud: ProjectiveCloud):
     output = background
     output[finite] = colour[finite]
     return output
+
+
+def _render_vggt_depth_preview(cv2, np, depth, confidence):
+    panels = []
+    for frame_depth, frame_confidence in zip(depth, confidence):
+        values = frame_depth.squeeze(-1)
+        valid = np.isfinite(values) & np.isfinite(frame_confidence) & (values > 0)
+        if bool(valid.any()):
+            confidence_cutoff = np.percentile(frame_confidence[valid], 35)
+            valid &= frame_confidence >= confidence_cutoff
+        normalized = np.zeros(values.shape, dtype=np.uint8)
+        if bool(valid.any()):
+            low, high = np.percentile(values[valid], [2, 98])
+            if high > low:
+                normalized[valid] = np.clip(
+                    (high - values[valid]) / (high - low) * 255.0, 0, 255
+                ).astype(np.uint8)
+        panel = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+        panel[~valid] = (10, 14, 19)
+        panels.append(panel)
+    return np.hstack(panels)
 
 
 def _render_cloud_preview(cv2, np, cloud: ProjectiveCloud):

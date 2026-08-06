@@ -73,7 +73,7 @@ class SpatialStore:
                 "run": {
                     "id": run_id,
                     "created_at": created_at,
-                    "kind": "opencv_projective",
+                    "kind": "vggt_neural",
                     "metric": False,
                     "status": "queued",
                 },

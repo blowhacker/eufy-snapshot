@@ -7,6 +7,7 @@ anyio==4.14.0
 av==17.1.0
 certifi==2026.6.17
 charset-normalizer==3.4.7
+click==8.4.2
 contourpy==1.3.3
 cycler==0.12.1
 filelock==3.29.0
@@ -18,6 +19,11 @@ hpack==4.1.0
 Hypercorn==0.18.0
 hyperframe==6.1.0
 idna==3.18
+einops==0.8.2
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+huggingface-hub==1.26.1
 Jinja2==3.1.6
 kiwisolver==1.5.0
 lap==0.5.12
@@ -50,6 +56,7 @@ pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
 requests==2.34.2
+safetensors==0.8.0
 scipy==1.18.0
 setuptools==70.2.0
 six==1.17.0
@@ -57,6 +64,7 @@ starlette==1.3.1
 sympy==1.13.1
 torch==2.5.1+cu121
 torchvision==0.20.1+cu121
+tqdm==4.70.0
 triton==3.1.0
 typing_extensions==4.15.0
 ultralytics==8.4.71
