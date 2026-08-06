@@ -87,6 +87,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="largest image dimension used for feature analysis (default: 1280)",
     )
     stereo.add_argument(
+        "--timing-window-minutes", type=float, default=180.0,
+        help="recorded vehicle history used for timing (default: 180 minutes)",
+    )
+    stereo.add_argument(
+        "--timing-step-ms", type=int, default=10,
+        help="moving-vehicle offset resolution (default: 10 ms)",
+    )
+    stereo.add_argument(
+        "--timing-events", type=int, default=30,
+        help="maximum unambiguous shared vehicle events (default: 30)",
+    )
+    stereo.add_argument(
         "--output-dir", default=None,
         help="diagnostic directory (default: data/stereo-inspect/<pair>/<timestamp>)",
     )
@@ -196,6 +208,9 @@ def cmd_stereo_inspect(args, config: AppConfig) -> int:
             offsets,
             output_dir,
             max_dimension=args.max_dimension,
+            timing_window_seconds=args.timing_window_minutes * 60.0,
+            timing_step_ms=args.timing_step_ms,
+            max_vehicle_events=args.timing_events,
         )
     except StereoInspectError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -211,9 +226,18 @@ def cmd_stereo_inspect(args, config: AppConfig) -> int:
         f" coverage={min(metrics['left_grid_coverage'], metrics['right_grid_coverage']):.1%}"
     )
     if temporal["observable"]:
-        print(f"temporal offset: {temporal['suggested_offset_ms']:+d} ms (observable)")
+        print(
+            f"temporal offset: {temporal['suggested_offset_ms']:+d} ms"
+            f" confidence={temporal['confidence']}"
+            f" events={temporal['matched_events']}"
+            f" p95={temporal['p95_residual_ms']:.0f} ms"
+        )
     else:
         print(f"temporal offset: not observable ({temporal['reason']})")
+    print(
+        "dynamic stereo: "
+        + ("ready" if temporal["dynamic_3d_ready"] else "not ready")
+    )
     print(f"diagnostics: {output_dir / 'report.json'}")
     return 0
 

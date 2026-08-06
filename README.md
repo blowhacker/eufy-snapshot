@@ -57,8 +57,13 @@ Main services in `docker-compose.yml`:
 wanyard serve        # web server, APIs, recording
 wanyard stamp        # SEI frame-clock stamper
 wanyard yolo-serve   # YOLO live detection + MP4 backfill
-wanyard stereo-inspect desk garden  # read-only two-camera feasibility report
+wanyard stereo-inspect tapo-front garden-old  # geometry + moving-vehicle timing report
 ```
+
+`stereo-inspect` reads recorded frames and detections only. Its default
+three-hour timing window looks for up to 30 shared moving vehicles, estimates
+the right-camera clock offset at 10 ms resolution, and writes a confidence
+gate, offset plot, and paired-vehicle montage alongside the geometry report.
 
 ## Tests
 

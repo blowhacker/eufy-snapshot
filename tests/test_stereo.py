@@ -121,6 +121,108 @@ class StereoInspectTests(unittest.TestCase):
         self.assertTrue(result["observable"])
         self.assertEqual(result["suggested_offset_ms"], 50)
 
+    def test_vehicle_tracks_keep_only_contiguous_motion(self) -> None:
+        rows = []
+        for index, timestamp in enumerate((1.0, 1.5, 2.0, 2.5)):
+            x = 0.1 + index * 0.04
+            rows.append({
+                "abs_ts": timestamp,
+                "boxes": [{
+                    "cls": "car",
+                    "track_id": "moving",
+                    "conf": 0.9,
+                    "x1": x,
+                    "y1": 0.3,
+                    "x2": x + 0.1,
+                    "y2": 0.4,
+                }, {
+                    "cls": "car",
+                    "track_id": "parked",
+                    "conf": 0.9,
+                    "x1": 0.7,
+                    "y1": 0.3,
+                    "x2": 0.8,
+                    "y2": 0.4,
+                }],
+            })
+
+        tracks = stereo._vehicle_tracks(rows, "front")
+
+        self.assertEqual(len(tracks), 1)
+        self.assertTrue(tracks[0].uid.startswith("moving:"))
+        self.assertGreater(tracks[0].travel, 0.1)
+
+    def test_vehicle_pair_curve_recovers_inter_camera_offset(self) -> None:
+        import numpy as np
+
+        def track(uid, clock_offset):
+            samples = tuple(
+                stereo.VehicleSample(
+                    timestamp=physical_time + clock_offset,
+                    x=0.5,
+                    y=0.2 + physical_time * 0.04,
+                    area=0.03,
+                )
+                for physical_time in np.arange(0.0, 3.01, 0.1)
+            )
+            return stereo.VehicleTrack(
+                uid=uid,
+                source_id=uid,
+                cls="car",
+                samples=samples,
+                travel=0.12,
+            )
+
+        # This fundamental matrix describes horizontal epipolar lines, so a
+        # time error becomes a directly measurable vertical residual.
+        fundamental = np.asarray([
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+        ])
+        pair = stereo._vehicle_pair_curve(
+            np,
+            fundamental,
+            track("left", 0.0),
+            track("right", 0.12),
+            range(-200, 201, 10),
+            (1000, 1000),
+            (1000, 1000),
+        )
+
+        self.assertIsNotNone(pair)
+        self.assertEqual(pair.best_offset_ms, 120)
+        self.assertLess(pair.median_error_px, 0.01)
+        self.assertGreater(pair.sharpness, 10.0)
+
+    def test_vehicle_consensus_enforces_dynamic_stereo_gate(self) -> None:
+        import numpy as np
+
+        sample = stereo.VehicleSample(1.0, 0.5, 0.5, 0.1)
+        track = stereo.VehicleTrack(
+            "track", "source", "car", (sample,), 0.2
+        )
+        pairs = [
+            stereo._VehiclePair(
+                left=track,
+                right=track,
+                best_offset_ms=35 + (index % 3) * 10,
+                median_error_px=2.0,
+                p90_error_px=4.0,
+                samples=8,
+                sharpness=1.4,
+                curve=((-100, 5.0), (40, 2.0), (100, 5.0)),
+            )
+            for index in range(24)
+        ]
+
+        result = stereo._summarize_vehicle_pairs(np, pairs)
+
+        self.assertTrue(result["observable"])
+        self.assertTrue(result["dynamic_3d_ready"])
+        self.assertEqual(result["confidence"], "high")
+        self.assertEqual(result["matched_events"], 24)
+
     def test_parser_exposes_stereo_inspect(self) -> None:
         args = cli.build_parser().parse_args([
             "stereo-inspect", "desk", "garden", "--at", "123.5",
@@ -139,6 +241,9 @@ class StereoInspectTests(unittest.TestCase):
             offset_max_ms=0,
             offset_step_ms=50,
             max_dimension=1280,
+            timing_window_minutes=180.0,
+            timing_step_ms=10,
+            timing_events=30,
             output_dir=None,
         )
         report = {
@@ -152,6 +257,10 @@ class StereoInspectTests(unittest.TestCase):
             "temporal_offset": {
                 "observable": False,
                 "suggested_offset_ms": None,
+                "confidence": "low",
+                "matched_events": 0,
+                "p95_residual_ms": None,
+                "dynamic_3d_ready": False,
                 "reason": "static",
             },
         }
