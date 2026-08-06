@@ -135,6 +135,8 @@
     const countMatch = headerText.match(/element vertex (\d+)/);
     if (!countMatch) throw new Error('PLY has no vertex count');
     const count = Number(countMatch[1]);
+    const faceMatch = headerText.match(/element face (\d+)/);
+    const faceCount = faceMatch ? Number(faceMatch[1]) : 0;
     offset += endMarker.length;
     while (bytes[offset] === 10 || bytes[offset] === 13) offset++;
     const stride = 15;
@@ -171,7 +173,23 @@
       positions[index + 1] = -(positions[index + 1] - center[1]) / scale * 2;
       positions[index + 2] = -(positions[index + 2] - center[2]) / scale * 2;
     }
-    return { count, positions, colors };
+    const faceValues = [];
+    let faceOffset = count * stride;
+    for (let index = 0; index < faceCount; index++) {
+      if (faceOffset >= view.byteLength) throw new Error('PLY face data is incomplete');
+      const vertices = view.getUint8(faceOffset);
+      faceOffset += 1;
+      if (faceOffset + vertices * 4 > view.byteLength) throw new Error('PLY face data is incomplete');
+      if (vertices === 3) {
+        faceValues.push(
+          view.getUint32(faceOffset, true),
+          view.getUint32(faceOffset + 4, true),
+          view.getUint32(faceOffset + 8, true)
+        );
+      }
+      faceOffset += vertices * 4;
+    }
+    return { count, positions, colors, indices: faceValues.length ? new Uint32Array(faceValues) : null };
   }
 
   function compile(gl, type, source) {
@@ -195,6 +213,7 @@
       uniform float uDistance;
       uniform float uAspect;
       uniform float uPointSize;
+      uniform bool uRenderPoints;
       varying vec3 vColor;
       void main() {
         float cy = cos(uYaw), sy = sin(uYaw);
@@ -211,10 +230,13 @@
       }`;
     const fragmentSource = `
       precision mediump float;
+      uniform bool uRenderPoints;
       varying vec3 vColor;
       void main() {
-        vec2 d = gl_PointCoord - vec2(.5);
-        if (dot(d, d) > .25) discard;
+        if (uRenderPoints) {
+          vec2 d = gl_PointCoord - vec2(.5);
+          if (dot(d, d) > .25) discard;
+        }
         gl_FragColor = vec4(vColor, .92);
       }`;
     const program = gl.createProgram();
@@ -238,7 +260,26 @@
     gl.vertexAttribPointer(colorLocation, 3, gl.UNSIGNED_BYTE, true, 0, 0);
 
     const uniforms = {};
-    ['uYaw', 'uPitch', 'uDistance', 'uAspect', 'uPointSize'].forEach(name => uniforms[name] = gl.getUniformLocation(program, name));
+    ['uYaw', 'uPitch', 'uDistance', 'uAspect', 'uPointSize', 'uRenderPoints'].forEach(name => uniforms[name] = gl.getUniformLocation(program, name));
+    let indexBuffer = null;
+    let indexType = null;
+    let indexCount = 0;
+    if (cloud.indices && cloud.indices.length) {
+      indexBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+      if (cloud.count <= 65535) {
+        const compact = new Uint16Array(cloud.indices);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, compact, gl.STATIC_DRAW);
+        indexType = gl.UNSIGNED_SHORT;
+      } else if (gl.getExtension('OES_element_index_uint')) {
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cloud.indices, gl.STATIC_DRAW);
+        indexType = gl.UNSIGNED_INT;
+      } else {
+        gl.deleteBuffer(indexBuffer);
+        indexBuffer = null;
+      }
+      if (indexBuffer) indexCount = cloud.indices.length;
+    }
     const view = { yaw: -.35, pitch: .12, distance: 3.0, pointSize: 2.25, orbiting: true };
     let pointer = null;
     let animation;
@@ -265,7 +306,13 @@
       gl.uniform1f(uniforms.uDistance, view.distance);
       gl.uniform1f(uniforms.uAspect, target.width / Math.max(target.height, 1));
       gl.uniform1f(uniforms.uPointSize, view.pointSize);
-      gl.drawArrays(gl.POINTS, 0, cloud.count);
+      if (indexBuffer) {
+        gl.uniform1i(uniforms.uRenderPoints, 0);
+        gl.drawElements(gl.TRIANGLES, indexCount, indexType, 0);
+      } else {
+        gl.uniform1i(uniforms.uRenderPoints, 1);
+        gl.drawArrays(gl.POINTS, 0, cloud.count);
+      }
       animation = requestAnimationFrame(draw);
     }
     function reset() { view.yaw = -.35; view.pitch = .12; view.distance = 3.0; }
@@ -299,7 +346,7 @@
       event.currentTarget.setAttribute('aria-pressed', String(view.orbiting));
     };
     animation = requestAnimationFrame(draw);
-    return { destroy() { cancelAnimationFrame(animation); gl.deleteBuffer(positionBuffer); gl.deleteBuffer(colorBuffer); gl.deleteProgram(program); } };
+    return { destroy() { cancelAnimationFrame(animation); gl.deleteBuffer(positionBuffer); gl.deleteBuffer(colorBuffer); if (indexBuffer) gl.deleteBuffer(indexBuffer); gl.deleteProgram(program); } };
   }
 
   document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {

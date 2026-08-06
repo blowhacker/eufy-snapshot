@@ -44,6 +44,7 @@ class SpatialReconstructionTests(unittest.TestCase):
             cloud = reconstruction.ProjectiveCloud(
                 points=points,
                 colors=colors,
+                faces=np.asarray([[0, 1, 2]], dtype=np.int32),
                 rectified_left=np.full((32, 48, 3), 60, dtype=np.uint8),
                 sample_x=np.asarray([10, 20, 30]),
                 sample_y=np.asarray([10, 15, 20]),
@@ -72,6 +73,7 @@ class SpatialReconstructionTests(unittest.TestCase):
             self.assertEqual(result["run"]["status"], "ready")
             self.assertEqual(result["run"]["kind"], "opencv_projective")
             self.assertEqual(result["stats"]["points"], 3)
+            self.assertEqual(result["stats"]["faces"], 1)
             run_dir = store.run_directory(scene_id, run_id)
             for relative in result["artifacts"].values():
                 self.assertTrue((run_dir / relative).is_file())

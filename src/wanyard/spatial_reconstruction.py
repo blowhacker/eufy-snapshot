@@ -27,6 +27,7 @@ class SpatialReconstructionError(RuntimeError):
 class ProjectiveCloud:
     points: object
     colors: object
+    faces: object
     rectified_left: object
     sample_x: object
     sample_y: object
@@ -108,6 +109,7 @@ def reconstruct_run(
             artifacts=artifacts,
             stats={
                 "points": int(len(cloud.points)),
+                "faces": int(len(cloud.faces)),
                 "camera_count": len(camera_ids),
                 "reconstructed_camera_count": 2,
                 "timestamp": cloud.timestamp,
@@ -264,10 +266,19 @@ def build_projective_cloud(
         raise SpatialReconstructionError(
             f"triangulation retained only {len(points)} stable points"
         )
+    faces = _build_faces(
+        np,
+        points,
+        sample_x,
+        sample_y,
+        warped_left.shape[1],
+        warped_left.shape[0],
+    )
 
     return ProjectiveCloud(
         points=points.astype(np.float32),
         colors=colors.astype(np.uint8),
+        faces=faces,
         rectified_left=warped_left,
         sample_x=sample_x,
         sample_y=sample_y,
@@ -428,6 +439,33 @@ def _triangulate(
     return points[keep], keep
 
 
+def _build_faces(np, points, sample_x, sample_y, width: int, height: int):
+    """Connect adjacent trustworthy samples without bridging depth edges."""
+    vertex_at = np.full((height, width), -1, dtype=np.int32)
+    vertex_at[sample_y, sample_x] = np.arange(len(points), dtype=np.int32)
+    top_left = vertex_at[:-1, :-1]
+    top_right = vertex_at[:-1, 1:]
+    bottom_left = vertex_at[1:, :-1]
+    bottom_right = vertex_at[1:, 1:]
+    candidates = []
+    for first, second, third in (
+        (top_left, top_right, bottom_left),
+        (top_right, bottom_right, bottom_left),
+    ):
+        present = (first >= 0) & (second >= 0) & (third >= 0)
+        if not bool(present.any()):
+            continue
+        faces = np.column_stack([first[present], second[present], third[present]])
+        depths = points[faces, 2]
+        # Adjacent pixels on one physical surface change depth gradually. This
+        # rejects triangles across occlusion borders and stereo mismatches.
+        continuous = depths.max(axis=1) <= depths.min(axis=1) * 1.12
+        candidates.append(faces[continuous])
+    if not candidates:
+        return np.empty((0, 3), dtype=np.int32)
+    return np.vstack(candidates).astype(np.int32, copy=False)
+
+
 def _publish_artifacts(run_dir: Path, cloud: ProjectiveCloud, camera_ids: list[str]) -> dict:
     cv2 = stereo._load_cv2()
     np = stereo._load_numpy()
@@ -435,7 +473,7 @@ def _publish_artifacts(run_dir: Path, cloud: ProjectiveCloud, camera_ids: list[s
     depth_preview = run_dir / "depth-preview.jpg"
     cloud_preview = run_dir / "pointcloud-preview.jpg"
     summary_path = run_dir / "model-summary.json"
-    _write_binary_ply(point_cloud, cloud.points, cloud.colors, np)
+    _write_binary_ply(point_cloud, cloud.points, cloud.colors, cloud.faces, np)
     _write_image_atomic(cv2, depth_preview, _render_depth_preview(cv2, np, cloud))
     _write_image_atomic(cv2, cloud_preview, _render_cloud_preview(cv2, np, cloud))
     summary = {
@@ -445,6 +483,7 @@ def _publish_artifacts(run_dir: Path, cloud: ProjectiveCloud, camera_ids: list[s
         "camera_ids": camera_ids,
         "reconstructed_pair": [cloud.left_camera_id, cloud.right_camera_id],
         "points": int(len(cloud.points)),
+        "faces": int(len(cloud.faces)),
         "match_metrics": cloud.metrics,
         "disparity_range": list(cloud.disparity_range),
         "intrinsic": [cloud.left_intrinsic.tolist(), cloud.right_intrinsic.tolist()],
@@ -467,12 +506,14 @@ def _publish_artifacts(run_dir: Path, cloud: ProjectiveCloud, camera_ids: list[s
     }
 
 
-def _write_binary_ply(path: Path, points, colors, np) -> None:
+def _write_binary_ply(path: Path, points, colors, faces, np) -> None:
     header = (
         "ply\nformat binary_little_endian 1.0\n"
         f"element vertex {len(points)}\n"
         "property float x\nproperty float y\nproperty float z\n"
         "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        f"element face {len(faces)}\n"
+        "property list uchar int vertex_indices\n"
         "end_header\n"
     ).encode("ascii")
     vertices = np.empty(
@@ -484,11 +525,17 @@ def _write_binary_ply(path: Path, points, colors, np) -> None:
         vertices[name] = points[:, index]
     for index, name in enumerate(("r", "g", "b")):
         vertices[name] = colors[:, index]
+    triangles = np.empty(
+        len(faces), dtype=[("count", "u1"), ("indices", "<i4", (3,))]
+    )
+    triangles["count"] = 3
+    triangles["indices"] = faces
     temporary = path.with_name(f".{path.name}-{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("wb") as handle:
             handle.write(header)
             handle.write(vertices.tobytes())
+            handle.write(triangles.tobytes())
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
