@@ -50,6 +50,7 @@ from .retention import (
     source_cleanup_days,
     validate_record_mode,
 )
+from .spatial import SpatialStore, SpatialStoreError
 
 LOG = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ _GZIP_SKIP_PREFIXES = (
 # gzip+chunked full-file response breaks the browser's byte-range strategy
 # for <video> (Content-Length gone, 200 instead of clean 206 semantics) —
 # scrubbing needs cheap ranges.
-_GZIP_SKIP_SUFFIXES = (".mp4", ".m4s", ".ts", ".jpg", ".jpeg")
+_GZIP_SKIP_SUFFIXES = (".mp4", ".m4s", ".ts", ".jpg", ".jpeg", ".ply")
 _EVENT_THUMB_MAX_W = 640
 # Encounters can now represent a complete walk rather than a short detector
 # burst.  Let previews follow that span, but do not let a static false positive
@@ -766,6 +767,9 @@ def make_app(
 ) -> Starlette:
     import wanyard
     static_dir = Path(wanyard.__file__).parent / "static"
+    spatial_store = SpatialStore(
+        Path(os.environ.get("WANYARD_SPATIAL_DIR", "data/spatial"))
+    )
     health_store = None
     health_collector = None
     try:
@@ -2677,6 +2681,24 @@ def make_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def api_spatial_scenes(request: Request) -> Response:
+        return JSONResponse({"scenes": spatial_store.list_scenes()})
+
+    async def api_spatial_artifact(request: Request) -> Response:
+        try:
+            path, media_type = spatial_store.artifact(
+                request.path_params.get("scene_id", ""),
+                request.path_params.get("run_id", ""),
+                request.path_params.get("artifact_name", ""),
+            )
+        except (FileNotFoundError, SpatialStoreError):
+            return JSONResponse({"error": "artifact not found"}, status_code=404)
+        return FileResponse(
+            path,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     routes = [
         Route("/video/webrtc/{source_path}/whep", serve_webrtc_whep, methods=["POST"]),
         # Landing = the live wall (god view). A specific ?source (and not the
@@ -2689,8 +2711,11 @@ def make_app(
                           else "wall.html"),
             headers={"Cache-Control": "no-cache"})),
         Route("/detections",               lambda r: FileResponse(static_dir / "detections.html", headers={"Cache-Control": "no-cache"})),
+        Route("/spatial",                  lambda r: FileResponse(static_dir / "spatial.html", headers={"Cache-Control": "no-cache"})),
         Route("/settings",                  lambda r: FileResponse(static_dir / "settings.html", headers={"Cache-Control": "no-cache"})),
         Route("/api/health",                api_health),
+        Route("/api/spatial/scenes",        api_spatial_scenes),
+        Route("/api/spatial/{scene_id}/{run_id}/{artifact_name}", api_spatial_artifact),
         Route("/api/thumb",                 api_thumb),
         Route("/api/video/event-thumb/{event_id}", api_video_event_thumb),
         Route("/api/video/live-thumb",      api_video_live_thumb),

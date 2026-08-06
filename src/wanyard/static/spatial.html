@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Spatial — Wanyard</title>
+    <meta name="theme-color" content="#06080b">
+    <link rel="icon" href="/favicon.ico" sizes="any">
+    <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+    <link rel="stylesheet" href="/app.css">
+    <link rel="stylesheet" href="/spatial.css?v=1">
+  </head>
+  <body class="sp-body">
+    <header class="sp-header">
+      <a class="sp-brand" href="/?view=wall" aria-label="Open live camera wall">
+        <img src="/assets/favicon.svg" alt="">
+        <span>Spatial</span>
+      </a>
+      <div class="sp-scene-pick">
+        <span>Scene</span>
+        <select id="sceneSelect" aria-label="Scene"></select>
+      </div>
+      <nav class="sp-nav" aria-label="Wanyard">
+        <a href="/?view=wall">Live</a>
+        <a href="/detections">Detections</a>
+        <a href="/settings" aria-label="Settings" title="Settings">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M8 2v1.5M8 12.5V14M2 8h1.5M12.5 8H14M3.8 3.8l1 1M11.2 11.2l1 1M3.8 12.2l1-1M11.2 4.8l1-1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+        </a>
+      </nav>
+    </header>
+
+    <main class="sp-shell">
+      <section class="sp-stage" aria-label="3D reconstruction viewer">
+        <canvas id="cloudCanvas"></canvas>
+        <img id="depthImage" class="sp-depth" alt="Per-camera estimated depth" hidden>
+        <img id="fallbackImage" class="sp-fallback" alt="Point cloud preview" hidden>
+
+        <div class="sp-stage-top">
+          <div class="sp-mode-switch" role="group" aria-label="Artifact view">
+            <button class="active" type="button" data-view="cloud" aria-pressed="true">3D cloud</button>
+            <button type="button" data-view="depth" aria-pressed="false">Depth</button>
+          </div>
+          <div id="runBadge" class="sp-run-badge">Loading run</div>
+        </div>
+
+        <div id="loading" class="sp-loading">
+          <span></span>
+          <strong>Loading geometry</strong>
+          <small id="loadingDetail">Fetching reconstruction</small>
+        </div>
+
+        <div class="sp-stage-bottom">
+          <span id="interactionHint">Drag to orbit · scroll to zoom</span>
+          <div class="sp-view-tools">
+            <label>Point size <input id="pointSize" type="range" min="1" max="5" step="0.25" value="2.25"></label>
+            <button id="orbitToggle" type="button" aria-pressed="true">Orbiting</button>
+            <button id="resetView" type="button">Reset view</button>
+          </div>
+        </div>
+      </section>
+
+      <aside class="sp-panel">
+        <div class="sp-panel-head">
+          <div class="sp-eyebrow">Reconstructed scene</div>
+          <h1 id="sceneName">Front garden</h1>
+          <p id="runDescription">An exploratory spatial model assembled from synchronized camera views.</p>
+        </div>
+
+        <div class="sp-stats">
+          <div><strong id="pointCount">—</strong><span>points</span></div>
+          <div><strong id="cameraCount">—</strong><span>cameras</span></div>
+          <div><strong id="scaleType">relative</strong><span>scale</span></div>
+        </div>
+
+        <section class="sp-panel-section">
+          <h2>Camera set</h2>
+          <div id="cameraList" class="sp-cameras"></div>
+        </section>
+
+        <section class="sp-panel-section">
+          <h2>Reconstruction</h2>
+          <dl class="sp-facts">
+            <div><dt>Method</dt><dd id="runKind">Neural preview</dd></div>
+            <div><dt>Captured</dt><dd id="runDate">—</dd></div>
+            <div><dt>Geometry</dt><dd id="runStatus"><i></i> Ready</dd></div>
+          </dl>
+        </section>
+
+        <div id="warning" class="sp-warning">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2 14 13H2L8 2Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M8 6v3.2M8 11.5v.1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+          <p>Shape is visible, but measurements wait for metric calibration.</p>
+        </div>
+
+        <a id="downloadCloud" class="sp-download" href="#" download>
+          Download point cloud <span>PLY</span>
+        </a>
+      </aside>
+    </main>
+
+    <script src="/spatial.js?v=1"></script>
+  </body>
+</html>
