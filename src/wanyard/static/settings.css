@@ -495,6 +495,75 @@
   background: rgba(226, 92, 76, 0.08) !important;
 }
 
+.s-remove-dialog {
+  width: min(460px, calc(100vw - 28px));
+  margin: auto;
+  padding: 0;
+  color: var(--txt);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surf);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .62);
+}
+.s-remove-dialog::backdrop {
+  background: rgba(4, 6, 9, .76);
+  backdrop-filter: blur(4px);
+}
+.s-remove-dialog form { padding: 24px; }
+.s-remove-kicker {
+  margin-bottom: 5px;
+  color: var(--red);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.s-remove-dialog h2 {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -.02em;
+}
+.s-remove-dialog > form > p {
+  margin-top: 9px;
+  color: var(--txt-2);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.s-remove-options { margin-top: 19px; display: grid; gap: 8px; }
+.s-remove-option {
+  width: 100% !important;
+  height: auto !important;
+  padding: 12px 13px !important;
+  display: flex !important;
+  align-items: flex-start !important;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  color: var(--txt-2) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--r) !important;
+  background: var(--surf-2) !important;
+  cursor: pointer;
+}
+.s-remove-option:hover { color: var(--txt) !important; border-color: #414755 !important; }
+.s-remove-option strong { color: var(--txt); font-size: 12.5px; font-weight: 500; }
+.s-remove-option span { color: var(--txt-3); font-size: 11px; line-height: 1.4; }
+.s-remove-option.danger { border-color: rgba(226, 92, 76, .25) !important; }
+.s-remove-option.danger strong { color: var(--red); }
+.s-remove-option.danger:hover { border-color: rgba(226, 92, 76, .55) !important; }
+.s-remove-cancel {
+  width: auto !important;
+  height: 30px !important;
+  margin-top: 14px;
+  padding: 0 4px !important;
+  color: var(--txt-3) !important;
+  border: 0 !important;
+  background: transparent !important;
+  cursor: pointer;
+  font-size: 12px !important;
+}
+.s-remove-cancel:hover { color: var(--txt) !important; }
+
 /* Notification rules */
 .s-rule-summary {
   display: flex;
