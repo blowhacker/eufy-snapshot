@@ -63,7 +63,10 @@ wanyard stereo-inspect tapo-front garden-old  # geometry + moving-vehicle timing
 `stereo-inspect` reads recorded frames and detections only. Its default
 three-hour timing window looks for up to 30 shared moving vehicles, estimates
 the right-camera clock offset at 10 ms resolution, and writes a confidence
-gate, offset plot, and paired-vehicle montage alongside the geometry report.
+gate, offset plot, paired-vehicle montage, and uncalibrated rectification
+alongside the geometry report. The rectification validates the shared view but
+remains projective: lens calibration and a measured baseline are required for
+metric depth.
 
 ## Tests
 

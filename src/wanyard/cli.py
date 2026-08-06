@@ -238,6 +238,20 @@ def cmd_stereo_inspect(args, config: AppConfig) -> int:
         "dynamic stereo: "
         + ("ready" if temporal["dynamic_3d_ready"] else "not ready")
     )
+    rectification = report.get("uncalibrated_rectification") or {}
+    if rectification.get("success"):
+        state = "usable" if rectification.get("usable_shared_view") else "weak"
+        print(
+            f"projective rectification: {state}"
+            f" median_vertical={rectification['median_vertical_error_px']:.2f}px"
+            f" p95={rectification['p95_vertical_error_px']:.2f}px"
+            f" overlap={rectification['common_valid_fraction']:.1%}"
+        )
+    else:
+        print(
+            "projective rectification: unavailable"
+            f" ({rectification.get('reason', 'insufficient geometry')})"
+        )
     print(f"diagnostics: {output_dir / 'report.json'}")
     return 0
 

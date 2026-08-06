@@ -1,8 +1,11 @@
-"""Read-only two-camera feasibility inspection.
+"""Read-only two-camera feasibility inspection and projective rectification.
 
 This module intentionally stops before stereo calibration or depth.  It asks a
 smaller question: do two timestamp-addressed Wanyard sources contain enough
-shared visual structure to justify calibrating them as a stereo pair?
+shared visual structure to justify calibrating them as a stereo pair?  When
+they do, it also writes an uncalibrated (projective) rectification diagnostic.
+That is useful for validating a shared stereo view, but it is deliberately not
+reported as metric depth.
 
 Frames are always obtained through :mod:`wanyard.media_time`; this command
 never opens another RTSP connection and never treats filenames or container
@@ -276,6 +279,11 @@ def inspect_pair(
     epipolar_image = _draw_epipolar(cv2, np, left_image, right_image, analysis)
     if epipolar_image is not None:
         _write_image(cv2, output_dir / "epipolar.jpg", epipolar_image)
+    rectification, rectified_image = _rectify_uncalibrated(
+        cv2, np, left_image, right_image, analysis
+    )
+    if rectified_image is not None:
+        _write_image(cv2, output_dir / "rectified.jpg", rectified_image)
     timing_plot = _draw_timing_plot(cv2, np, timing, timing_offsets)
     _write_image(cv2, output_dir / "timing-offsets.jpg", timing_plot)
     montage = _draw_vehicle_montage(
@@ -308,6 +316,7 @@ def inspect_pair(
         "feasibility": readiness,
         "feasibility_reasons": reasons,
         "best_metrics": asdict(analysis.metrics),
+        "uncalibrated_rectification": rectification,
         "temporal_offset": timing,
         "static_offset_scan": static_observability,
         "candidates": candidates,
@@ -316,16 +325,17 @@ def inspect_pair(
             "right": "right.jpg",
             "matches": "matches.jpg",
             "epipolar": "epipolar.jpg" if epipolar_image is not None else None,
+            "rectified": "rectified.jpg" if rectified_image is not None else None,
             "timing_offsets": "timing-offsets.jpg",
             "timing_vehicles": (
                 "timing-vehicles.jpg" if montage is not None else None
             ),
         },
         "limitations": [
-            "This estimates uncalibrated two-view overlap; it does not produce depth.",
+            "Uncalibrated rectification is projective; it does not produce metric depth.",
             "Matched-feature coverage is not a measurement of the complete shared field of view.",
             "Vehicle timing estimates ingestion-time alignment, not hardware shutter synchronization.",
-            "Calibration is still required before epipolar lines become horizontal or depth is metric.",
+            "Lens calibration and a measured baseline are still required before depth is metric.",
         ],
     }
     (output_dir / "report.json").write_text(
@@ -1151,6 +1161,183 @@ def _draw_epipolar(cv2, np, left, right, analysis: _Analysis):
         cv2.circle(left_draw, tuple(np.int32(left_point)), 5, color, -1)
         cv2.circle(right_draw, tuple(np.int32(right_point)), 5, color, -1)
     return _side_by_side(cv2, left_draw, right_draw)
+
+
+def _rectify_uncalibrated(cv2, np, left, right, analysis: _Analysis):
+    """Rectify a pair from its fundamental matrix without camera intrinsics.
+
+    The returned homographies define a projective coordinate system only.  In
+    particular, they cannot turn disparity into metres.  The overlap and point
+    retention measurements guard against the common failure mode where the
+    correspondence residual looks excellent but most useful pixels were warped
+    outside the output canvas.
+    """
+    unavailable = {
+        "success": False,
+        "usable_shared_view": False,
+        "reason": "at least eight geometrically consistent matches are required",
+    }
+    if (
+        analysis.fundamental is None
+        or analysis.inlier_mask is None
+        or analysis.left_points is None
+        or analysis.right_points is None
+    ):
+        return unavailable, None
+
+    mask = np.asarray(analysis.inlier_mask).reshape(-1).astype(bool)
+    left_points = np.asarray(analysis.left_points)[mask].astype(np.float32)
+    right_points = np.asarray(analysis.right_points)[mask].astype(np.float32)
+    if len(left_points) < 8:
+        return unavailable, None
+
+    height = max(int(left.shape[0]), int(right.shape[0]))
+    width = max(int(left.shape[1]), int(right.shape[1]))
+    try:
+        success, left_h, right_h = cv2.stereoRectifyUncalibrated(
+            left_points,
+            right_points,
+            np.asarray(analysis.fundamental, dtype=np.float64),
+            (width, height),
+            threshold=5.0,
+        )
+    except cv2.error:
+        success, left_h, right_h = False, None, None
+    if not success or left_h is None or right_h is None:
+        failed = dict(unavailable)
+        failed["reason"] = "OpenCV could not find stable rectifying homographies"
+        return failed, None
+
+    left_h = np.asarray(left_h, dtype=np.float64)
+    right_h = np.asarray(right_h, dtype=np.float64)
+    if (
+        left_h.shape != (3, 3)
+        or right_h.shape != (3, 3)
+        or not np.isfinite(left_h).all()
+        or not np.isfinite(right_h).all()
+    ):
+        failed = dict(unavailable)
+        failed["reason"] = "OpenCV returned invalid rectifying homographies"
+        return failed, None
+
+    output_size = (width, height)
+    left_rectified = cv2.warpPerspective(left, left_h, output_size)
+    right_rectified = cv2.warpPerspective(right, right_h, output_size)
+    left_valid = cv2.warpPerspective(
+        np.full(left.shape[:2], 255, dtype=np.uint8),
+        left_h,
+        output_size,
+        flags=cv2.INTER_NEAREST,
+    )
+    right_valid = cv2.warpPerspective(
+        np.full(right.shape[:2], 255, dtype=np.uint8),
+        right_h,
+        output_size,
+        flags=cv2.INTER_NEAREST,
+    )
+    left_warped_points = cv2.perspectiveTransform(
+        left_points.reshape(-1, 1, 2), left_h
+    ).reshape(-1, 2)
+    right_warped_points = cv2.perspectiveTransform(
+        right_points.reshape(-1, 1, 2), right_h
+    ).reshape(-1, 2)
+    metrics = _rectification_metrics(
+        np,
+        left_warped_points,
+        right_warped_points,
+        left_valid,
+        right_valid,
+    )
+    metrics.update({
+        "success": True,
+        "left_homography": left_h.tolist(),
+        "right_homography": right_h.tolist(),
+        "output_size": {"width": width, "height": height},
+        "coordinate_system": "projective pixels (non-metric)",
+    })
+    failures: list[str] = []
+    if metrics["median_vertical_error_px"] > 1.5:
+        failures.append("median vertical residual exceeds 1.5 px")
+    if metrics["p95_vertical_error_px"] > 4.0:
+        failures.append("p95 vertical residual exceeds 4 px")
+    if metrics["point_retention_ratio"] < 0.50:
+        failures.append("fewer than half of matched points remain on both canvases")
+    if metrics["common_valid_fraction"] < 0.10:
+        failures.append("less than 10% of the output canvas contains both views")
+    if min(metrics["left_valid_fraction"], metrics["right_valid_fraction"]) < 0.35:
+        failures.append("one rectified view retains less than 35% of its canvas")
+    if metrics["valid_area_balance"] < 0.50:
+        failures.append("the two rectified views have severely imbalanced image area")
+    usable = not failures
+    metrics["usable_shared_view"] = bool(usable)
+    metrics["reason"] = (
+        "matched structure rectifies horizontally with useful retained overlap"
+        if usable else "; ".join(failures)
+    )
+    return metrics, _draw_rectified_pair(
+        cv2, left_rectified, right_rectified, left_valid, right_valid
+    )
+
+
+def _rectification_metrics(
+    np, left_points, right_points, left_valid, right_valid
+) -> dict:
+    finite = (
+        np.isfinite(left_points).all(axis=1)
+        & np.isfinite(right_points).all(axis=1)
+    )
+    height, width = left_valid.shape[:2]
+    inside = finite.copy()
+    for points in (left_points, right_points):
+        inside &= (
+            (points[:, 0] >= 0.0)
+            & (points[:, 0] < width)
+            & (points[:, 1] >= 0.0)
+            & (points[:, 1] < height)
+        )
+    errors = np.abs(left_points[finite, 1] - right_points[finite, 1])
+    if len(errors):
+        median_error = float(np.median(errors))
+        p95_error = float(np.percentile(errors, 95))
+    else:
+        median_error = float("inf")
+        p95_error = float("inf")
+    total_pixels = max(1, int(width * height))
+    left_pixels = int(np.count_nonzero(left_valid))
+    right_pixels = int(np.count_nonzero(right_valid))
+    common_pixels = int(np.count_nonzero((left_valid > 0) & (right_valid > 0)))
+    area_balance = (
+        min(left_pixels, right_pixels) / max(left_pixels, right_pixels)
+        if left_pixels and right_pixels else 0.0
+    )
+    point_count = int(len(left_points))
+    return {
+        "matched_points": point_count,
+        "points_inside_both": int(inside.sum()),
+        "point_retention_ratio": round(
+            float(inside.sum()) / max(1, point_count), 6
+        ),
+        "median_vertical_error_px": round(median_error, 6),
+        "p95_vertical_error_px": round(p95_error, 6),
+        "left_valid_fraction": round(left_pixels / total_pixels, 6),
+        "right_valid_fraction": round(right_pixels / total_pixels, 6),
+        "common_valid_fraction": round(common_pixels / total_pixels, 6),
+        "valid_area_balance": round(area_balance, 6),
+    }
+
+
+def _draw_rectified_pair(cv2, left, right, left_valid, right_valid):
+    left_draw = left.copy()
+    right_draw = right.copy()
+    left_draw[left_valid == 0] = (18, 18, 18)
+    right_draw[right_valid == 0] = (18, 18, 18)
+    combined = _side_by_side(cv2, left_draw, right_draw)
+    height = combined.shape[0]
+    spacing = max(40, round(height / 12))
+    for row, y in enumerate(range(spacing, height, spacing)):
+        color = (55, 210, 255) if row % 2 == 0 else (80, 190, 90)
+        cv2.line(combined, (0, y), (combined.shape[1] - 1, y), color, 1, cv2.LINE_AA)
+    return combined
 
 
 def _draw_line(cv2, image, line, color) -> None:

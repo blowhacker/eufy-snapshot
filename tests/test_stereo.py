@@ -106,6 +106,30 @@ class StereoInspectTests(unittest.TestCase):
             "borderline",
         )
 
+    def test_rectification_metrics_measure_alignment_and_retention(self) -> None:
+        import numpy as np
+
+        left = np.asarray([
+            [10.0, 10.0], [20.0, 20.0], [30.0, 30.0], [120.0, 40.0],
+        ])
+        right = np.asarray([
+            [12.0, 10.2], [22.0, 19.7], [32.0, 30.4], [122.0, 40.1],
+        ])
+        left_valid = np.full((100, 100), 255, dtype=np.uint8)
+        right_valid = np.zeros((100, 100), dtype=np.uint8)
+        right_valid[:, :60] = 255
+
+        result = stereo._rectification_metrics(
+            np, left, right, left_valid, right_valid
+        )
+
+        self.assertEqual(result["matched_points"], 4)
+        self.assertEqual(result["points_inside_both"], 3)
+        self.assertEqual(result["point_retention_ratio"], 0.75)
+        self.assertAlmostEqual(result["median_vertical_error_px"], 0.25)
+        self.assertEqual(result["common_valid_fraction"], 0.6)
+        self.assertEqual(result["valid_area_balance"], 0.6)
+
     def test_temporal_offset_requires_a_decisive_peak(self) -> None:
         flat = [
             {"offset_ms": offset, "metrics": {"score": score}}
