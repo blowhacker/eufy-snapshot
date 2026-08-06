@@ -208,7 +208,6 @@ def build_vggt_cloud(
     try:
         import torch
         from vggt.models.vggt import VGGT
-        from vggt.utils.geometry import unproject_depth_map_to_point_map
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     except (ImportError, ModuleNotFoundError) as exc:
         raise SpatialReconstructionError("VGGT runtime is not installed") from exc
@@ -225,7 +224,7 @@ def build_vggt_cloud(
     try:
         model = VGGT(
             enable_camera=True,
-            enable_point=False,
+            enable_point=True,
             enable_depth=True,
             enable_track=False,
         )
@@ -244,6 +243,7 @@ def build_vggt_cloud(
         model = model.eval().to(dtype=dtype)
         model.camera_head.float()
         model.depth_head.float()
+        model.point_head.float()
         model = model.to("cuda")
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
             predictions = model(images)
@@ -251,17 +251,16 @@ def build_vggt_cloud(
             predictions["pose_enc"], images.shape[-2:]
         )
         depth = predictions["depth"].squeeze(0).float().cpu().numpy()
-        confidence = predictions["depth_conf"].squeeze(0).float().cpu().numpy()
+        depth_confidence = predictions["depth_conf"].squeeze(0).float().cpu().numpy()
+        world_points = predictions["world_points"].squeeze(0).float().cpu().numpy()
+        point_confidence = predictions["world_points_conf"].squeeze(0).float().cpu().numpy()
         extrinsic_np = extrinsic.squeeze(0).float().cpu().numpy()
         intrinsic_np = intrinsic.squeeze(0).float().cpu().numpy()
-        world_points = unproject_depth_map_to_point_map(
-            depth, extrinsic_np, intrinsic_np
-        )
         rgb = (
             images.detach().float().cpu().permute(0, 2, 3, 1).numpy() * 255.0
         ).clip(0, 255).astype(np.uint8)
         points, colors = _select_vggt_points(
-            np, world_points, confidence, rgb, max_points
+            np, world_points, point_confidence, rgb, max_points
         )
         if len(points) < 10_000:
             raise SpatialReconstructionError(
@@ -273,7 +272,7 @@ def build_vggt_cloud(
             colors=colors.astype(np.uint8),
             faces=np.empty((0, 3), dtype=np.int32),
             depth=depth,
-            confidence=confidence,
+            confidence=depth_confidence,
             timestamp=float(timestamp),
             camera_ids=list(camera_ids),
             intrinsic=intrinsic_np,
@@ -741,7 +740,7 @@ def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[
     )
     _write_image_atomic(cv2, cloud_preview, _render_cloud_preview(cv2, np, cloud))
     summary = {
-        "method": "vggt-1b-depth-unprojection",
+        "method": "vggt-1b-world-point-head",
         "metric": False,
         "timestamp": cloud.timestamp,
         "camera_ids": camera_ids,
