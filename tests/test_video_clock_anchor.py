@@ -227,6 +227,20 @@ class MediaEpochAnchorTests(unittest.TestCase):
         self.assertIsNotNone(frame)
         self.assertEqual(int(frame[0, 0, 0]), 150)
 
+    def test_live_resolver_prefers_exact_chunk_over_earlier_edge_slop(self) -> None:
+        chunks = [
+            {"uri": "earlier.ts", "start_ts": 98.0, "end_ts": 100.0,
+             "duration": 2.0, "media_offset": 0.0},
+            {"uri": "exact.ts", "start_ts": 100.0, "end_ts": 102.0,
+             "duration": 2.0, "media_offset": 2.0},
+        ]
+
+        with mock.patch.object(media_time, "_live_chunks", return_value=chunks):
+            location = media_time._resolve_live(Path("video"), "front", 101.0)
+
+        assert location is not None
+        self.assertEqual(location.anchor.asset_ref, "exact.ts")
+
 
 class VideoDbLogicTests(unittest.TestCase):
     def test_live_status_returns_requested_detection_window(self) -> None:

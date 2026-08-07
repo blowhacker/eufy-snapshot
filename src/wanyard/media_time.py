@@ -386,18 +386,29 @@ def _resolve_live(video_dir: Path, source_id: str,
         return None
     window = Coverage(chunks[0]["start_ts"],
                       max(c["end_ts"] for c in chunks))
-    for c in chunks:
-        if (t >= c["start_ts"] - _LIVE_EDGE_SLOP_SECONDS
-                and t <= c["end_ts"] + _LIVE_EDGE_SLOP_SECONDS):
-            anchor = Anchor("hls", c["uri"], c["start_ts"], c["duration"])
-            return MediaLocation(
-                provider="hls",
-                url=f"/video/live/{source_id}/{c['uri']}",
-                media_offset=anchor.clock_to_media(t),
-                coverage=window,
-                anchor=anchor,
-                reason="live",
-            )
+    candidates = [
+        chunk for chunk in chunks
+        if (
+            t >= chunk["start_ts"] - _LIVE_EDGE_SLOP_SECONDS
+            and t <= chunk["end_ts"] + _LIVE_EDGE_SLOP_SECONDS
+        )
+    ]
+    if candidates:
+        def proximity(chunk):
+            start, end = float(chunk["start_ts"]), float(chunk["end_ts"])
+            interval_distance = max(start - t, t - end, 0.0)
+            return (interval_distance, abs((start + end) / 2.0 - t), -start)
+
+        c = min(candidates, key=proximity)
+        anchor = Anchor("hls", c["uri"], c["start_ts"], c["duration"])
+        return MediaLocation(
+            provider="hls",
+            url=f"/video/live/{source_id}/{c['uri']}",
+            media_offset=anchor.clock_to_media(t),
+            coverage=window,
+            anchor=anchor,
+            reason="live",
+        )
     return None  # within neither a chunk; caller decides gap vs nothing
 
 
