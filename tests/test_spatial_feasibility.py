@@ -62,32 +62,35 @@ class SpatialFeasibilityTests(unittest.TestCase):
         self.assertEqual(report["components"], [["a", "b", "c"]])
 
     @patch("wanyard.spatial_feasibility._analyze_frames")
-    @patch("wanyard.spatial_feasibility.stereo._read_frame")
-    @patch("wanyard.spatial_feasibility.stereo.latest_common_timestamp")
-    def test_pair_error_is_recorded_without_geometry(self, latest, read_frame, analyze):
-        latest.return_value = 100.0
-        read_frame.side_effect = [SimpleNamespace(frame=None, status="not_found"), SimpleNamespace(frame=object(), status="ok")]
+    @patch("wanyard.spatial_feasibility.stereo.latest_decodable_pair")
+    def test_pair_error_is_recorded_without_geometry(self, latest, analyze):
+        latest.side_effect = RuntimeError("Camera frames are not ready yet.")
         pair = feasibility._inspect_pair(object(), "/video", "a", "b", 960)
         self.assertEqual(pair["status"], "error")
         self.assertIsNone(pair["metrics"])
         analyze.assert_not_called()
 
     @patch("wanyard.spatial_feasibility._analyze_frames")
-    @patch("wanyard.spatial_feasibility.stereo._read_frame")
-    @patch("wanyard.spatial_feasibility.stereo.latest_common_timestamp", return_value=100.0)
-    def test_pair_serializes_metrics_and_classification(self, _latest, read_frame, analyze):
-        read_frame.return_value = SimpleNamespace(frame=object(), status="ok")
+    @patch("wanyard.spatial_feasibility.stereo.latest_decodable_pair")
+    def test_pair_serializes_metrics_and_classification(self, latest, analyze):
+        latest.return_value = (100.0, {
+            "a": SimpleNamespace(frame=object(), provider="hls"),
+            "b": SimpleNamespace(frame=object(), provider="hls"),
+        })
         analyze.return_value = SimpleNamespace(metrics=MatchMetrics(100, 100, 90, 80, .8, .3, .3, 1.0, 90.0))
         pair = feasibility._inspect_pair(object(), "/video", "a", "b", 960)
         self.assertEqual(pair["status"], "promising")
         self.assertEqual(pair["timestamp"], 100.0)
         self.assertEqual(pair["metrics"]["fundamental_inliers"], 80)
+        self.assertEqual(pair["frame_provider"], "live")
 
     @patch("wanyard.spatial_feasibility._analyze_frames")
-    @patch("wanyard.spatial_feasibility.stereo._read_frame")
-    @patch("wanyard.spatial_feasibility.stereo.latest_common_timestamp", return_value=100.0)
-    def test_pair_promotes_sparse_consensus_for_neural_attempt(self, _latest, read_frame, analyze):
-        read_frame.return_value = SimpleNamespace(frame=object(), status="ok")
+    @patch("wanyard.spatial_feasibility.stereo.latest_decodable_pair")
+    def test_pair_promotes_sparse_consensus_for_neural_attempt(self, latest, analyze):
+        latest.return_value = (100.0, {
+            "garden": SimpleNamespace(frame=object(), provider="mp4"),
+            "desk": SimpleNamespace(frame=object(), provider="mp4"),
+        })
         analyze.return_value = SimpleNamespace(
             metrics=MatchMetrics(4441, 2476, 10, 7, .7, .125, .145833, .000047, 5.249953)
         )

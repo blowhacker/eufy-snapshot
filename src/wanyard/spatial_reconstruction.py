@@ -128,9 +128,12 @@ def _reconstruct_run_locked(
     store.update_run(scene_id, run_id, status="running", kind=kind)
     try:
         left_id, right_id = _choose_pair(camera_ids, feasibility or {})
-        timestamp = stereo.latest_common_timestamp(video_db, left_id, right_id)
+        timestamp, anchor_results = stereo.latest_decodable_pair(
+            video_db, video_dir, left_id, right_id
+        )
         timestamp, frames, used_camera_ids, unavailable = _read_reconstruction_frames(
-            video_db, video_dir, camera_ids, left_id, right_id, timestamp
+            video_db, video_dir, camera_ids, left_id, right_id, timestamp,
+            anchor_results=anchor_results,
         )
         run_dir = store.run_directory(scene_id, run_id)
         if engine == "vggt":
@@ -202,28 +205,30 @@ def _read_reconstruction_frames(
     left_id: str,
     right_id: str,
     timestamp: float,
+    anchor_results=None,
 ):
     """Find the newest shared timestamp that both anchor cameras can decode."""
-    pair_results = None
+    pair_results = dict(anchor_results) if anchor_results is not None else None
     chosen_timestamp = float(timestamp)
-    for offset in (0.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0):
-        candidate = float(timestamp) - offset
-        results = {
-            camera_id: stereo._read_frame(video_db, video_dir, camera_id, candidate)
-            for camera_id in (left_id, right_id)
-        }
-        pair_results = results
-        if all(result.frame is not None for result in results.values()):
-            chosen_timestamp = candidate
-            break
-    else:
-        unavailable = [
-            f"{camera_id}: {pair_results[camera_id].status}"
-            for camera_id in (left_id, right_id)
-        ]
-        raise SpatialReconstructionError(
-            "frame unavailable (" + "; ".join(unavailable) + ")"
-        )
+    if pair_results is None:
+        for offset in (0.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0):
+            candidate = float(timestamp) - offset
+            results = {
+                camera_id: stereo._read_frame(video_db, video_dir, camera_id, candidate)
+                for camera_id in (left_id, right_id)
+            }
+            pair_results = results
+            if all(result.frame is not None for result in results.values()):
+                chosen_timestamp = candidate
+                break
+        else:
+            unavailable = [
+                f"{camera_id}: {pair_results[camera_id].status}"
+                for camera_id in (left_id, right_id)
+            ]
+            raise SpatialReconstructionError(
+                "frame unavailable (" + "; ".join(unavailable) + ")"
+            )
 
     results = dict(pair_results)
     for camera_id in camera_ids:

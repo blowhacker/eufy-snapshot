@@ -29,9 +29,10 @@ def inspect_camera_set(
 ) -> dict:
     """Return a compact, JSON-safe overlap report for two to sixteen cameras.
 
-    Each pair gets its newest shared finalized timestamp and exactly one
-    zero-offset geometry analysis.  A failed pair remains in the report, so a
-    single unavailable camera cannot hide useful results for the other pairs.
+    Each pair gets its newest synchronized live frames, with recent finalized
+    footage as a short fallback, and exactly one zero-offset geometry analysis.
+    A failed pair remains in the report, so one unavailable camera cannot hide
+    useful results for the other pairs.
     """
     cameras = _validate_camera_ids(camera_ids)
     if max_dimension < 320 or max_dimension > 4096:
@@ -71,16 +72,11 @@ def _inspect_pair(video_db, video_dir: Path, left: str, right: str,
                   max_dimension: int) -> dict:
     pair = {"left_camera_id": left, "right_camera_id": right}
     try:
-        timestamp = stereo.latest_common_timestamp(video_db, left, right)
-        left_frame = stereo._read_frame(video_db, video_dir, left, timestamp)
-        right_frame = stereo._read_frame(video_db, video_dir, right, timestamp)
-        if left_frame.frame is None or right_frame.frame is None:
-            unavailable = []
-            if left_frame.frame is None:
-                unavailable.append(f"{left}: {left_frame.status}")
-            if right_frame.frame is None:
-                unavailable.append(f"{right}: {right_frame.status}")
-            raise stereo.StereoInspectError("frame unavailable (" + "; ".join(unavailable) + ")")
+        timestamp, frames = stereo.latest_decodable_pair(
+            video_db, video_dir, left, right
+        )
+        left_frame = frames[left]
+        right_frame = frames[right]
         analysis = _analyze_frames(left_frame.frame, right_frame.frame, max_dimension)
         status, reasons = stereo.classify_feasibility(analysis.metrics)
         if status == "weak" and _is_neural_candidate(analysis.metrics):
@@ -93,6 +89,10 @@ def _inspect_pair(video_db, video_dir: Path, left: str, right: str,
             "status": status,
             "reasons": reasons,
             "metrics": asdict(analysis.metrics),
+            "frame_provider": (
+                "live" if "hls" in {left_frame.provider, right_frame.provider}
+                else "recorded"
+            ),
         })
     except Exception as exc:  # Pair failures are report data, not a set failure.
         pair.update({"timestamp": None, "status": "error", "reasons": [str(exc)], "metrics": None})

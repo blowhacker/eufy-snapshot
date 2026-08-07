@@ -110,6 +110,68 @@ class StereoInspectTests(unittest.TestCase):
         with self.assertRaisesRegex(stereo.StereoInspectError, "no shared finalized"):
             stereo.latest_common_timestamp(db, "desk", "garden")
 
+    def test_latest_live_common_timestamp_uses_shared_clock_window(self) -> None:
+        windows = {
+            "front": {"start_ts": 100.0, "end_ts": 200.0},
+            "garden": {"start_ts": 120.0, "end_ts": 190.0},
+        }
+        with mock.patch.object(
+            stereo.media_time, "live_window",
+            side_effect=lambda _directory, source_id: windows[source_id],
+        ):
+            timestamp = stereo.latest_live_common_timestamp(
+                Path("video"), "front", "garden"
+            )
+
+        self.assertEqual(timestamp, 189.0)
+
+    def test_latest_decodable_pair_prefers_live_frames(self) -> None:
+        frame = object()
+        windows = {
+            "front": {"start_ts": 100.0, "end_ts": 200.0},
+            "garden": {"start_ts": 120.0, "end_ts": 190.0},
+        }
+        with (
+            mock.patch.object(
+                stereo.media_time, "live_window",
+                side_effect=lambda _directory, source_id: windows[source_id],
+            ),
+            mock.patch.object(
+                stereo, "_read_frame",
+                side_effect=lambda _db, _directory, source_id, _timestamp:
+                    SimpleNamespace(frame=frame, status="ok", provider="hls"),
+            ),
+            mock.patch.object(stereo, "latest_common_timestamp") as finalized,
+        ):
+            timestamp, results = stereo.latest_decodable_pair(
+                object(), Path("video"), "front", "garden"
+            )
+
+        self.assertEqual(timestamp, 189.0)
+        self.assertIs(results["front"].frame, frame)
+        finalized.assert_not_called()
+
+    def test_latest_decodable_pair_hides_cli_only_error(self) -> None:
+        windows = {
+            "front": {"start_ts": 100.0, "end_ts": 200.0},
+            "garden": {"start_ts": 120.0, "end_ts": 190.0},
+        }
+        pending = SimpleNamespace(frame=None, status="pending", provider="hls")
+        with (
+            mock.patch.object(
+                stereo.media_time, "live_window",
+                side_effect=lambda _directory, source_id: windows[source_id],
+            ),
+            mock.patch.object(stereo, "_read_frame", return_value=pending),
+        ):
+            with self.assertRaises(stereo.StereoInspectError) as raised:
+                stereo.latest_decodable_pair(
+                    object(), Path("video"), "front", "garden"
+                )
+
+        self.assertIn("few seconds", str(raised.exception))
+        self.assertNotIn("--at", str(raised.exception))
+
     def test_grid_coverage_counts_spatial_cells_not_convex_hull(self) -> None:
         points = [(1, 1), (99, 1), (1, 99), (99, 99), (99, 99)]
         self.assertAlmostEqual(

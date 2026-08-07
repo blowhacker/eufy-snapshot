@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -152,6 +153,83 @@ def latest_common_timestamp(video_db, left_source: str, right_source: str,
     overlap_start, overlap_end = max(overlaps, key=lambda value: value[1])
     candidate = overlap_end - max(0.0, float(edge_margin_seconds))
     return max(overlap_start, candidate)
+
+
+def latest_live_common_timestamp(
+    video_dir: Path,
+    left_source: str,
+    right_source: str,
+    edge_margin_seconds: float = 1.0,
+) -> float:
+    """Return a recent clock timestamp covered by both live HLS windows."""
+    windows = [
+        media_time.live_window(Path(video_dir), source_id)
+        for source_id in (left_source, right_source)
+    ]
+    if any(window is None for window in windows):
+        raise StereoInspectError("both live camera windows are not ready")
+    start = max(float(window["start_ts"]) for window in windows)
+    end = min(float(window["end_ts"]) for window in windows)
+    if end <= start:
+        raise StereoInspectError("the live camera windows do not overlap")
+    candidate = end - max(0.0, float(edge_margin_seconds))
+    return max(start, candidate)
+
+
+def latest_decodable_pair(
+    video_db,
+    video_dir: Path,
+    left_source: str,
+    right_source: str,
+    *,
+    max_finalized_age_seconds: float = 120.0,
+):
+    """Read the newest synchronized pair, preferring live clock-anchored HLS."""
+    video_dir = Path(video_dir)
+    live_windows = [
+        media_time.live_window(video_dir, source_id)
+        for source_id in (left_source, right_source)
+    ]
+    candidates: list[float] = []
+    if all(window is not None for window in live_windows):
+        start = max(float(window["start_ts"]) for window in live_windows)
+        end = min(float(window["end_ts"]) for window in live_windows)
+        if end > start:
+            edge = max(start, end - 1.0)
+            candidates.extend(
+                candidate for candidate in (edge, edge - 1.0, edge - 2.0, edge - 4.0)
+                if candidate >= start
+            )
+    else:
+        try:
+            finalized = latest_common_timestamp(video_db, left_source, right_source)
+        except StereoInspectError:
+            finalized = None
+        if (
+            finalized is not None
+            and time.time() - float(finalized) <= float(max_finalized_age_seconds)
+        ):
+            candidates.extend(
+                float(finalized) - offset for offset in (0.0, 5.0, 10.0, 20.0)
+            )
+
+    seen = set()
+    for candidate in candidates:
+        key = round(float(candidate), 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        results = {
+            source_id: _read_frame(video_db, video_dir, source_id, float(candidate))
+            for source_id in (left_source, right_source)
+        }
+        if all(result.frame is not None for result in results.values()):
+            return float(candidate), results
+
+    raise StereoInspectError(
+        "Camera frames are not ready yet. Keep both cameras live for a few "
+        "seconds, then check overlap again."
+    )
 
 
 def _closed_segment_coverage(row: dict) -> tuple[float, float] | None:
