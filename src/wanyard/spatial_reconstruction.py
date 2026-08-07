@@ -261,7 +261,6 @@ def build_vggt_cloud(
     try:
         import torch
         from vggt.models.vggt import VGGT
-        from vggt.utils.geometry import unproject_depth_map_to_point_map
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     except (ImportError, ModuleNotFoundError) as exc:
         raise SpatialReconstructionError("VGGT runtime is not installed") from exc
@@ -302,13 +301,10 @@ def build_vggt_cloud(
         )
         depth = predictions["depth"].squeeze(0).float().cpu().numpy()
         depth_confidence = predictions["depth_conf"].squeeze(0).float().cpu().numpy()
-        raw_world_points = predictions["world_points"].squeeze(0).float().cpu().numpy()
+        world_points = predictions["world_points"].squeeze(0).float().cpu().numpy()
         point_confidence = predictions["world_points_conf"].squeeze(0).float().cpu().numpy()
         extrinsic_np = extrinsic.squeeze(0).float().cpu().numpy()
         intrinsic_np = intrinsic.squeeze(0).float().cpu().numpy()
-        world_points = unproject_depth_map_to_point_map(
-            depth, extrinsic_np, intrinsic_np
-        ).astype(np.float32)
         depth_values = depth[..., 0] if depth.ndim == 4 else depth
         depth_edges = _depth_edge_mask(np, depth_values, rtol=0.03)
         cross_view_valid = _cross_view_consistency_mask(
@@ -320,11 +316,15 @@ def build_vggt_cloud(
             images.detach().float().cpu().permute(0, 2, 3, 1).numpy() * 255.0
         ).clip(0, 255).astype(np.uint8)
         points, colors, selected = _select_vggt_points(
-            np, world_points, depth_confidence, rgb, max_points, clean_valid
+            np, world_points, point_confidence, rgb, max_points, clean_valid
         )
         raw_points, raw_colors, raw_selected = _select_vggt_points(
-            np, raw_world_points, point_confidence, rgb, max_points, live_valid
+            np, world_points, point_confidence, rgb, max_points, live_valid
         )
+        spatial_support, spatial_stats = _spatial_support_mask(np, points)
+        points = points[spatial_support]
+        colors = colors[spatial_support]
+        selected = selected[spatial_support]
         if len(points) < 10_000:
             raise SpatialReconstructionError(
                 f"VGGT retained only {len(points)} confident scene points"
@@ -344,7 +344,7 @@ def build_vggt_cloud(
             raw_live_uv=live_uv.reshape(-1, 2)[raw_selected].astype(np.float32),
             raw_live_camera_indices=np.repeat(
                 np.arange(len(camera_ids), dtype=np.uint8),
-                raw_world_points.shape[1] * raw_world_points.shape[2],
+                world_points.shape[1] * world_points.shape[2],
             )[raw_selected],
             depth=depth,
             confidence=depth_confidence,
@@ -363,6 +363,7 @@ def build_vggt_cloud(
                 ),
                 "depth_edge_relative_tolerance": 0.03,
                 "cross_view_relative_tolerance": 0.08,
+                **spatial_stats,
             },
         )
     except torch.cuda.OutOfMemoryError as exc:
@@ -537,6 +538,44 @@ def _cross_view_consistency_mask(
             )
         keep[source_index] = ~contradicted.reshape(height, width)
     return keep
+
+
+def _spatial_support_mask(
+    np, points, *, neighbors: int = 8, mad_multiplier: float = 3.0,
+    tree_factory=None,
+):
+    """Remove sparse 3D outliers using a scale-independent neighbor test."""
+    values = np.asarray(points)
+    if len(values) <= neighbors:
+        return np.ones(len(values), dtype=bool), {
+            "spatial_outliers_removed": 0,
+            "spatial_neighbor_count": int(neighbors),
+            "spatial_mad_multiplier": float(mad_multiplier),
+        }
+    if tree_factory is None:
+        try:
+            from scipy.spatial import cKDTree
+        except (ImportError, ModuleNotFoundError):
+            return np.ones(len(values), dtype=bool), {
+                "spatial_outliers_removed": 0,
+                "spatial_neighbor_count": int(neighbors),
+                "spatial_mad_multiplier": float(mad_multiplier),
+                "spatial_filter_unavailable": True,
+            }
+        tree_factory = cKDTree
+    distances = tree_factory(values).query(
+        values, k=min(int(neighbors) + 1, len(values)), workers=-1,
+    )[0]
+    mean_neighbor_distance = distances[:, 1:].mean(axis=1)
+    median = float(np.median(mean_neighbor_distance))
+    mad = float(np.median(np.abs(mean_neighbor_distance - median)))
+    threshold = median + float(mad_multiplier) * max(mad, 1e-9)
+    keep = np.isfinite(mean_neighbor_distance) & (mean_neighbor_distance <= threshold)
+    return keep, {
+        "spatial_outliers_removed": int((~keep).sum()),
+        "spatial_neighbor_count": int(neighbors),
+        "spatial_mad_multiplier": float(mad_multiplier),
+    }
 
 
 def build_projective_cloud(
@@ -973,7 +1012,7 @@ def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[
     )
     _write_image_atomic(cv2, cloud_preview, _render_cloud_preview(cv2, np, cloud))
     summary = {
-        "method": "vggt-1b-depth-unprojection",
+        "method": "vggt-1b-world-point-head-filtered",
         "raw_method": "vggt-1b-world-point-head",
         "metric": False,
         "timestamp": cloud.timestamp,

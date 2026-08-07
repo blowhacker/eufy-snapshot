@@ -58,6 +58,31 @@ class SpatialReconstructionTests(unittest.TestCase):
         self.assertTrue(mask[0, 0, 0])
         self.assertTrue(mask[1].all())
 
+    def test_spatial_support_filter_removes_sparse_outlier(self):
+        class BruteTree:
+            def __init__(self, values):
+                self.values = values
+
+            def query(self, values, k, workers):
+                distances = np.linalg.norm(
+                    values[:, None, :] - self.values[None, :, :], axis=2
+                )
+                return np.sort(distances, axis=1)[:, :k], None
+
+        cluster = np.asarray([
+            [x, y, 0.0] for x in (0.0, 0.1, 0.2) for y in (0.0, 0.1, 0.2)
+        ], dtype=np.float32)
+        points = np.concatenate([cluster, [[10.0, 10.0, 10.0]]], axis=0)
+
+        keep, stats = reconstruction._spatial_support_mask(
+            np, points, neighbors=3, mad_multiplier=3.0,
+            tree_factory=BruteTree,
+        )
+
+        self.assertTrue(keep[:-1].all())
+        self.assertFalse(keep[-1])
+        self.assertEqual(stats["spatial_outliers_removed"], 1)
+
     def test_reconstruction_steps_back_from_an_undecodable_segment_tail(self):
         frame = np.zeros((4, 4, 3), dtype=np.uint8)
 
