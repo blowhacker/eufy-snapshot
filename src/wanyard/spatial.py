@@ -21,9 +21,20 @@ _ARTIFACT_MEDIA_TYPES = {
     ".png": "image/png",
 }
 
+SPATIAL_POINT_BUDGETS = (120_000, 300_000, 500_000)
+DEFAULT_SPATIAL_POINT_BUDGET = 300_000
+LEGACY_SPATIAL_POINT_BUDGET = 120_000
+
 
 class SpatialStoreError(ValueError):
     pass
+
+
+def validate_spatial_point_budget(value: object) -> int:
+    if isinstance(value, bool) or value not in SPATIAL_POINT_BUDGETS:
+        choices = ", ".join(str(item) for item in SPATIAL_POINT_BUDGETS)
+        raise SpatialStoreError(f"point_budget must be one of: {choices}")
+    return int(value)
 
 
 class SpatialStore:
@@ -44,6 +55,7 @@ class SpatialStore:
         feasibility: dict | str | None = None,
         *,
         feasibility_id: str | None = None,
+        point_budget: int = DEFAULT_SPATIAL_POINT_BUDGET,
     ) -> dict:
         """Persist a new scene with a queued reconstruction run.
 
@@ -55,6 +67,7 @@ class SpatialStore:
         clean_name = self._validate_scene_name(name)
         clean_camera_ids = self._validate_camera_ids(camera_ids)
         feasibility_data = self._feasibility_data(feasibility, feasibility_id)
+        point_budget = validate_spatial_point_budget(point_budget)
 
         self.root.mkdir(parents=True, exist_ok=True)
         for _ in range(32):
@@ -79,6 +92,7 @@ class SpatialStore:
                     "kind": "vggt_neural",
                     "metric": False,
                     "status": "queued",
+                    "point_budget": point_budget,
                 },
                 "artifacts": {},
             }
@@ -88,9 +102,15 @@ class SpatialStore:
             return manifest
         raise SpatialStoreError("could not allocate a unique scene run")
 
-    def queue_run(self, scene_id: str) -> tuple[dict, bool]:
+    def queue_run(
+        self,
+        scene_id: str,
+        *,
+        point_budget: int = DEFAULT_SPATIAL_POINT_BUDGET,
+    ) -> tuple[dict, bool]:
         """Queue one replacement run, returning an existing active run idempotently."""
         self._validate_identifier(scene_id, "scene")
+        point_budget = validate_spatial_point_budget(point_budget)
         with self._mutation_lock:
             manifests = self._scene_manifests(scene_id)
             if not manifests:
@@ -116,6 +136,7 @@ class SpatialStore:
                         "kind": "vggt_neural",
                         "metric": False,
                         "status": "queued",
+                        "point_budget": point_budget,
                     },
                     "artifacts": {},
                 }
@@ -217,6 +238,9 @@ class SpatialStore:
                 "camera_ids": list(manifest["scene"]["camera_ids"]),
                 "created_at": str(manifest["run"].get("created_at", "")),
                 "feasibility": manifest.get("feasibility", {}),
+                "point_budget": manifest["run"].get(
+                    "point_budget", LEGACY_SPATIAL_POINT_BUDGET
+                ),
             })
         pending.sort(key=lambda job: (job["created_at"], job["scene_id"], job["run_id"]))
         return pending
@@ -386,6 +410,8 @@ class SpatialStore:
             raise SpatialStoreError("invalid run id")
         self._validate_scene_name(scene.get("name"))
         self._validate_camera_ids(camera_ids)
+        if "point_budget" in run:
+            validate_spatial_point_budget(run["point_budget"])
         if any(not _IDENTIFIER.fullmatch(str(name or "")) for name in artifacts):
             raise SpatialStoreError("invalid artifact name")
         return manifest

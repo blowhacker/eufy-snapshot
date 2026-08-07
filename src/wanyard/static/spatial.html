@@ -8,7 +8,7 @@
     <link rel="icon" href="/favicon.ico" sizes="any">
     <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/spatial.css?v=5">
+    <link rel="stylesheet" href="/spatial.css?v=6">
   </head>
   <body class="sp-body">
     <header class="sp-header">
@@ -54,6 +54,11 @@
         <div class="sp-stage-bottom">
           <span id="interactionHint">Drag to orbit · scroll to zoom</span>
           <div class="sp-view-tools">
+            <select id="geometryDensity" aria-label="Point budget for the next geometry refresh" title="Point budget for the next geometry refresh">
+              <option value="120000">120k · standard</option>
+              <option value="300000">300k · high</option>
+              <option value="500000">500k · maximum</option>
+            </select>
             <button id="refreshGeometry" type="button" disabled>Refresh geometry</button>
             <label>Point size <input id="pointSize" type="range" min="1" max="5" step="0.25" value="2.25"></label>
             <button id="liveToggle" type="button" aria-pressed="false" disabled>Live unavailable</button>
@@ -126,6 +131,6 @@
     </div>
 
     <script src="/spatial-view.js?v=1"></script>
-    <script src="/spatial.js?v=15"></script>
+    <script src="/spatial.js?v=16"></script>
   </body>
 </html>

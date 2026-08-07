@@ -50,7 +50,12 @@ from .retention import (
     source_cleanup_days,
     validate_record_mode,
 )
-from .spatial import SpatialStore, SpatialStoreError
+from .spatial import (
+    DEFAULT_SPATIAL_POINT_BUDGET,
+    SpatialStore,
+    SpatialStoreError,
+    validate_spatial_point_budget,
+)
 from .spatial_feasibility import (
     SpatialFeasibilityError,
     inspect_camera_set,
@@ -2808,6 +2813,12 @@ def make_app(
         name = body.get("name")
         camera_ids = body.get("camera_ids")
         feasibility_id = body.get("feasibility_id")
+        try:
+            point_budget = validate_spatial_point_budget(
+                body.get("point_budget", DEFAULT_SPATIAL_POINT_BUDGET)
+            )
+        except SpatialStoreError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
             return JSONResponse(
                 {"error": "name must be between 1 and 80 characters"}, status_code=400
@@ -2867,6 +2878,7 @@ def make_app(
                 name.strip(),
                 camera_ids,
                 report,
+                point_budget=point_budget,
             )
         except SpatialStoreError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -2903,6 +2915,20 @@ def make_app(
 
     async def api_spatial_runs(request: Request) -> Response:
         scene_id = request.path_params.get("scene_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"}, status_code=400
+            )
+        try:
+            point_budget = validate_spatial_point_budget(
+                body.get("point_budget", DEFAULT_SPATIAL_POINT_BUDGET)
+            )
+        except SpatialStoreError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         scene = next(
             (item for item in spatial_store.list_scenes() if item["id"] == scene_id),
             None,
@@ -2920,7 +2946,7 @@ def make_app(
             )
         try:
             manifest, created = await asyncio.to_thread(
-                spatial_store.queue_run, scene_id
+                spatial_store.queue_run, scene_id, point_budget=point_budget
             )
         except FileNotFoundError:
             return JSONResponse({"error": "spatial view not found"}, status_code=404)

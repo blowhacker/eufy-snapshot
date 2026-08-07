@@ -8,6 +8,7 @@
   const loadingDetail = document.getElementById('loadingDetail');
   const sceneSelect = document.getElementById('sceneSelect');
   const refreshButton = document.getElementById('refreshGeometry');
+  const densitySelect = document.getElementById('geometryDensity');
   const refreshMessage = document.getElementById('refreshMessage');
   const state = { scenes: [], scene: null, run: null, pendingRun: null, viewer: null, sources: [], feasibility: null, previousFocus: null, runPoll: null };
 
@@ -33,6 +34,17 @@
     const run = state.run;
     document.getElementById('sceneName').textContent = scene.name;
     document.getElementById('pointCount').textContent = Number(run.stats.points || 0).toLocaleString();
+    const runs = sceneRunState(scene);
+    const selectedBudget = Number(
+      runs.pending?.point_budget
+      || runs.failure?.point_budget
+      || run.point_budget
+      || run.stats.point_budget
+      || 120000
+    );
+    if (Array.from(densitySelect.options).some(option => Number(option.value) === selectedBudget)) {
+      densitySelect.value = String(selectedBudget);
+    }
     document.getElementById('cameraCount').textContent = scene.camera_ids.length.toLocaleString();
     document.getElementById('scaleType').textContent = run.metric ? 'metric' : 'relative';
     document.getElementById('runKind').textContent = niceLabel(run.kind || 'reconstruction');
@@ -86,6 +98,7 @@
       const running = pending.status === 'running';
       const status = running ? `Reconstructing · ${elapsedSeconds(pending)}s` : 'Geometry queued';
       refreshButton.disabled = true;
+      densitySelect.disabled = true;
       refreshButton.textContent = status;
       refreshMessage.hidden = false;
       refreshMessage.className = 'sp-refresh-message busy';
@@ -96,6 +109,7 @@
       return;
     }
     refreshButton.disabled = !(state.scene && state.run?.artifacts?.point_cloud);
+    densitySelect.disabled = refreshButton.disabled;
     refreshButton.textContent = failure ? 'Retry geometry' : 'Refresh geometry';
     if (failure) {
       refreshMessage.hidden = false;
@@ -869,6 +883,7 @@
     document.getElementById('downloadCloud').hidden = true;
     document.getElementById('removeSpatialView').hidden = true;
     refreshButton.disabled = true;
+    densitySelect.disabled = true;
     refreshButton.textContent = 'Refresh geometry';
     refreshMessage.hidden = true;
   }
@@ -876,15 +891,21 @@
   async function refreshGeometry() {
     if (!state.scene || !state.run?.artifacts?.point_cloud || state.pendingRun) return;
     const sceneId = state.scene.id;
+    const pointBudget = Number(densitySelect.value);
     refreshButton.disabled = true;
+    densitySelect.disabled = true;
     refreshButton.textContent = 'Queuing geometry…';
     refreshMessage.hidden = false;
     refreshMessage.className = 'sp-refresh-message busy';
-    refreshMessage.textContent = 'Requesting a new reconstruction. The current model remains active.';
+    refreshMessage.textContent = `Requesting up to ${pointBudget.toLocaleString()} points. The current model remains active.`;
     try {
       const response = await fetch(
         '/api/spatial/scenes/' + encodeURIComponent(sceneId) + '/runs',
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ point_budget: pointBudget }),
+        },
       );
       if (!response.ok) throw await responseError(response, 'Unable to refresh geometry');
       const payload = await response.json();

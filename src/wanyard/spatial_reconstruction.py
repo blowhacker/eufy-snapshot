@@ -20,7 +20,12 @@ from pathlib import Path
 import uuid
 
 from . import stereo
-from .spatial import SpatialStore
+from .spatial import (
+    DEFAULT_SPATIAL_POINT_BUDGET,
+    LEGACY_SPATIAL_POINT_BUDGET,
+    SpatialStore,
+    validate_spatial_point_budget,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -86,6 +91,7 @@ def process_next_run(store: SpatialStore, video_db, video_dir: Path) -> bool:
         job["run_id"],
         job["camera_ids"],
         job.get("feasibility", {}),
+        point_budget=job.get("point_budget", LEGACY_SPATIAL_POINT_BUDGET),
     )
     return True
 
@@ -98,8 +104,11 @@ def reconstruct_run(
     run_id: str,
     camera_ids: list[str],
     feasibility: dict | None = None,
+    *,
+    point_budget: int = DEFAULT_SPATIAL_POINT_BUDGET,
 ) -> dict:
     """Build one run while holding an inter-process ownership lock."""
+    point_budget = validate_spatial_point_budget(point_budget)
     lock_path = store.run_directory(scene_id, run_id) / ".reconstruction.lock"
     with lock_path.open("a+b") as lock:
         try:
@@ -109,7 +118,8 @@ def reconstruct_run(
                 f"spatial run {run_id} is already being reconstructed"
             ) from exc
         return _reconstruct_run_locked(
-            store, video_db, video_dir, scene_id, run_id, camera_ids, feasibility
+            store, video_db, video_dir, scene_id, run_id, camera_ids, feasibility,
+            point_budget,
         )
 
 
@@ -121,6 +131,7 @@ def _reconstruct_run_locked(
     run_id: str,
     camera_ids: list[str],
     feasibility: dict | None = None,
+    point_budget: int = DEFAULT_SPATIAL_POINT_BUDGET,
 ) -> dict:
     """Build and publish one queued projective point-cloud preview."""
     engine = os.environ.get("WANYARD_SPATIAL_ENGINE", "vggt").strip().lower()
@@ -144,6 +155,7 @@ def _reconstruct_run_locked(
                 model_path=Path(os.environ.get(
                     "WANYARD_SPATIAL_MODEL", "/app/models/vggt/model.pt"
                 )),
+                max_points=point_budget,
             )
             artifacts = _publish_vggt_artifacts(run_dir, cloud, camera_ids)
             published_point_count = len(cloud.raw_points)
@@ -157,6 +169,7 @@ def _reconstruct_run_locked(
                 timestamp=timestamp,
                 left_camera_id=left_id,
                 right_camera_id=right_id,
+                max_points=point_budget,
             )
             artifacts = _publish_artifacts(run_dir, cloud, camera_ids)
             published_point_count = len(cloud.points)
@@ -174,6 +187,7 @@ def _reconstruct_run_locked(
             artifacts=artifacts,
             stats={
                 "points": int(published_point_count),
+                "point_budget": int(point_budget),
                 "faces": int(len(cloud.faces)),
                 "camera_count": len(camera_ids),
                 "reconstructed_camera_count": len(used_camera_ids),

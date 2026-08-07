@@ -21,6 +21,25 @@ from wanyard import spatial_reconstruction as reconstruction
 
 
 class SpatialReconstructionTests(unittest.TestCase):
+    def test_worker_passes_the_persisted_point_budget_to_reconstruction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpatialStore(Path(directory) / "spatial")
+            manifest = store.create_scene(
+                "Front", ["front", "garden"], point_budget=500_000
+            )
+            with mock.patch.object(
+                reconstruction, "reconstruct_run", return_value={}
+            ) as reconstruct:
+                found = reconstruction.process_next_run(
+                    store, object(), Path(directory) / "video"
+                )
+
+            self.assertTrue(found)
+            self.assertEqual(reconstruct.call_args.kwargs["point_budget"], 500_000)
+            self.assertEqual(
+                reconstruct.call_args.args[4], manifest["run"]["id"]
+            )
+
     def test_depth_edge_mask_marks_relative_discontinuities(self):
         depth = np.ones((1, 5, 5), dtype=np.float32)
         depth[0, 2, 2] = 2.0
@@ -172,7 +191,9 @@ class SpatialReconstructionTests(unittest.TestCase):
                     return_value=(123.0, {"front": frame, "garden": frame}),
                 ),
                 mock.patch.object(reconstruction.stereo, "_read_frame", return_value=frame),
-                mock.patch.object(reconstruction, "build_projective_cloud", return_value=cloud),
+                mock.patch.object(
+                    reconstruction, "build_projective_cloud", return_value=cloud
+                ) as build_cloud,
             ):
                 result = reconstruction.reconstruct_run(
                     store, object(), root / "video", scene_id, run_id,
@@ -182,6 +203,8 @@ class SpatialReconstructionTests(unittest.TestCase):
             self.assertEqual(result["run"]["status"], "ready")
             self.assertEqual(result["run"]["kind"], "opencv_projective")
             self.assertEqual(result["stats"]["points"], 3)
+            self.assertEqual(result["stats"]["point_budget"], 300_000)
+            self.assertEqual(build_cloud.call_args.kwargs["max_points"], 300_000)
             self.assertEqual(result["stats"]["faces"], 1)
             self.assertEqual(result["warnings"], [])
             run_dir = store.run_directory(scene_id, run_id)
