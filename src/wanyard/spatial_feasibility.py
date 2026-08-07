@@ -83,6 +83,11 @@ def _inspect_pair(video_db, video_dir: Path, left: str, right: str,
             raise stereo.StereoInspectError("frame unavailable (" + "; ".join(unavailable) + ")")
         analysis = _analyze_frames(left_frame.frame, right_frame.frame, max_dimension)
         status, reasons = stereo.classify_feasibility(analysis.metrics)
+        if status == "weak" and _is_neural_candidate(analysis.metrics):
+            status = "borderline"
+            reasons = [
+                "sparse but strongly consistent shared structure is suitable for a neural reconstruction attempt"
+            ]
         pair.update({
             "timestamp": float(timestamp),
             "status": status,
@@ -92,6 +97,26 @@ def _inspect_pair(video_db, video_dir: Path, left: str, right: str,
     except Exception as exc:  # Pair failures are report data, not a set failure.
         pair.update({"timestamp": None, "status": "error", "reasons": [str(exc)], "metrics": None})
     return pair
+
+
+def _is_neural_candidate(metrics) -> bool:
+    """Accept sparse, wide-baseline evidence that VGGT can resolve.
+
+    Classical feature count is deliberately still the primary gate. This
+    exception requires the minimum geometry for a fundamental matrix, strong
+    consensus, distributed matches in both images, and a stable epipolar fit.
+    It is scoped to spatial reconstruction rather than changing the stricter
+    OpenCV stereo classification used elsewhere.
+    """
+    coverage = min(metrics.left_grid_coverage, metrics.right_grid_coverage)
+    error = metrics.median_epipolar_error_px
+    return (
+        metrics.fundamental_inliers >= 7
+        and metrics.inlier_ratio >= 0.55
+        and coverage >= 0.10
+        and error is not None
+        and error <= 1.5
+    )
 
 
 def _analyze_frames(left_frame, right_frame, max_dimension: int):
