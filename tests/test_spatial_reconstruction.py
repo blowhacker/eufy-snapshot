@@ -21,6 +21,27 @@ from wanyard import spatial_reconstruction as reconstruction
 
 
 class SpatialReconstructionTests(unittest.TestCase):
+    def test_live_map_preserves_point_order_and_camera_pixels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live-map.bin"
+            uv = np.asarray([[0.125, 0.25], [0.75, 0.875]], dtype=np.float32)
+            cameras = np.asarray([0, 1], dtype=np.uint8)
+
+            reconstruction._write_live_map(path, uv, cameras, 2, np)
+
+            payload = path.read_bytes()
+            self.assertEqual(payload[:4], b"WYLM")
+            self.assertEqual(int.from_bytes(payload[4:6], "little"), 1)
+            self.assertEqual(int.from_bytes(payload[6:8], "little"), 2)
+            self.assertEqual(int.from_bytes(payload[8:12], "little"), 2)
+            records = np.frombuffer(
+                payload[12:],
+                dtype=[("u", "<f4"), ("v", "<f4"), ("camera", "u1"), ("padding", "u1", (3,))],
+            )
+            np.testing.assert_allclose(records["u"], uv[:, 0])
+            np.testing.assert_allclose(records["v"], uv[:, 1])
+            np.testing.assert_array_equal(records["camera"], cameras)
+
     def test_choose_pair_uses_strongest_usable_feasibility_edge(self):
         pair = reconstruction._choose_pair(["a", "b", "c"], {"pairs": [
             {"left_camera_id": "a", "right_camera_id": "b", "status": "borderline", "metrics": {"score": 4}},

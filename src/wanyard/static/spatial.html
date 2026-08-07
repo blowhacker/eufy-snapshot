@@ -8,7 +8,7 @@
     <link rel="icon" href="/favicon.ico" sizes="any">
     <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/spatial.css?v=3">
+    <link rel="stylesheet" href="/spatial.css?v=4">
   </head>
   <body class="sp-body">
     <header class="sp-header">
@@ -38,8 +38,8 @@
 
         <div class="sp-stage-top">
           <div class="sp-mode-switch" role="group" aria-label="Artifact view">
-            <button class="active" type="button" data-view="overview" aria-pressed="true">Overview</button>
-            <button type="button" data-view="cloud" aria-pressed="false">Explore 3D</button>
+            <button type="button" data-view="overview" aria-pressed="false">Overview</button>
+            <button class="active" type="button" data-view="cloud" aria-pressed="true">Explore 3D</button>
             <button type="button" data-view="depth" aria-pressed="false">Depth</button>
           </div>
           <div id="runBadge" class="sp-run-badge">Loading run</div>
@@ -55,6 +55,7 @@
           <span id="interactionHint">Drag to orbit · scroll to zoom</span>
           <div class="sp-view-tools">
             <label>Point size <input id="pointSize" type="range" min="1" max="5" step="0.25" value="2.25"></label>
+            <button id="liveToggle" type="button" aria-pressed="false" disabled>Live unavailable</button>
             <button id="orbitToggle" type="button" aria-pressed="false">Orbit paused</button>
             <button id="resetView" type="button">Reset view</button>
           </div>
@@ -122,6 +123,6 @@
       </section>
     </div>
 
-    <script src="/spatial.js?v=11"></script>
+    <script src="/spatial.js?v=12"></script>
   </body>
 </html>

@@ -180,6 +180,7 @@
 .sp-view-tools input { width: 70px; accent-color: var(--sp-cyan); }
 .sp-view-tools button { padding: 6px 8px; background: var(--sp-glass); font-size: 11px; }
 .sp-view-tools button:hover { color: var(--txt); }
+.sp-view-tools button[aria-pressed="true"] { color: var(--sp-cyan); border-color: rgba(101, 226, 221, .42); }
 
 .sp-loading {
   position: absolute;

@@ -102,14 +102,21 @@
     loading.querySelector('strong').textContent = 'Loading geometry';
     loadingDetail.textContent = 'Fetching point cloud';
     try {
-      const response = await fetch(artifactUrl('point_cloud'));
+      const [response, liveMapResponse] = await Promise.all([
+        fetch(artifactUrl('point_cloud')),
+        state.run.artifacts.live_map ? fetch(artifactUrl('live_map')) : Promise.resolve(null),
+      ]);
       if (!response.ok) throw new Error('Point cloud returned ' + response.status);
       const buffer = await response.arrayBuffer();
       loadingDetail.textContent = 'Preparing ' + (runPointCount(buffer) || 'the') + ' points';
       const cloud = parsePly(buffer);
+      const liveMap = liveMapResponse && liveMapResponse.ok
+        ? parseLiveMap(await liveMapResponse.arrayBuffer(), cloud.count)
+        : null;
+      const liveCameraIds = state.run.stats?.reconstructed_camera_ids || state.scene.camera_ids;
       if (state.viewer) state.viewer.destroy();
-      state.viewer = createViewer(canvas, cloud);
-      setArtifactView('overview');
+      state.viewer = createViewer(canvas, cloud, liveMap, liveCameraIds);
+      setArtifactView('cloud');
       loading.hidden = true;
     } catch (error) {
       console.error(error);
@@ -194,6 +201,31 @@
     return { count, positions, colors, indices: faceValues.length ? new Uint32Array(faceValues) : null };
   }
 
+  function parseLiveMap(buffer, expectedPoints) {
+    if (buffer.byteLength < 12) throw new Error('Live texture map is incomplete');
+    const bytes = new Uint8Array(buffer);
+    if (String.fromCharCode(...bytes.subarray(0, 4)) !== 'WYLM') {
+      throw new Error('Live texture map has an unknown format');
+    }
+    const view = new DataView(buffer);
+    const version = view.getUint16(4, true);
+    const cameraCount = view.getUint16(6, true);
+    const pointCount = view.getUint32(8, true);
+    const stride = 12;
+    if (version !== 1 || pointCount !== expectedPoints || 12 + pointCount * stride > buffer.byteLength) {
+      throw new Error('Live texture map does not match this point cloud');
+    }
+    const uv = new Float32Array(pointCount * 2);
+    const cameras = new Float32Array(pointCount);
+    for (let index = 0; index < pointCount; index++) {
+      const source = 12 + index * stride;
+      uv[index * 2] = view.getFloat32(source, true);
+      uv[index * 2 + 1] = view.getFloat32(source + 4, true);
+      cameras[index] = view.getUint8(source + 8);
+    }
+    return { uv, cameras, cameraCount };
+  }
+
   function compile(gl, type, source) {
     const shader = gl.createShader(type);
     gl.shaderSource(shader, source);
@@ -202,7 +234,62 @@
     return shader;
   }
 
-  function createViewer(target, cloud) {
+  let hlsLoader;
+  function loadHls() {
+    if (window.Hls) return Promise.resolve(window.Hls);
+    if (!hlsLoader) hlsLoader = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = '/hls.min.js';
+      script.onload = () => resolve(window.Hls);
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+    return hlsLoader;
+  }
+
+  function makeLiveVideo() {
+    const video = document.createElement('video');
+    video.muted = true; video.autoplay = true; video.playsInline = true;
+    video.setAttribute('muted', ''); video.setAttribute('playsinline', '');
+    video.hidden = true;
+    document.body.appendChild(video);
+    return video;
+  }
+
+  async function attachSpatialLiveVideo(video, cameraId, resources) {
+    try {
+      const pc = new RTCPeerConnection();
+      resources.peerConnections.push(pc);
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.ontrack = event => {
+        video.srcObject = event.streams[0];
+        video.play().catch(() => {});
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const response = await fetch(`/video/webrtc/${encodeURIComponent(cameraId)}/whep`, {
+        method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp,
+      });
+      if (!response.ok) throw new Error('WebRTC returned ' + response.status);
+      await pc.setRemoteDescription({ type: 'answer', sdp: await response.text() });
+      return;
+    } catch (error) {
+      console.warn('Spatial WebRTC fallback for ' + cameraId, error);
+    }
+    const url = `/video/native-live/${encodeURIComponent(cameraId)}/index.m3u8`;
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url; video.load(); video.play().catch(() => {}); return;
+    }
+    const Hls = await loadHls().catch(() => null);
+    if (Hls?.isSupported?.()) {
+      const hls = new Hls({ lowLatencyMode: false, liveSyncDurationCount: 2 });
+      resources.hls.push(hls);
+      hls.loadSource(url); hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    }
+  }
+
+  function createViewer(target, cloud, liveMap, cameraIds) {
     target.hidden = false;
     fallbackImage.hidden = true;
     const gl = target.getContext('webgl', { antialias: true, alpha: true });
@@ -210,6 +297,8 @@
     const vertexSource = `
       attribute vec3 aPosition;
       attribute vec3 aColor;
+      attribute vec2 aLiveUv;
+      attribute float aCamera;
       uniform float uYaw;
       uniform float uPitch;
       uniform float uDistance;
@@ -217,6 +306,8 @@
       uniform float uPointSize;
       uniform bool uRenderPoints;
       varying vec3 vColor;
+      varying vec2 vLiveUv;
+      varying float vCamera;
       void main() {
         float cy = cos(uYaw), sy = sin(uYaw);
         float cp = cos(uPitch), sp = sin(uPitch);
@@ -229,17 +320,34 @@
         gl_Position = vec4(p.x * f / uAspect, p.y * f, ((far + near) / (near - far)) * p.z + (2.0 * far * near) / (near - far), -p.z);
         gl_PointSize = clamp(uPointSize * 3.5 / max(-p.z, .2), 1.0, 7.0);
         vColor = aColor;
+        vLiveUv = aLiveUv;
+        vCamera = aCamera;
       }`;
     const fragmentSource = `
       precision mediump float;
       uniform bool uRenderPoints;
+      uniform bool uUseLive;
+      uniform float uAtlasGrid;
+      uniform sampler2D uLiveAtlas;
       varying vec3 vColor;
+      varying vec2 vLiveUv;
+      varying float vCamera;
       void main() {
         if (uRenderPoints) {
           vec2 d = gl_PointCoord - vec2(.5);
           if (dot(d, d) > .25) discard;
         }
-        gl_FragColor = vec4(vColor, .92);
+        vec3 colour = vColor;
+        if (uUseLive) {
+          float column = mod(vCamera, uAtlasGrid);
+          float row = floor(vCamera / uAtlasGrid);
+          vec2 atlasUv = vec2(
+            (column + vLiveUv.x) / uAtlasGrid,
+            (uAtlasGrid - row - vLiveUv.y) / uAtlasGrid
+          );
+          colour = texture2D(uLiveAtlas, atlasUv).rgb;
+        }
+        gl_FragColor = vec4(colour, .92);
       }`;
     const program = gl.createProgram();
     gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, vertexSource));
@@ -261,8 +369,21 @@
     gl.enableVertexAttribArray(colorLocation);
     gl.vertexAttribPointer(colorLocation, 3, gl.UNSIGNED_BYTE, true, 0, 0);
 
+    const liveUvBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, liveUvBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, liveMap?.uv || new Float32Array(cloud.count * 2), gl.STATIC_DRAW);
+    const liveUvLocation = gl.getAttribLocation(program, 'aLiveUv');
+    gl.enableVertexAttribArray(liveUvLocation);
+    gl.vertexAttribPointer(liveUvLocation, 2, gl.FLOAT, false, 0, 0);
+    const cameraBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, cameraBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, liveMap?.cameras || new Float32Array(cloud.count), gl.STATIC_DRAW);
+    const cameraLocation = gl.getAttribLocation(program, 'aCamera');
+    gl.enableVertexAttribArray(cameraLocation);
+    gl.vertexAttribPointer(cameraLocation, 1, gl.FLOAT, false, 0, 0);
+
     const uniforms = {};
-    ['uYaw', 'uPitch', 'uDistance', 'uAspect', 'uPointSize', 'uRenderPoints'].forEach(name => uniforms[name] = gl.getUniformLocation(program, name));
+    ['uYaw', 'uPitch', 'uDistance', 'uAspect', 'uPointSize', 'uRenderPoints', 'uUseLive', 'uAtlasGrid', 'uLiveAtlas'].forEach(name => uniforms[name] = gl.getUniformLocation(program, name));
     let indexBuffer = null;
     let indexType = null;
     let indexCount = 0;
@@ -282,7 +403,51 @@
       }
       if (indexBuffer) indexCount = cloud.indices.length;
     }
-    const view = { yaw: -.35, pitch: .12, distance: 3.0, pointSize: 2.25, orbiting: false };
+    const liveResources = { peerConnections: [], hls: [], videos: [] };
+    const liveAvailable = Boolean(
+      liveMap && cameraIds?.length && liveMap.cameraCount === cameraIds.length
+    );
+    const atlasGrid = Math.max(1, Math.ceil(Math.sqrt(liveMap?.cameraCount || 1)));
+    const atlasCell = 320;
+    const atlas = document.createElement('canvas');
+    atlas.width = atlas.height = atlasGrid * atlasCell;
+    const atlasContext = atlas.getContext('2d', { alpha: false });
+    const liveTexture = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, liveTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    atlasContext.fillStyle = '#111820'; atlasContext.fillRect(0, 0, atlas.width, atlas.height);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, atlas);
+    if (liveAvailable) cameraIds.forEach(cameraId => {
+      const video = makeLiveVideo();
+      liveResources.videos.push(video);
+      attachSpatialLiveVideo(video, cameraId, liveResources).catch(error => {
+        console.warn('Spatial live video failed for ' + cameraId, error);
+      });
+    });
+    let lastAtlasUpload = 0;
+    let atlasReady = false;
+    function updateLiveAtlas(time) {
+      if (!view.live || !liveAvailable || time - lastAtlasUpload < 100) return;
+      if (!liveResources.videos.every(video => video.readyState >= 2 && video.videoWidth)) return;
+      lastAtlasUpload = time;
+      liveResources.videos.forEach((video, index) => {
+        const column = index % atlasGrid;
+        const row = Math.floor(index / atlasGrid);
+        atlasContext.drawImage(video, column * atlasCell, row * atlasCell, atlasCell, atlasCell);
+      });
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, liveTexture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, atlas);
+      atlasReady = true;
+      liveToggle.dataset.ready = 'true';
+      liveToggle.textContent = 'Live colour · on';
+    }
+    const view = { yaw: -.35, pitch: .12, distance: 3.0, pointSize: 2.25, orbiting: false, live: liveAvailable };
     let pointer = null;
     let animation;
     let previousTime = performance.now();
@@ -308,6 +473,10 @@
       gl.uniform1f(uniforms.uDistance, view.distance);
       gl.uniform1f(uniforms.uAspect, target.width / Math.max(target.height, 1));
       gl.uniform1f(uniforms.uPointSize, view.pointSize);
+      updateLiveAtlas(time);
+      gl.uniform1i(uniforms.uUseLive, view.live && atlasReady ? 1 : 0);
+      gl.uniform1f(uniforms.uAtlasGrid, atlasGrid);
+      gl.uniform1i(uniforms.uLiveAtlas, 0);
       if (indexBuffer) {
         gl.uniform1i(uniforms.uRenderPoints, 0);
         gl.drawElements(gl.TRIANGLES, indexCount, indexType, 0);
@@ -342,13 +511,37 @@
     target.addEventListener('dblclick', reset);
     document.getElementById('pointSize').oninput = event => { view.pointSize = Number(event.target.value); };
     document.getElementById('resetView').onclick = reset;
+    const liveToggle = document.getElementById('liveToggle');
+    liveToggle.disabled = !liveAvailable;
+    liveToggle.setAttribute('aria-pressed', String(view.live));
+    liveToggle.textContent = liveAvailable ? 'Live colour · connecting' : 'Live unavailable';
+    liveToggle.onclick = () => {
+      if (!liveAvailable) return;
+      view.live = !view.live;
+      liveToggle.setAttribute('aria-pressed', String(view.live));
+      liveToggle.textContent = view.live
+        ? (atlasReady ? 'Live colour · on' : 'Live colour · connecting')
+        : 'Live colour · off';
+    };
     document.getElementById('orbitToggle').onclick = event => {
       view.orbiting = !view.orbiting;
       event.currentTarget.textContent = view.orbiting ? 'Orbiting' : 'Orbit paused';
       event.currentTarget.setAttribute('aria-pressed', String(view.orbiting));
     };
     animation = requestAnimationFrame(draw);
-    return { destroy() { cancelAnimationFrame(animation); gl.deleteBuffer(positionBuffer); gl.deleteBuffer(colorBuffer); if (indexBuffer) gl.deleteBuffer(indexBuffer); gl.deleteProgram(program); } };
+    return { destroy() {
+      cancelAnimationFrame(animation);
+      liveResources.hls.forEach(hls => { try { hls.destroy(); } catch {} });
+      liveResources.peerConnections.forEach(pc => { try { pc.close(); } catch {} });
+      liveResources.videos.forEach(video => {
+        try { video.pause(); video.srcObject = null; video.removeAttribute('src'); video.load(); video.remove(); } catch {}
+      });
+      gl.deleteTexture(liveTexture);
+      gl.deleteBuffer(positionBuffer); gl.deleteBuffer(colorBuffer);
+      gl.deleteBuffer(liveUvBuffer); gl.deleteBuffer(cameraBuffer);
+      if (indexBuffer) gl.deleteBuffer(indexBuffer);
+      gl.deleteProgram(program);
+    } };
   }
 
   function setArtifactView(viewName) {

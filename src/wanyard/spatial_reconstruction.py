@@ -51,6 +51,8 @@ class NeuralCloud:
     points: object
     colors: object
     faces: object
+    live_uv: object
+    live_camera_indices: object
     depth: object
     confidence: object
     timestamp: float
@@ -174,6 +176,7 @@ def _reconstruct_run_locked(
                 "faces": int(len(cloud.faces)),
                 "camera_count": len(camera_ids),
                 "reconstructed_camera_count": len(used_camera_ids),
+                "reconstructed_camera_ids": list(used_camera_ids),
                 "timestamp": cloud.timestamp,
             },
             warnings=warnings,
@@ -216,7 +219,8 @@ def build_vggt_cloud(
 
     cv2 = stereo._load_cv2()
     np = stereo._load_numpy()
-    images = _preprocess_vggt_frames(cv2, np, torch, frames).to("cuda")
+    images, live_uv, live_valid = _preprocess_vggt_frames(cv2, np, torch, frames)
+    images = images.to("cuda")
     model = None
     predictions = None
     torch.cuda.empty_cache()
@@ -254,8 +258,8 @@ def build_vggt_cloud(
         rgb = (
             images.detach().float().cpu().permute(0, 2, 3, 1).numpy() * 255.0
         ).clip(0, 255).astype(np.uint8)
-        points, colors = _select_vggt_points(
-            np, world_points, point_confidence, rgb, max_points
+        points, colors, selected = _select_vggt_points(
+            np, world_points, point_confidence, rgb, max_points, live_valid
         )
         if len(points) < 10_000:
             raise SpatialReconstructionError(
@@ -266,6 +270,11 @@ def build_vggt_cloud(
             points=points.astype(np.float32),
             colors=colors.astype(np.uint8),
             faces=np.empty((0, 3), dtype=np.int32),
+            live_uv=live_uv.reshape(-1, 2)[selected].astype(np.float32),
+            live_camera_indices=np.repeat(
+                np.arange(len(camera_ids), dtype=np.uint8),
+                world_points.shape[1] * world_points.shape[2],
+            )[selected],
             depth=depth,
             confidence=depth_confidence,
             timestamp=float(timestamp),
@@ -290,6 +299,7 @@ def build_vggt_cloud(
 def _preprocess_vggt_frames(cv2, np, torch, frames):
     processed = []
     shapes = []
+    transforms = []
     for frame in frames:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
@@ -300,15 +310,19 @@ def _preprocess_vggt_frames(cv2, np, torch, frames):
             (new_width, new_height),
             interpolation=cv2.INTER_AREA if new_width < width else cv2.INTER_CUBIC,
         )
+        crop_top = 0
         if new_height > 518:
-            start = (new_height - 518) // 2
-            resized = resized[start:start + 518]
+            crop_top = (new_height - 518) // 2
+            resized = resized[crop_top:crop_top + 518]
         processed.append(resized)
         shapes.append(resized.shape[:2])
+        transforms.append((new_width, new_height, crop_top))
     max_height = max(shape[0] for shape in shapes)
     max_width = max(shape[1] for shape in shapes)
     tensors = []
-    for image in processed:
+    uv_maps = []
+    valid_maps = []
+    for image, (resized_width, resized_height, crop_top) in zip(processed, transforms):
         height, width = image.shape[:2]
         top = (max_height - height) // 2
         bottom = max_height - height - top
@@ -323,23 +337,40 @@ def _preprocess_vggt_frames(cv2, np, torch, frames):
             torch.from_numpy(np.ascontiguousarray(image))
             .permute(2, 0, 1).float().div_(255.0)
         )
-    return torch.stack(tensors)
+        yy, xx = np.mgrid[0:max_height, 0:max_width]
+        local_x = xx - left
+        local_y = yy - top
+        valid = (
+            (local_x >= 0) & (local_x < width)
+            & (local_y >= 0) & (local_y < height)
+        )
+        source_y = local_y + crop_top
+        uv_maps.append(np.stack([
+            (local_x + 0.5) / resized_width,
+            (source_y + 0.5) / resized_height,
+        ], axis=-1).astype(np.float32))
+        valid_maps.append(valid)
+    return torch.stack(tensors), np.stack(uv_maps), np.stack(valid_maps)
 
 
-def _select_vggt_points(np, world_points, confidence, rgb, max_points: int):
+def _select_vggt_points(
+    np, world_points, confidence, rgb, max_points: int, live_valid=None
+):
     points = world_points.reshape(-1, 3)
     scores = confidence.reshape(-1)
     colors = rgb.reshape(-1, 3)
     valid = np.isfinite(points).all(axis=1) & np.isfinite(scores) & (scores > 1e-5)
+    if live_valid is not None:
+        valid &= live_valid.reshape(-1)
     if not bool(valid.any()):
-        return points[:0], colors[:0]
+        return points[:0], colors[:0], np.empty(0, dtype=int)
     threshold = np.percentile(scores[valid], 45)
     selected = np.flatnonzero(valid & (scores >= threshold))
     if len(selected) > max_points:
         selected = selected[
             np.linspace(0, len(selected) - 1, max_points, dtype=int)
         ]
-    return points[selected], colors[selected]
+    return points[selected], colors[selected], selected
 
 
 def build_projective_cloud(
@@ -721,6 +752,33 @@ def _publish_artifacts(run_dir: Path, cloud: ProjectiveCloud, camera_ids: list[s
     }
 
 
+def _write_live_map(path: Path, uv, camera_indices, camera_count: int, np) -> None:
+    if len(uv) != len(camera_indices):
+        raise SpatialReconstructionError("live texture mapping does not match point cloud")
+    header = (
+        b"WYLM"
+        + (1).to_bytes(2, "little")
+        + int(camera_count).to_bytes(2, "little")
+        + int(len(uv)).to_bytes(4, "little")
+    )
+    records = np.empty(
+        len(uv),
+        dtype=[("u", "<f4"), ("v", "<f4"), ("camera", "u1"), ("padding", "u1", (3,))],
+    )
+    records["u"] = uv[:, 0]
+    records["v"] = uv[:, 1]
+    records["camera"] = camera_indices
+    records["padding"] = 0
+    temporary = path.with_name(f".{path.name}-{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(header)
+            handle.write(records.tobytes())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[str]) -> dict:
     cv2 = stereo._load_cv2()
     np = stereo._load_numpy()
@@ -728,7 +786,12 @@ def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[
     depth_preview = run_dir / "depth-preview.jpg"
     cloud_preview = run_dir / "pointcloud-preview.jpg"
     summary_path = run_dir / "model-summary.json"
+    live_map_path = run_dir / "live-map.bin"
     _write_binary_ply(point_cloud, cloud.points, cloud.colors, cloud.faces, np)
+    _write_live_map(
+        live_map_path, cloud.live_uv, cloud.live_camera_indices,
+        len(cloud.camera_ids), np,
+    )
     _write_image_atomic(
         cv2, depth_preview,
         _render_vggt_depth_preview(cv2, np, cloud.depth, cloud.confidence),
@@ -756,6 +819,7 @@ def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[
         "depth_preview": depth_preview.name,
         "pointcloud_preview": cloud_preview.name,
         "model_summary": summary_path.name,
+        "live_map": live_map_path.name,
     }
 
 
