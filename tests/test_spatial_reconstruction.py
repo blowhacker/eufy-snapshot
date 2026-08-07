@@ -97,6 +97,7 @@ class SpatialReconstructionTests(unittest.TestCase):
             self.assertEqual(result["run"]["kind"], "opencv_projective")
             self.assertEqual(result["stats"]["points"], 3)
             self.assertEqual(result["stats"]["faces"], 1)
+            self.assertEqual(result["warnings"], [])
             run_dir = store.run_directory(scene_id, run_id)
             for relative in result["artifacts"].values():
                 self.assertTrue((run_dir / relative).is_file())

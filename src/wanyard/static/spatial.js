@@ -48,8 +48,12 @@
       chip.append(document.createTextNode(niceLabel(cameraId)));
       return chip;
     }));
-    const warning = run.warnings && run.warnings[0];
-    if (warning) document.querySelector('#warning p').textContent = warning;
+    const warnings = (run.warnings || []).filter(message =>
+      !String(message).includes('measurements wait for camera calibration')
+    );
+    const warningBox = document.getElementById('warning');
+    warningBox.hidden = !warnings.length;
+    if (warnings.length) warningBox.querySelector('p').textContent = warnings[0];
     const download = document.getElementById('downloadCloud');
     download.hidden = !run.artifacts.point_cloud;
     download.href = run.artifacts.point_cloud ? artifactUrl('point_cloud') : '#';

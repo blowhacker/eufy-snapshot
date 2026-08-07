@@ -147,9 +147,7 @@ def _reconstruct_run_locked(
                 )),
             )
             artifacts = _publish_vggt_artifacts(run_dir, cloud, camera_ids)
-            warnings = [
-                "VGGT neural geometry has relative scale; measurements wait for camera calibration."
-            ]
+            warnings = []
         else:
             left_frame = frames[used_camera_ids.index(left_id)]
             right_frame = frames[used_camera_ids.index(right_id)]
@@ -161,9 +159,7 @@ def _reconstruct_run_locked(
                 right_camera_id=right_id,
             )
             artifacts = _publish_artifacts(run_dir, cloud, camera_ids)
-            warnings = [
-                "OpenCV projective geometry: shape is relative; measurements wait for camera calibration."
-            ]
+            warnings = []
         if unavailable:
             warnings.append(
                 "Some selected cameras had no readable synchronized frame: "
