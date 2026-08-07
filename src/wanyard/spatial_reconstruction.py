@@ -57,6 +57,10 @@ class NeuralCloud:
     faces: object
     live_uv: object
     live_camera_indices: object
+    raw_points: object
+    raw_colors: object
+    raw_live_uv: object
+    raw_live_camera_indices: object
     depth: object
     confidence: object
     timestamp: float
@@ -65,6 +69,7 @@ class NeuralCloud:
     extrinsic: object
     input_shape: tuple[int, ...]
     gpu_peak_mb: float
+    filter_stats: dict
 
 
 def process_next_run(store: SpatialStore, video_db, video_dir: Path) -> bool:
@@ -256,6 +261,7 @@ def build_vggt_cloud(
     try:
         import torch
         from vggt.models.vggt import VGGT
+        from vggt.utils.geometry import unproject_depth_map_to_point_map
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     except (ImportError, ModuleNotFoundError) as exc:
         raise SpatialReconstructionError("VGGT runtime is not installed") from exc
@@ -296,15 +302,28 @@ def build_vggt_cloud(
         )
         depth = predictions["depth"].squeeze(0).float().cpu().numpy()
         depth_confidence = predictions["depth_conf"].squeeze(0).float().cpu().numpy()
-        world_points = predictions["world_points"].squeeze(0).float().cpu().numpy()
+        raw_world_points = predictions["world_points"].squeeze(0).float().cpu().numpy()
         point_confidence = predictions["world_points_conf"].squeeze(0).float().cpu().numpy()
         extrinsic_np = extrinsic.squeeze(0).float().cpu().numpy()
         intrinsic_np = intrinsic.squeeze(0).float().cpu().numpy()
+        world_points = unproject_depth_map_to_point_map(
+            depth, extrinsic_np, intrinsic_np
+        ).astype(np.float32)
+        depth_values = depth[..., 0] if depth.ndim == 4 else depth
+        depth_edges = _depth_edge_mask(np, depth_values, rtol=0.03)
+        cross_view_valid = _cross_view_consistency_mask(
+            np, world_points, depth_values, extrinsic_np, intrinsic_np,
+            relative_tolerance=0.08,
+        )
+        clean_valid = live_valid & ~depth_edges & cross_view_valid
         rgb = (
             images.detach().float().cpu().permute(0, 2, 3, 1).numpy() * 255.0
         ).clip(0, 255).astype(np.uint8)
         points, colors, selected = _select_vggt_points(
-            np, world_points, point_confidence, rgb, max_points, live_valid
+            np, world_points, depth_confidence, rgb, max_points, clean_valid
+        )
+        raw_points, raw_colors, raw_selected = _select_vggt_points(
+            np, raw_world_points, point_confidence, rgb, max_points, live_valid
         )
         if len(points) < 10_000:
             raise SpatialReconstructionError(
@@ -320,6 +339,13 @@ def build_vggt_cloud(
                 np.arange(len(camera_ids), dtype=np.uint8),
                 world_points.shape[1] * world_points.shape[2],
             )[selected],
+            raw_points=raw_points.astype(np.float32),
+            raw_colors=raw_colors.astype(np.uint8),
+            raw_live_uv=live_uv.reshape(-1, 2)[raw_selected].astype(np.float32),
+            raw_live_camera_indices=np.repeat(
+                np.arange(len(camera_ids), dtype=np.uint8),
+                raw_world_points.shape[1] * raw_world_points.shape[2],
+            )[raw_selected],
             depth=depth,
             confidence=depth_confidence,
             timestamp=float(timestamp),
@@ -328,6 +354,16 @@ def build_vggt_cloud(
             extrinsic=extrinsic_np,
             input_shape=tuple(int(value) for value in images.shape),
             gpu_peak_mb=peak,
+            filter_stats={
+                "raw_points": int(len(raw_points)),
+                "clean_points": int(len(points)),
+                "depth_edge_pixels_removed": int((live_valid & depth_edges).sum()),
+                "cross_view_pixels_rejected": int(
+                    (live_valid & ~depth_edges & ~cross_view_valid).sum()
+                ),
+                "depth_edge_relative_tolerance": 0.03,
+                "cross_view_relative_tolerance": 0.08,
+            },
         )
     except torch.cuda.OutOfMemoryError as exc:
         raise SpatialReconstructionError(
@@ -416,6 +452,91 @@ def _select_vggt_points(
             np.linspace(0, len(selected) - 1, max_points, dtype=int)
         ]
     return points[selected], colors[selected], selected
+
+
+def _depth_edge_mask(np, depth, rtol: float = 0.03, kernel_size: int = 3):
+    """Mark pixels on relative depth discontinuities in every camera."""
+    values = np.asarray(depth)
+    original_shape = values.shape
+    values = values.reshape(-1, *original_shape[-2:])
+    pad = kernel_size // 2
+    padded = np.pad(values, ((0, 0), (pad, pad), (pad, pad)), mode="edge")
+    depth_max = np.full_like(values, -np.inf)
+    depth_min = np.full_like(values, np.inf)
+    for y in range(kernel_size):
+        for x in range(kernel_size):
+            window = padded[:, y:y + values.shape[-2], x:x + values.shape[-1]]
+            depth_max = np.maximum(depth_max, window)
+            depth_min = np.minimum(depth_min, window)
+    relative_jump = (depth_max - depth_min) / np.maximum(np.abs(values), 1e-6)
+    return (relative_jump > rtol).reshape(original_shape)
+
+
+def _cross_view_consistency_mask(
+    np,
+    world_points,
+    depth,
+    extrinsic,
+    intrinsic,
+    *,
+    relative_tolerance: float = 0.08,
+    max_comparison_cameras: int = 4,
+):
+    """Reject points contradicted by a nearer source in another camera view."""
+    points = np.asarray(world_points)
+    depths = np.asarray(depth)
+    keep = np.ones(points.shape[:-1], dtype=bool)
+    camera_count, height, width = keep.shape
+    if camera_count < 2:
+        return keep
+    rotations = extrinsic[:, :3, :3]
+    translations = extrinsic[:, :3, 3]
+    camera_centers = -np.einsum("sji,sj->si", rotations, translations)
+    for source_index in range(camera_count):
+        source_points = points[source_index].reshape(-1, 3)
+        contradicted = np.zeros(len(source_points), dtype=bool)
+        finite = np.isfinite(source_points).all(axis=1)
+        center_distances = np.linalg.norm(
+            camera_centers - camera_centers[source_index], axis=1
+        )
+        target_indices = [
+            int(index) for index in np.argsort(center_distances)
+            if int(index) != source_index
+        ][:max(1, int(max_comparison_cameras))]
+        for target_index in target_indices:
+            rotation = extrinsic[target_index, :3, :3]
+            translation = extrinsic[target_index, :3, 3]
+            camera_points = source_points @ rotation.T + translation
+            z = camera_points[:, 2]
+            valid_z = finite & np.isfinite(z) & (z > 1e-6)
+            safe_z = np.where(valid_z, z, 1.0)
+            u = intrinsic[target_index, 0, 0] * camera_points[:, 0] / safe_z \
+                + intrinsic[target_index, 0, 2]
+            v = intrinsic[target_index, 1, 1] * camera_points[:, 1] / safe_z \
+                + intrinsic[target_index, 1, 2]
+            u = np.where(valid_z & np.isfinite(u), u, -1.0)
+            v = np.where(valid_z & np.isfinite(v), v, -1.0)
+            pixel_x = np.rint(u).astype(np.int64)
+            pixel_y = np.rint(v).astype(np.int64)
+            inside = (
+                valid_z & (pixel_x >= 0) & (pixel_x < width)
+                & (pixel_y >= 0) & (pixel_y < height)
+            )
+            sample_indices = np.flatnonzero(inside)
+            if not len(sample_indices):
+                continue
+            target_depth = depths[
+                target_index, pixel_y[sample_indices], pixel_x[sample_indices]
+            ]
+            comparable = np.isfinite(target_depth) & (target_depth > 1e-6)
+            sample_indices = sample_indices[comparable]
+            target_depth = target_depth[comparable]
+            contradicted[sample_indices] |= (
+                z[sample_indices]
+                < target_depth * (1.0 - float(relative_tolerance))
+            )
+        keep[source_index] = ~contradicted.reshape(height, width)
+    return keep
 
 
 def build_projective_cloud(
@@ -828,13 +949,22 @@ def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[
     cv2 = stereo._load_cv2()
     np = stereo._load_numpy()
     point_cloud = run_dir / "scene.ply"
+    raw_point_cloud = run_dir / "scene-raw.ply"
     depth_preview = run_dir / "depth-preview.jpg"
     cloud_preview = run_dir / "pointcloud-preview.jpg"
     summary_path = run_dir / "model-summary.json"
     live_map_path = run_dir / "live-map.bin"
+    raw_live_map_path = run_dir / "live-map-raw.bin"
     _write_binary_ply(point_cloud, cloud.points, cloud.colors, cloud.faces, np)
+    _write_binary_ply(
+        raw_point_cloud, cloud.raw_points, cloud.raw_colors, cloud.faces, np
+    )
     _write_live_map(
         live_map_path, cloud.live_uv, cloud.live_camera_indices,
+        len(cloud.camera_ids), np,
+    )
+    _write_live_map(
+        raw_live_map_path, cloud.raw_live_uv, cloud.raw_live_camera_indices,
         len(cloud.camera_ids), np,
     )
     _write_image_atomic(
@@ -843,7 +973,8 @@ def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[
     )
     _write_image_atomic(cv2, cloud_preview, _render_cloud_preview(cv2, np, cloud))
     summary = {
-        "method": "vggt-1b-world-point-head",
+        "method": "vggt-1b-depth-unprojection",
+        "raw_method": "vggt-1b-world-point-head",
         "metric": False,
         "timestamp": cloud.timestamp,
         "camera_ids": camera_ids,
@@ -853,18 +984,20 @@ def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[
         "intrinsic": cloud.intrinsic.tolist(),
         "extrinsic": cloud.extrinsic.tolist(),
         "gpu_peak_mb": round(cloud.gpu_peak_mb, 2),
+        "filters": cloud.filter_stats,
         "limitations": [
-            "Depth and translation have relative, not metric, scale.",
-            "Metric measurements require camera calibration and a measured baseline.",
+            "Coordinates use the model's relative scene scale.",
         ],
     }
     _write_json_atomic(summary_path, summary)
     return {
         "point_cloud": point_cloud.name,
+        "raw_point_cloud": raw_point_cloud.name,
         "depth_preview": depth_preview.name,
         "pointcloud_preview": cloud_preview.name,
         "model_summary": summary_path.name,
         "live_map": live_map_path.name,
+        "raw_live_map": raw_live_map_path.name,
     }
 
 

@@ -21,6 +21,43 @@ from wanyard import spatial_reconstruction as reconstruction
 
 
 class SpatialReconstructionTests(unittest.TestCase):
+    def test_depth_edge_mask_marks_relative_discontinuities(self):
+        depth = np.ones((1, 5, 5), dtype=np.float32)
+        depth[0, 2, 2] = 2.0
+
+        mask = reconstruction._depth_edge_mask(np, depth, rtol=0.03)
+
+        self.assertFalse(mask[0, 0, 0])
+        self.assertTrue(mask[0, 2, 2])
+        self.assertTrue(mask[0, 1, 1])
+        self.assertFalse(mask[0, 4, 4])
+
+    def test_cross_view_filter_rejects_a_point_floating_before_shared_depth(self):
+        height = width = 3
+        depth = np.full((2, height, width), 2.0, dtype=np.float32)
+        yy, xx = np.mgrid[0:height, 0:width]
+        base = np.stack([
+            (xx - 1) * depth[0], (yy - 1) * depth[0], depth[0]
+        ], axis=-1).astype(np.float32)
+        points = np.stack([base.copy(), base.copy()])
+        points[0, 1, 1] = [0.0, 0.0, 1.0]
+        extrinsic = np.repeat(
+            np.asarray([[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]], dtype=np.float32),
+            2, axis=0,
+        )
+        intrinsic = np.repeat(
+            np.asarray([[[1, 0, 1], [0, 1, 1], [0, 0, 1]]], dtype=np.float32),
+            2, axis=0,
+        )
+
+        mask = reconstruction._cross_view_consistency_mask(
+            np, points, depth, extrinsic, intrinsic
+        )
+
+        self.assertFalse(mask[0, 1, 1])
+        self.assertTrue(mask[0, 0, 0])
+        self.assertTrue(mask[1].all())
+
     def test_reconstruction_steps_back_from_an_undecodable_segment_tail(self):
         frame = np.zeros((4, 4, 3), dtype=np.uint8)
 
