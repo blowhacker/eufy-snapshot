@@ -186,10 +186,15 @@
       refreshMessage.textContent = 'New geometry ready · validating before swap.';
     }
     try {
-      const [response, liveMapResponse] = await Promise.all([
+      const [response, liveMapResponse, modelSummary] = await Promise.all([
         fetch(artifactUrl('point_cloud', scene, runs.ready)),
         runs.ready.artifacts.live_map
           ? fetch(artifactUrl('live_map', scene, runs.ready)) : Promise.resolve(null),
+        runs.ready.artifacts.model_summary
+          ? fetch(artifactUrl('model_summary', scene, runs.ready))
+            .then(result => result.ok ? result.json() : null)
+            .catch(() => null)
+          : Promise.resolve(null),
       ]);
       if (!response.ok) throw new Error('Point cloud returned ' + response.status);
       const buffer = await response.arrayBuffer();
@@ -203,7 +208,7 @@
       const previousView = replacingCurrent ? state.viewer?.snapshot() : null;
       if (state.viewer) state.viewer.destroy();
       state.run = runs.ready;
-      state.viewer = createViewer(canvas, cloud, liveMap, liveCameraIds, previousView);
+      state.viewer = createViewer(canvas, cloud, liveMap, liveCameraIds, previousView, modelSummary);
       renderMetadata();
       renderRefreshState(runs.pending, runs.failure);
       setArtifactView('cloud');
@@ -388,7 +393,7 @@
     }
   }
 
-  function createViewer(target, cloud, liveMap, cameraIds, initialView = null) {
+  function createViewer(target, cloud, liveMap, cameraIds, initialView = null, modelSummary = null) {
     target.hidden = false;
     fallbackImage.hidden = true;
     const gl = target.getContext('webgl', { antialias: true, alpha: true });
@@ -546,9 +551,11 @@
       liveToggle.dataset.ready = 'true';
       liveToggle.textContent = 'Live colour · on';
     }
+    const defaultView = window.WanyardSpatialView?.cameraAlignedOrbit(modelSummary)
+      || { yaw: Math.PI, pitch: 0 };
     const view = {
-      yaw: initialView?.yaw ?? -.35,
-      pitch: initialView?.pitch ?? .12,
+      yaw: initialView?.yaw ?? defaultView.yaw,
+      pitch: initialView?.pitch ?? defaultView.pitch,
       distance: initialView?.distance ?? 3.0,
       pointSize: initialView?.pointSize ?? 2.25,
       orbiting: initialView?.orbiting ?? false,
@@ -592,7 +599,11 @@
       }
       animation = requestAnimationFrame(draw);
     }
-    function reset() { view.yaw = -.35; view.pitch = .12; view.distance = 3.0; }
+    function reset() {
+      view.yaw = defaultView.yaw;
+      view.pitch = defaultView.pitch;
+      view.distance = 3.0;
+    }
     function pointerDown(event) {
       pointer = { id: event.pointerId, x: event.clientX, y: event.clientY };
       target.setPointerCapture(event.pointerId);
