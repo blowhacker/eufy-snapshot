@@ -143,6 +143,7 @@ def _reconstruct_run_locked(
                 )),
             )
             artifacts = _publish_vggt_artifacts(run_dir, cloud, camera_ids)
+            published_point_count = len(cloud.raw_points)
             warnings = []
         else:
             left_frame = frames[used_camera_ids.index(left_id)]
@@ -155,6 +156,7 @@ def _reconstruct_run_locked(
                 right_camera_id=right_id,
             )
             artifacts = _publish_artifacts(run_dir, cloud, camera_ids)
+            published_point_count = len(cloud.points)
             warnings = []
         if unavailable:
             warnings.append(
@@ -168,7 +170,7 @@ def _reconstruct_run_locked(
             kind=kind,
             artifacts=artifacts,
             stats={
-                "points": int(len(cloud.points)),
+                "points": int(published_point_count),
                 "faces": int(len(cloud.faces)),
                 "camera_count": len(camera_ids),
                 "reconstructed_camera_count": len(used_camera_ids),
@@ -988,37 +990,45 @@ def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[
     cv2 = stereo._load_cv2()
     np = stereo._load_numpy()
     point_cloud = run_dir / "scene.ply"
-    raw_point_cloud = run_dir / "scene-raw.ply"
+    filtered_point_cloud = run_dir / "scene-filtered.ply"
     depth_preview = run_dir / "depth-preview.jpg"
     cloud_preview = run_dir / "pointcloud-preview.jpg"
     summary_path = run_dir / "model-summary.json"
     live_map_path = run_dir / "live-map.bin"
-    raw_live_map_path = run_dir / "live-map-raw.bin"
-    _write_binary_ply(point_cloud, cloud.points, cloud.colors, cloud.faces, np)
+    filtered_live_map_path = run_dir / "live-map-filtered.bin"
     _write_binary_ply(
-        raw_point_cloud, cloud.raw_points, cloud.raw_colors, cloud.faces, np
+        point_cloud, cloud.raw_points, cloud.raw_colors, cloud.faces, np
+    )
+    _write_binary_ply(
+        filtered_point_cloud, cloud.points, cloud.colors, cloud.faces, np
     )
     _write_live_map(
-        live_map_path, cloud.live_uv, cloud.live_camera_indices,
+        live_map_path, cloud.raw_live_uv, cloud.raw_live_camera_indices,
         len(cloud.camera_ids), np,
     )
     _write_live_map(
-        raw_live_map_path, cloud.raw_live_uv, cloud.raw_live_camera_indices,
+        filtered_live_map_path, cloud.live_uv, cloud.live_camera_indices,
         len(cloud.camera_ids), np,
     )
     _write_image_atomic(
         cv2, depth_preview,
         _render_vggt_depth_preview(cv2, np, cloud.depth, cloud.confidence),
     )
-    _write_image_atomic(cv2, cloud_preview, _render_cloud_preview(cv2, np, cloud))
+    _write_image_atomic(
+        cv2, cloud_preview,
+        _render_cloud_preview(
+            cv2, np, cloud, points=cloud.raw_points, colors=cloud.raw_colors
+        ),
+    )
     summary = {
-        "method": "vggt-1b-world-point-head-filtered",
-        "raw_method": "vggt-1b-world-point-head",
+        "method": "vggt-1b-world-point-head",
+        "experimental_filter_method": "depth-edge-cross-view-spatial-support",
         "metric": False,
         "timestamp": cloud.timestamp,
         "camera_ids": camera_ids,
         "reconstructed_camera_ids": cloud.camera_ids,
-        "points": int(len(cloud.points)),
+        "points": int(len(cloud.raw_points)),
+        "experimental_filtered_points": int(len(cloud.points)),
         "input_shape": list(cloud.input_shape),
         "intrinsic": cloud.intrinsic.tolist(),
         "extrinsic": cloud.extrinsic.tolist(),
@@ -1031,12 +1041,14 @@ def _publish_vggt_artifacts(run_dir: Path, cloud: NeuralCloud, camera_ids: list[
     _write_json_atomic(summary_path, summary)
     return {
         "point_cloud": point_cloud.name,
-        "raw_point_cloud": raw_point_cloud.name,
+        "raw_point_cloud": point_cloud.name,
+        "filtered_point_cloud": filtered_point_cloud.name,
         "depth_preview": depth_preview.name,
         "pointcloud_preview": cloud_preview.name,
         "model_summary": summary_path.name,
         "live_map": live_map_path.name,
-        "raw_live_map": raw_live_map_path.name,
+        "raw_live_map": live_map_path.name,
+        "filtered_live_map": filtered_live_map_path.name,
     }
 
 
@@ -1114,18 +1126,19 @@ def _render_vggt_depth_preview(cv2, np, depth, confidence):
     return np.hstack(panels)
 
 
-def _render_cloud_preview(cv2, np, cloud: ProjectiveCloud):
+def _render_cloud_preview(cv2, np, cloud: ProjectiveCloud, *, points=None, colors=None):
     canvas_height, canvas_width = 640, 1920
     panel_width = canvas_width // 3
     canvas = np.full((canvas_height, canvas_width, 3), (7, 10, 13), dtype=np.uint8)
-    points = cloud.points.astype(np.float64).copy()
+    points = (cloud.points if points is None else points).astype(np.float64).copy()
+    colors = cloud.colors if colors is None else colors
     points[:, 0] *= -1.0
     points[:, 1] *= -1.0
     low = np.percentile(points, 1, axis=0)
     high = np.percentile(points, 99, axis=0)
     inlier = np.all((points >= low) & (points <= high), axis=1)
     points = points[inlier]
-    colors = cloud.colors[inlier]
+    colors = colors[inlier]
     low = np.percentile(points, 1, axis=0)
     high = np.percentile(points, 99, axis=0)
     center = (low + high) / 2.0
