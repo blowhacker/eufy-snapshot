@@ -171,6 +171,9 @@
 
 .sp-view-tools { display: flex; gap: 7px; align-items: center; }
 .sp-view-tools select {
+  width: auto;
+  height: auto;
+  flex: 0 0 auto;
   padding: 6px 25px 6px 8px;
   color: var(--txt-2);
   border: 1px solid var(--line);
