@@ -22,6 +22,16 @@
     return String(value).split(/[-_]+/).map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
   }
 
+  function densityForRun(run) {
+    if (['standard', 'high', 'full'].includes(run?.density_preset)) {
+      return run.density_preset;
+    }
+    const budget = Number(run?.point_budget || run?.stats?.point_budget || 120000);
+    if (budget <= 120000) return 'standard';
+    if (budget >= 2000000) return 'full';
+    return 'high';
+  }
+
   function showError(message) {
     loading.hidden = false;
     loading.querySelector('span').hidden = true;
@@ -35,16 +45,8 @@
     document.getElementById('sceneName').textContent = scene.name;
     document.getElementById('pointCount').textContent = Number(run.stats.points || 0).toLocaleString();
     const runs = sceneRunState(scene);
-    const selectedBudget = Number(
-      runs.pending?.point_budget
-      || runs.failure?.point_budget
-      || run.point_budget
-      || run.stats.point_budget
-      || 120000
-    );
-    if (Array.from(densitySelect.options).some(option => Number(option.value) === selectedBudget)) {
-      densitySelect.value = String(selectedBudget);
-    }
+    const selectedDensity = densityForRun(runs.pending || runs.failure || run);
+    densitySelect.value = selectedDensity;
     document.getElementById('cameraCount').textContent = scene.camera_ids.length.toLocaleString();
     document.getElementById('scaleType').textContent = run.metric ? 'metric' : 'relative';
     document.getElementById('runKind').textContent = niceLabel(run.kind || 'reconstruction');
@@ -52,6 +54,17 @@
     document.getElementById('runDate').textContent = run.created_at
       ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(run.created_at))
       : 'Unknown';
+    const runPercentile = run.confidence_percentile ?? run.stats.confidence_percentile;
+    const densityDetail = runPercentile == null
+      ? `Legacy · ${Number(run.point_budget || run.stats.point_budget || 120000).toLocaleString()} cap`
+      : Number(runPercentile) === 0
+        ? 'Full · all finite'
+        : `${niceLabel(densityForRun(run))} · confidence p${Number(runPercentile)}`;
+    document.getElementById('runDensity').textContent = densityDetail;
+    const candidatePoints = Number(run.stats.candidate_points || 0);
+    document.getElementById('pointCount').title = candidatePoints
+      ? `${Number(run.stats.points || 0).toLocaleString()} rendered from ${candidatePoints.toLocaleString()} valid model points`
+      : '';
     document.getElementById('runStatus').innerHTML = '<i></i> ' + niceLabel(run.status || 'ready');
     document.getElementById('cameraList').replaceChildren(...scene.camera_ids.map(cameraId => {
       const chip = document.createElement('span');
@@ -891,20 +904,21 @@
   async function refreshGeometry() {
     if (!state.scene || !state.run?.artifacts?.point_cloud || state.pendingRun) return;
     const sceneId = state.scene.id;
-    const pointBudget = Number(densitySelect.value);
+    const densityPreset = densitySelect.value;
+    const densityLabel = densitySelect.options[densitySelect.selectedIndex].textContent;
     refreshButton.disabled = true;
     densitySelect.disabled = true;
     refreshButton.textContent = 'Queuing geometry…';
     refreshMessage.hidden = false;
     refreshMessage.className = 'sp-refresh-message busy';
-    refreshMessage.textContent = `Requesting up to ${pointBudget.toLocaleString()} points. The current model remains active.`;
+    refreshMessage.textContent = `Requesting ${densityLabel.toLowerCase()}. The current model remains active.`;
     try {
       const response = await fetch(
         '/api/spatial/scenes/' + encodeURIComponent(sceneId) + '/runs',
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ point_budget: pointBudget }),
+          body: JSON.stringify({ density_preset: densityPreset }),
         },
       );
       if (!response.ok) throw await responseError(response, 'Unable to refresh geometry');

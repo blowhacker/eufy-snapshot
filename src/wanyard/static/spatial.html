@@ -54,10 +54,10 @@
         <div class="sp-stage-bottom">
           <span id="interactionHint">Drag to orbit · scroll to zoom</span>
           <div class="sp-view-tools">
-            <select id="geometryDensity" aria-label="Point budget for the next geometry refresh" title="Point budget for the next geometry refresh">
-              <option value="120000">120k · standard</option>
-              <option value="300000">300k · high</option>
-              <option value="500000">500k · maximum</option>
+            <select id="geometryDensity" aria-label="Density for the next geometry refresh" title="Density for the next geometry refresh">
+              <option value="standard" title="45th-percentile confidence gate; up to 120,000 points">Standard · 120k</option>
+              <option value="high" title="20th-percentile confidence gate; up to 500,000 points">High · detailed</option>
+              <option value="full" title="Every finite model point; two-million-point safety ceiling">Full model output</option>
             </select>
             <button id="refreshGeometry" type="button" disabled>Refresh geometry</button>
             <label>Point size <input id="pointSize" type="range" min="1" max="5" step="0.25" value="2.25"></label>
@@ -91,6 +91,7 @@
           <dl class="sp-facts">
             <div><dt>Method</dt><dd id="runKind">Neural preview</dd></div>
             <div><dt>Captured</dt><dd id="runDate">—</dd></div>
+            <div><dt>Density</dt><dd id="runDensity">—</dd></div>
             <div><dt>Geometry</dt><dd id="runStatus"><i></i> Ready</dd></div>
           </dl>
           <p id="refreshMessage" class="sp-refresh-message" aria-live="polite" hidden></p>
@@ -131,6 +132,6 @@
     </div>
 
     <script src="/spatial-view.js?v=1"></script>
-    <script src="/spatial.js?v=16"></script>
+    <script src="/spatial.js?v=17"></script>
   </body>
 </html>

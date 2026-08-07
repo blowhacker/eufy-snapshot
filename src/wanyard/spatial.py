@@ -21,8 +21,16 @@ _ARTIFACT_MEDIA_TYPES = {
     ".png": "image/png",
 }
 
-SPATIAL_POINT_BUDGETS = (120_000, 300_000, 500_000)
-DEFAULT_SPATIAL_POINT_BUDGET = 300_000
+SPATIAL_DENSITY_PRESETS = {
+    "standard": {"point_budget": 120_000, "confidence_percentile": 45.0},
+    "high": {"point_budget": 500_000, "confidence_percentile": 20.0},
+    "full": {"point_budget": 2_000_000, "confidence_percentile": 0.0},
+}
+DEFAULT_SPATIAL_DENSITY = "high"
+SPATIAL_POINT_BUDGETS = (120_000, 300_000, 500_000, 2_000_000)
+DEFAULT_SPATIAL_POINT_BUDGET = SPATIAL_DENSITY_PRESETS[
+    DEFAULT_SPATIAL_DENSITY
+]["point_budget"]
 LEGACY_SPATIAL_POINT_BUDGET = 120_000
 
 
@@ -35,6 +43,27 @@ def validate_spatial_point_budget(value: object) -> int:
         choices = ", ".join(str(item) for item in SPATIAL_POINT_BUDGETS)
         raise SpatialStoreError(f"point_budget must be one of: {choices}")
     return int(value)
+
+
+def validate_spatial_density(value: object) -> str:
+    if not isinstance(value, str) or value not in SPATIAL_DENSITY_PRESETS:
+        choices = ", ".join(SPATIAL_DENSITY_PRESETS)
+        raise SpatialStoreError(f"density_preset must be one of: {choices}")
+    return value
+
+
+def density_for_legacy_budget(value: object) -> str:
+    budget = validate_spatial_point_budget(value)
+    if budget == 120_000:
+        return "standard"
+    if budget == 2_000_000:
+        return "full"
+    return "high"
+
+
+def spatial_density_settings(value: object) -> dict:
+    preset = validate_spatial_density(value)
+    return {"density_preset": preset, **SPATIAL_DENSITY_PRESETS[preset]}
 
 
 class SpatialStore:
@@ -55,7 +84,7 @@ class SpatialStore:
         feasibility: dict | str | None = None,
         *,
         feasibility_id: str | None = None,
-        point_budget: int = DEFAULT_SPATIAL_POINT_BUDGET,
+        density_preset: str = DEFAULT_SPATIAL_DENSITY,
     ) -> dict:
         """Persist a new scene with a queued reconstruction run.
 
@@ -67,7 +96,7 @@ class SpatialStore:
         clean_name = self._validate_scene_name(name)
         clean_camera_ids = self._validate_camera_ids(camera_ids)
         feasibility_data = self._feasibility_data(feasibility, feasibility_id)
-        point_budget = validate_spatial_point_budget(point_budget)
+        density = spatial_density_settings(density_preset)
 
         self.root.mkdir(parents=True, exist_ok=True)
         for _ in range(32):
@@ -92,7 +121,7 @@ class SpatialStore:
                     "kind": "vggt_neural",
                     "metric": False,
                     "status": "queued",
-                    "point_budget": point_budget,
+                    **density,
                 },
                 "artifacts": {},
             }
@@ -106,11 +135,11 @@ class SpatialStore:
         self,
         scene_id: str,
         *,
-        point_budget: int = DEFAULT_SPATIAL_POINT_BUDGET,
+        density_preset: str = DEFAULT_SPATIAL_DENSITY,
     ) -> tuple[dict, bool]:
         """Queue one replacement run, returning an existing active run idempotently."""
         self._validate_identifier(scene_id, "scene")
-        point_budget = validate_spatial_point_budget(point_budget)
+        density = spatial_density_settings(density_preset)
         with self._mutation_lock:
             manifests = self._scene_manifests(scene_id)
             if not manifests:
@@ -136,7 +165,7 @@ class SpatialStore:
                         "kind": "vggt_neural",
                         "metric": False,
                         "status": "queued",
-                        "point_budget": point_budget,
+                        **density,
                     },
                     "artifacts": {},
                 }
@@ -232,14 +261,25 @@ class SpatialStore:
                 continue
             if manifest["run"].get("status") not in {"queued", "running"}:
                 continue
+            run = manifest["run"]
+            legacy_budget = run.get(
+                "point_budget", LEGACY_SPATIAL_POINT_BUDGET
+            )
+            density_preset = run.get(
+                "density_preset", density_for_legacy_budget(legacy_budget)
+            )
+            density = spatial_density_settings(density_preset)
             pending.append({
                 "scene_id": manifest["scene"]["id"],
-                "run_id": manifest["run"]["id"],
+                "run_id": run["id"],
                 "camera_ids": list(manifest["scene"]["camera_ids"]),
-                "created_at": str(manifest["run"].get("created_at", "")),
+                "created_at": str(run.get("created_at", "")),
                 "feasibility": manifest.get("feasibility", {}),
-                "point_budget": manifest["run"].get(
-                    "point_budget", LEGACY_SPATIAL_POINT_BUDGET
+                "density_preset": density_preset,
+                "point_budget": legacy_budget,
+                "confidence_percentile": run.get(
+                    "confidence_percentile", 45.0 if "density_preset" not in run
+                    else density["confidence_percentile"]
                 ),
             })
         pending.sort(key=lambda job: (job["created_at"], job["scene_id"], job["run_id"]))
@@ -412,6 +452,14 @@ class SpatialStore:
         self._validate_camera_ids(camera_ids)
         if "point_budget" in run:
             validate_spatial_point_budget(run["point_budget"])
+        if "density_preset" in run:
+            validate_spatial_density(run["density_preset"])
+        if "confidence_percentile" in run and (
+            isinstance(run["confidence_percentile"], bool)
+            or not isinstance(run["confidence_percentile"], (int, float))
+            or not 0 <= run["confidence_percentile"] <= 100
+        ):
+            raise SpatialStoreError("invalid confidence_percentile")
         if any(not _IDENTIFIER.fullmatch(str(name or "")) for name in artifacts):
             raise SpatialStoreError("invalid artifact name")
         return manifest

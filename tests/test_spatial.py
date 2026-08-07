@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from wanyard.spatial import (
+    DEFAULT_SPATIAL_DENSITY,
     DEFAULT_SPATIAL_POINT_BUDGET,
     SpatialStore,
     SpatialStoreError,
@@ -68,6 +69,9 @@ class SpatialStoreTests(unittest.TestCase):
             self.assertEqual(
                 manifest["run"]["point_budget"], DEFAULT_SPATIAL_POINT_BUDGET
             )
+            self.assertEqual(
+                manifest["run"]["density_preset"], DEFAULT_SPATIAL_DENSITY
+            )
             self.assertEqual(manifest["artifacts"], {})
             self.assertEqual(manifest["feasibility"], {"id": "check-123"})
             self.assertEqual(len(scenes), 1)
@@ -117,9 +121,9 @@ class SpatialStoreTests(unittest.TestCase):
             first_id = first["run"]["id"]
             store.update_run(scene_id, first_id, status="ready", artifacts={})
 
-            queued, created = store.queue_run(scene_id, point_budget=500_000)
+            queued, created = store.queue_run(scene_id, density_preset="full")
             duplicate, duplicate_created = store.queue_run(
-                scene_id, point_budget=120_000
+                scene_id, density_preset="standard"
             )
 
             self.assertTrue(created)
@@ -128,15 +132,16 @@ class SpatialStoreTests(unittest.TestCase):
             self.assertNotEqual(queued["run"]["id"], first_id)
             self.assertEqual(queued["scene"], first["scene"])
             self.assertEqual(queued["feasibility"], first["feasibility"])
-            self.assertEqual(queued["run"]["point_budget"], 500_000)
-            self.assertEqual(duplicate["run"]["point_budget"], 500_000)
+            self.assertEqual(queued["run"]["point_budget"], 2_000_000)
+            self.assertEqual(queued["run"]["density_preset"], "full")
+            self.assertEqual(duplicate["run"]["density_preset"], "full")
 
-    def test_point_budget_rejects_values_outside_the_ui_presets(self):
+    def test_density_rejects_values_outside_the_ui_presets(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SpatialStore(directory)
-            with self.assertRaisesRegex(SpatialStoreError, "point_budget"):
+            with self.assertRaisesRegex(SpatialStoreError, "density_preset"):
                 store.create_scene(
-                    "Front", ["front", "garden"], point_budget=2_000_000
+                    "Front", ["front", "garden"], density_preset="extreme"
                 )
 
     def test_prune_ready_runs_retains_three_newest_successes(self):

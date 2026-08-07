@@ -21,11 +21,35 @@ from wanyard import spatial_reconstruction as reconstruction
 
 
 class SpatialReconstructionTests(unittest.TestCase):
-    def test_worker_passes_the_persisted_point_budget_to_reconstruction(self):
+    def test_density_presets_relax_confidence_without_calling_noise_verified(self):
+        world = np.arange(15, dtype=np.float32).reshape(1, 1, 5, 3)
+        confidence = np.asarray([[[-1.0, 1.0, 2.0, 3.0, 4.0]]], dtype=np.float32)
+        colors = np.zeros((1, 1, 5, 3), dtype=np.uint8)
+        valid = np.ones((1, 1, 5), dtype=bool)
+
+        _, _, _, standard = reconstruction._select_vggt_points(
+            np, world, confidence, colors, 100, valid,
+            confidence_percentile=45,
+        )
+        _, _, _, high = reconstruction._select_vggt_points(
+            np, world, confidence, colors, 100, valid,
+            confidence_percentile=20,
+        )
+        _, _, _, full = reconstruction._select_vggt_points(
+            np, world, confidence, colors, 100, valid,
+            confidence_percentile=0,
+        )
+
+        self.assertEqual(standard["confidence_kept"], 2)
+        self.assertEqual(high["confidence_kept"], 3)
+        self.assertEqual(full["confidence_kept"], 5)
+        self.assertIsNone(full["confidence_threshold"])
+
+    def test_worker_passes_the_persisted_density_to_reconstruction(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SpatialStore(Path(directory) / "spatial")
             manifest = store.create_scene(
-                "Front", ["front", "garden"], point_budget=500_000
+                "Front", ["front", "garden"], density_preset="full"
             )
             with mock.patch.object(
                 reconstruction, "reconstruct_run", return_value={}
@@ -35,7 +59,9 @@ class SpatialReconstructionTests(unittest.TestCase):
                 )
 
             self.assertTrue(found)
-            self.assertEqual(reconstruct.call_args.kwargs["point_budget"], 500_000)
+            self.assertEqual(reconstruct.call_args.kwargs["point_budget"], 2_000_000)
+            self.assertEqual(reconstruct.call_args.kwargs["density_preset"], "full")
+            self.assertEqual(reconstruct.call_args.kwargs["confidence_percentile"], 0)
             self.assertEqual(
                 reconstruct.call_args.args[4], manifest["run"]["id"]
             )
@@ -203,8 +229,10 @@ class SpatialReconstructionTests(unittest.TestCase):
             self.assertEqual(result["run"]["status"], "ready")
             self.assertEqual(result["run"]["kind"], "opencv_projective")
             self.assertEqual(result["stats"]["points"], 3)
-            self.assertEqual(result["stats"]["point_budget"], 300_000)
-            self.assertEqual(build_cloud.call_args.kwargs["max_points"], 300_000)
+            self.assertEqual(result["stats"]["point_budget"], 500_000)
+            self.assertEqual(result["stats"]["density_preset"], "high")
+            self.assertEqual(result["stats"]["confidence_percentile"], 20)
+            self.assertEqual(build_cloud.call_args.kwargs["max_points"], 500_000)
             self.assertEqual(result["stats"]["faces"], 1)
             self.assertEqual(result["warnings"], [])
             run_dir = store.run_directory(scene_id, run_id)

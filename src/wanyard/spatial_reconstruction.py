@@ -21,9 +21,12 @@ import uuid
 
 from . import stereo
 from .spatial import (
+    DEFAULT_SPATIAL_DENSITY,
     DEFAULT_SPATIAL_POINT_BUDGET,
     LEGACY_SPATIAL_POINT_BUDGET,
     SpatialStore,
+    SPATIAL_DENSITY_PRESETS,
+    validate_spatial_density,
     validate_spatial_point_budget,
 )
 
@@ -92,6 +95,8 @@ def process_next_run(store: SpatialStore, video_db, video_dir: Path) -> bool:
         job["camera_ids"],
         job.get("feasibility", {}),
         point_budget=job.get("point_budget", LEGACY_SPATIAL_POINT_BUDGET),
+        density_preset=job.get("density_preset", "standard"),
+        confidence_percentile=job.get("confidence_percentile", 45.0),
     )
     return True
 
@@ -106,9 +111,20 @@ def reconstruct_run(
     feasibility: dict | None = None,
     *,
     point_budget: int = DEFAULT_SPATIAL_POINT_BUDGET,
+    density_preset: str = DEFAULT_SPATIAL_DENSITY,
+    confidence_percentile: float = SPATIAL_DENSITY_PRESETS[
+        DEFAULT_SPATIAL_DENSITY
+    ]["confidence_percentile"],
 ) -> dict:
     """Build one run while holding an inter-process ownership lock."""
     point_budget = validate_spatial_point_budget(point_budget)
+    density_preset = validate_spatial_density(density_preset)
+    if (
+        isinstance(confidence_percentile, bool)
+        or not isinstance(confidence_percentile, (int, float))
+        or not 0 <= confidence_percentile <= 100
+    ):
+        raise SpatialReconstructionError("confidence percentile must be between 0 and 100")
     lock_path = store.run_directory(scene_id, run_id) / ".reconstruction.lock"
     with lock_path.open("a+b") as lock:
         try:
@@ -119,7 +135,7 @@ def reconstruct_run(
             ) from exc
         return _reconstruct_run_locked(
             store, video_db, video_dir, scene_id, run_id, camera_ids, feasibility,
-            point_budget,
+            point_budget, density_preset, float(confidence_percentile),
         )
 
 
@@ -132,6 +148,10 @@ def _reconstruct_run_locked(
     camera_ids: list[str],
     feasibility: dict | None = None,
     point_budget: int = DEFAULT_SPATIAL_POINT_BUDGET,
+    density_preset: str = DEFAULT_SPATIAL_DENSITY,
+    confidence_percentile: float = SPATIAL_DENSITY_PRESETS[
+        DEFAULT_SPATIAL_DENSITY
+    ]["confidence_percentile"],
 ) -> dict:
     """Build and publish one queued projective point-cloud preview."""
     engine = os.environ.get("WANYARD_SPATIAL_ENGINE", "vggt").strip().lower()
@@ -156,9 +176,11 @@ def _reconstruct_run_locked(
                     "WANYARD_SPATIAL_MODEL", "/app/models/vggt/model.pt"
                 )),
                 max_points=point_budget,
+                confidence_percentile=confidence_percentile,
             )
             artifacts = _publish_vggt_artifacts(run_dir, cloud, camera_ids)
             published_point_count = len(cloud.raw_points)
+            selection_stats = cloud.filter_stats.get("raw_selection", {})
             warnings = []
         else:
             left_frame = frames[used_camera_ids.index(left_id)]
@@ -173,6 +195,7 @@ def _reconstruct_run_locked(
             )
             artifacts = _publish_artifacts(run_dir, cloud, camera_ids)
             published_point_count = len(cloud.points)
+            selection_stats = {}
             warnings = []
         if unavailable:
             warnings.append(
@@ -188,6 +211,14 @@ def _reconstruct_run_locked(
             stats={
                 "points": int(published_point_count),
                 "point_budget": int(point_budget),
+                "density_preset": density_preset,
+                "confidence_percentile": float(confidence_percentile),
+                "candidate_points": int(selection_stats.get(
+                    "valid_points", published_point_count
+                )),
+                "confidence_kept_points": int(selection_stats.get(
+                    "confidence_kept", published_point_count
+                )),
                 "faces": int(len(cloud.faces)),
                 "camera_count": len(camera_ids),
                 "reconstructed_camera_count": len(used_camera_ids),
@@ -270,6 +301,7 @@ def build_vggt_cloud(
     camera_ids: list[str],
     model_path: Path,
     max_points: int = 120_000,
+    confidence_percentile: float = 45.0,
 ) -> NeuralCloud:
     """Infer coherent cameras and dense relative geometry with official VGGT."""
     if len(frames) < 2 or len(frames) != len(camera_ids):
@@ -336,11 +368,13 @@ def build_vggt_cloud(
         rgb = (
             images.detach().float().cpu().permute(0, 2, 3, 1).numpy() * 255.0
         ).clip(0, 255).astype(np.uint8)
-        points, colors, selected = _select_vggt_points(
-            np, world_points, point_confidence, rgb, max_points, clean_valid
+        points, colors, selected, clean_selection_stats = _select_vggt_points(
+            np, world_points, point_confidence, rgb, max_points, clean_valid,
+            confidence_percentile=confidence_percentile,
         )
-        raw_points, raw_colors, raw_selected = _select_vggt_points(
-            np, world_points, point_confidence, rgb, max_points, live_valid
+        raw_points, raw_colors, raw_selected, raw_selection_stats = _select_vggt_points(
+            np, world_points, point_confidence, rgb, max_points, live_valid,
+            confidence_percentile=confidence_percentile,
         )
         spatial_support, spatial_stats = _spatial_support_mask(np, points)
         points = points[spatial_support]
@@ -378,6 +412,8 @@ def build_vggt_cloud(
             filter_stats={
                 "raw_points": int(len(raw_points)),
                 "clean_points": int(len(points)),
+                "raw_selection": raw_selection_stats,
+                "clean_selection": clean_selection_stats,
                 "depth_edge_pixels_removed": int((live_valid & depth_edges).sum()),
                 "cross_view_pixels_rejected": int(
                     (live_valid & ~depth_edges & ~cross_view_valid).sum()
@@ -457,23 +493,48 @@ def _preprocess_vggt_frames(cv2, np, torch, frames):
 
 
 def _select_vggt_points(
-    np, world_points, confidence, rgb, max_points: int, live_valid=None
+    np, world_points, confidence, rgb, max_points: int, live_valid=None, *,
+    confidence_percentile: float = 45.0,
 ):
     points = world_points.reshape(-1, 3)
     scores = confidence.reshape(-1)
     colors = rgb.reshape(-1, 3)
-    valid = np.isfinite(points).all(axis=1) & np.isfinite(scores) & (scores > 1e-5)
+    input_points = int(len(points))
+    valid = np.isfinite(points).all(axis=1) & np.isfinite(scores)
+    if confidence_percentile > 0:
+        valid &= scores > 1e-5
     if live_valid is not None:
         valid &= live_valid.reshape(-1)
+    valid_points = int(valid.sum())
     if not bool(valid.any()):
-        return points[:0], colors[:0], np.empty(0, dtype=int)
-    threshold = np.percentile(scores[valid], 45)
-    selected = np.flatnonzero(valid & (scores >= threshold))
+        stats = {
+            "input_points": input_points,
+            "valid_points": 0,
+            "confidence_percentile": float(confidence_percentile),
+            "confidence_threshold": None,
+            "confidence_kept": 0,
+            "cap_kept": 0,
+        }
+        return points[:0], colors[:0], np.empty(0, dtype=int), stats
+    threshold = (
+        float(np.percentile(scores[valid], confidence_percentile))
+        if confidence_percentile > 0 else None
+    )
+    selected = np.flatnonzero(valid if threshold is None else valid & (scores >= threshold))
+    confidence_kept = int(len(selected))
     if len(selected) > max_points:
         selected = selected[
             np.linspace(0, len(selected) - 1, max_points, dtype=int)
         ]
-    return points[selected], colors[selected], selected
+    stats = {
+        "input_points": input_points,
+        "valid_points": valid_points,
+        "confidence_percentile": float(confidence_percentile),
+        "confidence_threshold": threshold,
+        "confidence_kept": confidence_kept,
+        "cap_kept": int(len(selected)),
+    }
+    return points[selected], colors[selected], selected, stats
 
 
 def _depth_edge_mask(np, depth, rtol: float = 0.03, kernel_size: int = 3):

@@ -196,7 +196,7 @@ class SpatialApiTests(unittest.TestCase):
             route = self._route(app, "/api/spatial/scenes/{scene_id}/runs")
             request = lambda: _request(
                 f"/api/spatial/scenes/{scene_id}/runs",
-                {"point_budget": 500_000},
+                {"density_preset": "full"},
                 path_params={"scene_id": scene_id},
             )
 
@@ -210,13 +210,14 @@ class SpatialApiTests(unittest.TestCase):
             self.assertEqual(duplicate.status_code, 200)
             self.assertFalse(duplicate_payload["queued"])
             self.assertEqual(queued_payload["run_id"], duplicate_payload["run_id"])
-            self.assertEqual(queued_payload["run"]["point_budget"], 500_000)
+            self.assertEqual(queued_payload["run"]["point_budget"], 2_000_000)
+            self.assertEqual(queued_payload["run"]["density_preset"], "full")
             self.assertEqual(
                 [run["status"] for run in store.list_scenes()[0]["runs"]],
                 ["queued", "ready"],
             )
 
-    def test_geometry_refresh_rejects_an_unknown_point_budget(self):
+    def test_geometry_refresh_rejects_an_unknown_density(self):
         with tempfile.TemporaryDirectory() as directory:
             app = self._app(directory)
             store = SpatialStore(Path(directory) / "spatial")
@@ -228,12 +229,12 @@ class SpatialApiTests(unittest.TestCase):
             route = self._route(app, "/api/spatial/scenes/{scene_id}/runs")
             response = asyncio.run(route.endpoint(_request(
                 f"/api/spatial/scenes/{initial['scene']['id']}/runs",
-                {"point_budget": 999_999},
+                {"density_preset": "extreme"},
                 path_params={"scene_id": initial["scene"]["id"]},
             )))
 
             self.assertEqual(response.status_code, 400)
-            self.assertIn("point_budget", json.loads(response.body)["error"])
+            self.assertIn("density_preset", json.loads(response.body)["error"])
 
 
 if __name__ == "__main__":

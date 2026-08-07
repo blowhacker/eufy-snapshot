@@ -51,10 +51,11 @@ from .retention import (
     validate_record_mode,
 )
 from .spatial import (
-    DEFAULT_SPATIAL_POINT_BUDGET,
+    DEFAULT_SPATIAL_DENSITY,
     SpatialStore,
     SpatialStoreError,
-    validate_spatial_point_budget,
+    density_for_legacy_budget,
+    validate_spatial_density,
 )
 from .spatial_feasibility import (
     SpatialFeasibilityError,
@@ -83,6 +84,14 @@ _EVENT_THUMB_MAX_W = 640
 # burst.  Let previews follow that span, but do not let a static false positive
 # monopolise the feed for an entire recording segment.
 _DETECTION_PREVIEW_MAX_SECONDS = 90.0
+
+
+def _requested_spatial_density(body: dict) -> str:
+    if "density_preset" in body:
+        return validate_spatial_density(body["density_preset"])
+    if "point_budget" in body:
+        return density_for_legacy_budget(body["point_budget"])
+    return DEFAULT_SPATIAL_DENSITY
 
 
 def _gzip_path_is_excluded(
@@ -2814,9 +2823,7 @@ def make_app(
         camera_ids = body.get("camera_ids")
         feasibility_id = body.get("feasibility_id")
         try:
-            point_budget = validate_spatial_point_budget(
-                body.get("point_budget", DEFAULT_SPATIAL_POINT_BUDGET)
-            )
+            density_preset = _requested_spatial_density(body)
         except SpatialStoreError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
@@ -2878,7 +2885,7 @@ def make_app(
                 name.strip(),
                 camera_ids,
                 report,
-                point_budget=point_budget,
+                density_preset=density_preset,
             )
         except SpatialStoreError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -2924,9 +2931,7 @@ def make_app(
                 {"error": "request body must be a JSON object"}, status_code=400
             )
         try:
-            point_budget = validate_spatial_point_budget(
-                body.get("point_budget", DEFAULT_SPATIAL_POINT_BUDGET)
-            )
+            density_preset = _requested_spatial_density(body)
         except SpatialStoreError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         scene = next(
@@ -2946,7 +2951,7 @@ def make_app(
             )
         try:
             manifest, created = await asyncio.to_thread(
-                spatial_store.queue_run, scene_id, point_budget=point_budget
+                spatial_store.queue_run, scene_id, density_preset=density_preset
             )
         except FileNotFoundError:
             return JSONResponse({"error": "spatial view not found"}, status_code=404)
