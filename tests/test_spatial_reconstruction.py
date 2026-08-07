@@ -21,6 +21,27 @@ from wanyard import spatial_reconstruction as reconstruction
 
 
 class SpatialReconstructionTests(unittest.TestCase):
+    def test_reconstruction_steps_back_from_an_undecodable_segment_tail(self):
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+
+        def read_frame(_db, _directory, camera_id, timestamp):
+            if timestamp == 100.0:
+                return SimpleNamespace(frame=None, status="pending")
+            return SimpleNamespace(frame=frame + (camera_id == "garden"), status="ok")
+
+        with mock.patch.object(reconstruction.stereo, "_read_frame", side_effect=read_frame):
+            timestamp, frames, camera_ids, unavailable = (
+                reconstruction._read_reconstruction_frames(
+                    object(), Path("video"), ["front", "garden"],
+                    "front", "garden", 100.0,
+                )
+            )
+
+        self.assertEqual(timestamp, 95.0)
+        self.assertEqual(camera_ids, ["front", "garden"])
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(unavailable, [])
+
     def test_live_map_preserves_point_order_and_camera_pixels(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "live-map.bin"
