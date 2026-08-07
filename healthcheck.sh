@@ -31,6 +31,10 @@ video_dir = Path(os.environ.get('VIDEO_DIR', '/app/video'))
 live_dir = video_dir / 'live'
 if live_dir.exists():
     for cam_dir in live_dir.iterdir():
+        # Removed cameras can leave archival playlists behind. They are not a
+        # signal for the health of the currently configured recording set.
+        if cam_dir.name not in threads:
+            continue
         m3u8 = cam_dir / 'live.m3u8'
         if m3u8.exists():
             age = time.time() - m3u8.stat().st_mtime
