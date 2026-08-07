@@ -4,7 +4,9 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +35,7 @@ class SpatialStore:
 
     def __init__(self, root: Path | str):
         self.root = Path(root)
+        self._mutation_lock = threading.Lock()
 
     def create_scene(
         self,
@@ -84,6 +87,66 @@ class SpatialStore:
             self._write_manifest(run_dir / "manifest.json", manifest)
             return manifest
         raise SpatialStoreError("could not allocate a unique scene run")
+
+    def queue_run(self, scene_id: str) -> tuple[dict, bool]:
+        """Queue one replacement run, returning an existing active run idempotently."""
+        self._validate_identifier(scene_id, "scene")
+        with self._mutation_lock:
+            manifests = self._scene_manifests(scene_id)
+            if not manifests:
+                raise FileNotFoundError(self.root / scene_id)
+            for manifest in manifests:
+                if manifest["run"].get("status") in {"queued", "running"}:
+                    return manifest, False
+
+            source = manifests[0]
+            for _ in range(32):
+                run_id = f"run-{uuid.uuid4().hex}"
+                run_dir = self.root / scene_id / run_id
+                try:
+                    run_dir.mkdir(parents=True)
+                except FileExistsError:
+                    continue
+                created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                manifest = {
+                    "scene": dict(source["scene"]),
+                    "run": {
+                        "id": run_id,
+                        "created_at": created_at,
+                        "kind": "vggt_neural",
+                        "metric": False,
+                        "status": "queued",
+                    },
+                    "artifacts": {},
+                }
+                if source.get("feasibility") is not None:
+                    manifest["feasibility"] = source["feasibility"]
+                self._write_manifest(run_dir / "manifest.json", manifest)
+                return manifest, True
+        raise SpatialStoreError("could not allocate a unique reconstruction run")
+
+    def prune_ready_runs(self, scene_id: str, keep: int = 3) -> list[str]:
+        """Delete older successful runs after a replacement has been published."""
+        self._validate_identifier(scene_id, "scene")
+        if not isinstance(keep, int) or keep < 1:
+            raise SpatialStoreError("keep must be a positive integer")
+        removed = []
+        with self._mutation_lock:
+            ready = [
+                manifest for manifest in self._scene_manifests(scene_id)
+                if manifest["run"].get("status") == "ready"
+            ]
+            for manifest in ready[keep:]:
+                run_id = manifest["run"]["id"]
+                run_dir = self.root / scene_id / run_id
+                if (
+                    run_dir.is_symlink()
+                    or run_dir.parent.resolve() != (self.root / scene_id).resolve()
+                ):
+                    raise SpatialStoreError("run directory escapes its scene")
+                shutil.rmtree(run_dir)
+                removed.append(run_id)
+        return removed
 
     def update_run(
         self,
@@ -157,6 +220,27 @@ class SpatialStore:
             })
         pending.sort(key=lambda job: (job["created_at"], job["scene_id"], job["run_id"]))
         return pending
+
+    def _scene_manifests(self, scene_id: str) -> list[dict]:
+        scene_dir = self.root / scene_id
+        if scene_dir.is_symlink() or not scene_dir.is_dir():
+            return []
+        manifests = []
+        for path in scene_dir.glob("*/manifest.json"):
+            try:
+                manifest = self._read_manifest(path)
+            except (OSError, json.JSONDecodeError, SpatialStoreError):
+                continue
+            if manifest["scene"]["id"] != scene_id:
+                raise SpatialStoreError("manifest location does not match its scene identifier")
+            manifests.append(manifest)
+        manifests.sort(
+            key=lambda item: (
+                str(item["run"].get("created_at", "")), item["run"]["id"]
+            ),
+            reverse=True,
+        )
+        return manifests
 
     def run_directory(self, scene_id: str, run_id: str) -> Path:
         """Resolve a validated run directory for trusted worker output."""

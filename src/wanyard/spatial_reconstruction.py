@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 import fcntl
 import gc
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -20,6 +21,9 @@ import uuid
 
 from . import stereo
 from .spatial import SpatialStore
+
+
+LOG = logging.getLogger(__name__)
 
 
 class SpatialReconstructionError(RuntimeError):
@@ -165,7 +169,7 @@ def _reconstruct_run_locked(
                 "Some selected cameras had no readable synchronized frame: "
                 + "; ".join(unavailable)
             )
-        return store.update_run(
+        result = store.update_run(
             scene_id,
             run_id,
             status="ready",
@@ -181,6 +185,11 @@ def _reconstruct_run_locked(
             },
             warnings=warnings,
         )
+        try:
+            store.prune_ready_runs(scene_id, keep=3)
+        except Exception:
+            LOG.warning("could not prune old spatial runs for %s", scene_id, exc_info=True)
+        return result
     except Exception as exc:
         message = str(exc).strip() or exc.__class__.__name__
         try:

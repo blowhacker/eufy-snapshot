@@ -7,12 +7,14 @@
   const loading = document.getElementById('loading');
   const loadingDetail = document.getElementById('loadingDetail');
   const sceneSelect = document.getElementById('sceneSelect');
-  const state = { scenes: [], scene: null, run: null, viewer: null, sources: [], feasibility: null, previousFocus: null, runPoll: null };
+  const refreshButton = document.getElementById('refreshGeometry');
+  const refreshMessage = document.getElementById('refreshMessage');
+  const state = { scenes: [], scene: null, run: null, pendingRun: null, viewer: null, sources: [], feasibility: null, previousFocus: null, runPoll: null };
 
-  function artifactUrl(name) {
-    const path = ['/api/spatial', state.scene.id, state.run.id, name]
+  function artifactUrl(name, scene = state.scene, run = state.run) {
+    const path = ['/api/spatial', scene.id, run.id, name]
       .map((part, index) => index ? encodeURIComponent(part) : part).join('/');
-    return path + '?v=' + encodeURIComponent(state.run.updated_at || state.run.created_at || '1');
+    return path + '?v=' + encodeURIComponent(run.updated_at || run.created_at || '1');
   }
 
   function niceLabel(value) {
@@ -56,13 +58,83 @@
     fallbackImage.src = artifactUrl('pointcloud_preview');
   }
 
+  function sceneRunState(scene) {
+    const runs = scene.runs || [];
+    const pending = runs.find(run => run.status === 'queued' || run.status === 'running') || null;
+    const ready = runs.find(run => run.status === 'ready' && run.artifacts?.point_cloud) || null;
+    const latest = runs[0] || null;
+    const failure = !pending && latest?.status === 'failed'
+      && (!ready || String(latest.created_at || '') > String(ready.created_at || ''))
+      ? latest : null;
+    return { pending, ready, failure, display: ready || pending || latest };
+  }
+
+  function elapsedSeconds(run) {
+    const started = Date.parse(run.updated_at || run.created_at || '');
+    return Number.isFinite(started) ? Math.max(0, Math.round((Date.now() - started) / 1000)) : 0;
+  }
+
+  function renderRefreshState(pending, failure = null) {
+    state.pendingRun = pending;
+    const runBadge = document.getElementById('runBadge');
+    runBadge.classList.toggle('busy', Boolean(pending));
+    if (pending) {
+      const running = pending.status === 'running';
+      const status = running ? `Reconstructing · ${elapsedSeconds(pending)}s` : 'Geometry queued';
+      refreshButton.disabled = true;
+      refreshButton.textContent = status;
+      refreshMessage.hidden = false;
+      refreshMessage.className = 'sp-refresh-message busy';
+      refreshMessage.textContent = running
+        ? 'Building a replacement. The current live model remains active.'
+        : 'Waiting for the reconstruction worker. The current model remains active.';
+      runBadge.textContent = status;
+      return;
+    }
+    refreshButton.disabled = !(state.scene && state.run?.artifacts?.point_cloud);
+    refreshButton.textContent = failure ? 'Retry geometry' : 'Refresh geometry';
+    if (failure) {
+      refreshMessage.hidden = false;
+      refreshMessage.className = 'sp-refresh-message failed';
+      refreshMessage.textContent = `Refresh failed: ${failure.error || 'reconstruction failed'}. Existing geometry retained.`;
+    } else {
+      refreshMessage.hidden = true;
+      refreshMessage.textContent = '';
+    }
+    if (state.run) runBadge.textContent = niceLabel(state.run.kind || 'reconstruction');
+  }
+
+  function scheduleRunPoll(sceneId) {
+    if (state.runPoll) clearTimeout(state.runPoll);
+    state.runPoll = setTimeout(async () => {
+      state.runPoll = null;
+      try {
+        await refreshScenes();
+        const updated = state.scenes.find(item => item.id === sceneId);
+        if (updated && state.scene?.id === sceneId) {
+          sceneSelect.value = sceneId;
+          await openScene(updated);
+        }
+      } catch (error) {
+        console.error(error);
+        if (state.scene?.id === sceneId) scheduleRunPoll(sceneId);
+      }
+    }, 1500);
+  }
+
   async function openScene(scene) {
     if (state.runPoll) { clearTimeout(state.runPoll); state.runPoll = null; }
+    const previousSceneId = state.scene?.id;
+    const previousRun = state.run;
+    const previousViewer = state.viewer;
     state.scene = scene;
-    state.run = scene.runs[0];
-    if (!state.run) return showError('This scene has no reconstruction runs.');
-    renderMetadata();
-    if (!state.run.artifacts || !state.run.artifacts.point_cloud) {
+    const runs = sceneRunState(scene);
+    if (!runs.display) return showError('This scene has no reconstruction runs.');
+
+    if (!runs.ready) {
+      state.run = runs.display;
+      renderMetadata();
+      renderRefreshState(runs.pending, runs.failure);
       if (state.viewer) { state.viewer.destroy(); state.viewer = null; }
       canvas.hidden = true;
       depthImage.hidden = true;
@@ -78,53 +150,76 @@
         ? 'Matching and triangulating the shared camera view'
         : 'Waiting for the reconstruction worker');
       document.querySelector('.sp-stage-bottom').hidden = true;
-      if (state.run.status === 'queued' || state.run.status === 'running') {
-        const sceneId = scene.id;
-        state.runPoll = setTimeout(async () => {
-          state.runPoll = null;
-          try {
-            await refreshScenes();
-            const updated = state.scenes.find(item => item.id === sceneId);
-            if (updated && state.scene && state.scene.id === sceneId) {
-              sceneSelect.value = sceneId;
-              await openScene(updated);
-            }
-          } catch (error) {
-            console.error(error);
-          }
-        }, 2000);
-      }
+      if (runs.pending) scheduleRunPoll(scene.id);
       return;
     }
+
+    const alreadyLoaded = previousSceneId === scene.id
+      && previousRun?.id === runs.ready.id && Boolean(previousViewer);
+    if (alreadyLoaded) {
+      state.run = runs.ready;
+      renderMetadata();
+      renderRefreshState(runs.pending, runs.failure);
+      document.querySelector('.sp-stage-bottom').hidden = false;
+      if (runs.pending) scheduleRunPoll(scene.id);
+      return;
+    }
+
+    const replacingCurrent = previousSceneId === scene.id && Boolean(previousViewer);
+    if (!replacingCurrent && state.viewer) {
+      state.viewer.destroy();
+      state.viewer = null;
+    }
     document.querySelector('.sp-stage-bottom').hidden = false;
-    loading.hidden = false;
-    loading.querySelector('span').hidden = false;
-    loading.querySelector('strong').textContent = 'Loading geometry';
-    loadingDetail.textContent = 'Fetching point cloud';
+    if (!replacingCurrent) {
+      loading.hidden = false;
+      loading.querySelector('span').hidden = false;
+      loading.querySelector('strong').textContent = 'Loading geometry';
+      loadingDetail.textContent = 'Fetching point cloud';
+    } else {
+      refreshMessage.hidden = false;
+      refreshMessage.className = 'sp-refresh-message busy';
+      refreshMessage.textContent = 'New geometry ready · validating before swap.';
+    }
     try {
       const [response, liveMapResponse] = await Promise.all([
-        fetch(artifactUrl('point_cloud')),
-        state.run.artifacts.live_map ? fetch(artifactUrl('live_map')) : Promise.resolve(null),
+        fetch(artifactUrl('point_cloud', scene, runs.ready)),
+        runs.ready.artifacts.live_map
+          ? fetch(artifactUrl('live_map', scene, runs.ready)) : Promise.resolve(null),
       ]);
       if (!response.ok) throw new Error('Point cloud returned ' + response.status);
       const buffer = await response.arrayBuffer();
-      loadingDetail.textContent = 'Preparing ' + (runPointCount(buffer) || 'the') + ' points';
+      if (!replacingCurrent) loadingDetail.textContent = 'Preparing ' + (runPointCount(buffer) || 'the') + ' points';
       const cloud = parsePly(buffer);
       const liveMap = liveMapResponse && liveMapResponse.ok
         ? parseLiveMap(await liveMapResponse.arrayBuffer(), cloud.count)
         : null;
-      const liveCameraIds = state.run.stats?.reconstructed_camera_ids || state.scene.camera_ids;
+      if (state.scene?.id !== scene.id) return;
+      const liveCameraIds = runs.ready.stats?.reconstructed_camera_ids || scene.camera_ids;
+      const previousView = replacingCurrent ? state.viewer?.snapshot() : null;
       if (state.viewer) state.viewer.destroy();
-      state.viewer = createViewer(canvas, cloud, liveMap, liveCameraIds);
+      state.run = runs.ready;
+      state.viewer = createViewer(canvas, cloud, liveMap, liveCameraIds, previousView);
+      renderMetadata();
+      renderRefreshState(runs.pending, runs.failure);
       setArtifactView('cloud');
       loading.hidden = true;
     } catch (error) {
       console.error(error);
-      fallbackImage.hidden = false;
-      canvas.hidden = true;
-      loading.hidden = true;
-      document.getElementById('interactionHint').textContent = 'Static preview · WebGL geometry unavailable';
+      if (replacingCurrent) {
+        state.run = previousRun;
+        renderMetadata();
+        renderRefreshState(null, { error: `new geometry could not be loaded (${error.message})` });
+      } else {
+        state.run = runs.ready;
+        renderMetadata();
+        fallbackImage.hidden = false;
+        canvas.hidden = true;
+        loading.hidden = true;
+        document.getElementById('interactionHint').textContent = 'Static preview · WebGL geometry unavailable';
+      }
     }
+    if (runs.pending && state.scene?.id === scene.id) scheduleRunPoll(scene.id);
   }
 
   function runPointCount(buffer) {
@@ -289,7 +384,7 @@
     }
   }
 
-  function createViewer(target, cloud, liveMap, cameraIds) {
+  function createViewer(target, cloud, liveMap, cameraIds, initialView = null) {
     target.hidden = false;
     fallbackImage.hidden = true;
     const gl = target.getContext('webgl', { antialias: true, alpha: true });
@@ -447,7 +542,14 @@
       liveToggle.dataset.ready = 'true';
       liveToggle.textContent = 'Live colour · on';
     }
-    const view = { yaw: -.35, pitch: .12, distance: 3.0, pointSize: 2.25, orbiting: false, live: liveAvailable };
+    const view = {
+      yaw: initialView?.yaw ?? -.35,
+      pitch: initialView?.pitch ?? .12,
+      distance: initialView?.distance ?? 3.0,
+      pointSize: initialView?.pointSize ?? 2.25,
+      orbiting: initialView?.orbiting ?? false,
+      live: liveAvailable && initialView?.live !== false,
+    };
     let pointer = null;
     let animation;
     let previousTime = performance.now();
@@ -487,34 +589,38 @@
       animation = requestAnimationFrame(draw);
     }
     function reset() { view.yaw = -.35; view.pitch = .12; view.distance = 3.0; }
-    target.addEventListener('pointerdown', event => {
+    function pointerDown(event) {
       pointer = { id: event.pointerId, x: event.clientX, y: event.clientY };
       target.setPointerCapture(event.pointerId);
       target.classList.add('dragging');
-    });
-    target.addEventListener('pointermove', event => {
+    }
+    function pointerMove(event) {
       if (!pointer || pointer.id !== event.pointerId) return;
       view.yaw += (event.clientX - pointer.x) * .006;
       view.pitch = Math.max(-1.45, Math.min(1.45, view.pitch + (event.clientY - pointer.y) * .006));
       pointer.x = event.clientX; pointer.y = event.clientY;
-    });
+    }
     function release(event) {
       if (pointer && pointer.id === event.pointerId) pointer = null;
       target.classList.remove('dragging');
     }
-    target.addEventListener('pointerup', release);
-    target.addEventListener('pointercancel', release);
-    target.addEventListener('wheel', event => {
+    function wheel(event) {
       event.preventDefault();
       view.distance = Math.max(1.15, Math.min(9, view.distance * Math.exp(event.deltaY * .001)));
-    }, { passive: false });
+    }
+    target.addEventListener('pointerdown', pointerDown);
+    target.addEventListener('pointermove', pointerMove);
+    target.addEventListener('pointerup', release);
+    target.addEventListener('pointercancel', release);
+    target.addEventListener('wheel', wheel, { passive: false });
     target.addEventListener('dblclick', reset);
     document.getElementById('pointSize').oninput = event => { view.pointSize = Number(event.target.value); };
     document.getElementById('resetView').onclick = reset;
     const liveToggle = document.getElementById('liveToggle');
     liveToggle.disabled = !liveAvailable;
     liveToggle.setAttribute('aria-pressed', String(view.live));
-    liveToggle.textContent = liveAvailable ? 'Live colour · connecting' : 'Live unavailable';
+    liveToggle.textContent = !liveAvailable
+      ? 'Live unavailable' : view.live ? 'Live colour · connecting' : 'Live colour · off';
     liveToggle.onclick = () => {
       if (!liveAvailable) return;
       view.live = !view.live;
@@ -523,25 +629,40 @@
         ? (atlasReady ? 'Live colour · on' : 'Live colour · connecting')
         : 'Live colour · off';
     };
-    document.getElementById('orbitToggle').onclick = event => {
+    const orbitToggle = document.getElementById('orbitToggle');
+    orbitToggle.textContent = view.orbiting ? 'Orbiting' : 'Orbit paused';
+    orbitToggle.setAttribute('aria-pressed', String(view.orbiting));
+    orbitToggle.onclick = event => {
       view.orbiting = !view.orbiting;
       event.currentTarget.textContent = view.orbiting ? 'Orbiting' : 'Orbit paused';
       event.currentTarget.setAttribute('aria-pressed', String(view.orbiting));
     };
+    document.getElementById('pointSize').value = String(view.pointSize);
     animation = requestAnimationFrame(draw);
-    return { destroy() {
-      cancelAnimationFrame(animation);
-      liveResources.hls.forEach(hls => { try { hls.destroy(); } catch {} });
-      liveResources.peerConnections.forEach(pc => { try { pc.close(); } catch {} });
-      liveResources.videos.forEach(video => {
-        try { video.pause(); video.srcObject = null; video.removeAttribute('src'); video.load(); video.remove(); } catch {}
-      });
-      gl.deleteTexture(liveTexture);
-      gl.deleteBuffer(positionBuffer); gl.deleteBuffer(colorBuffer);
-      gl.deleteBuffer(liveUvBuffer); gl.deleteBuffer(cameraBuffer);
-      if (indexBuffer) gl.deleteBuffer(indexBuffer);
-      gl.deleteProgram(program);
-    } };
+    return {
+      snapshot() {
+        return { ...view };
+      },
+      destroy() {
+        cancelAnimationFrame(animation);
+        target.removeEventListener('pointerdown', pointerDown);
+        target.removeEventListener('pointermove', pointerMove);
+        target.removeEventListener('pointerup', release);
+        target.removeEventListener('pointercancel', release);
+        target.removeEventListener('wheel', wheel);
+        target.removeEventListener('dblclick', reset);
+        liveResources.hls.forEach(hls => { try { hls.destroy(); } catch {} });
+        liveResources.peerConnections.forEach(pc => { try { pc.close(); } catch {} });
+        liveResources.videos.forEach(video => {
+          try { video.pause(); video.srcObject = null; video.removeAttribute('src'); video.load(); video.remove(); } catch {}
+        });
+        gl.deleteTexture(liveTexture);
+        gl.deleteBuffer(positionBuffer); gl.deleteBuffer(colorBuffer);
+        gl.deleteBuffer(liveUvBuffer); gl.deleteBuffer(cameraBuffer);
+        if (indexBuffer) gl.deleteBuffer(indexBuffer);
+        gl.deleteProgram(program);
+      },
+    };
   }
 
   function setArtifactView(viewName) {
@@ -714,7 +835,7 @@
   }
   function showEmptySpatial() {
     if (state.runPoll) { clearTimeout(state.runPoll); state.runPoll = null; }
-    state.scene = null; state.run = null;
+    state.scene = null; state.run = null; state.pendingRun = null;
     if (state.viewer) { state.viewer.destroy(); state.viewer = null; }
     canvas.hidden = true; depthImage.hidden = true; fallbackImage.hidden = true;
     document.querySelector('.sp-stage-bottom').hidden = true;
@@ -732,6 +853,37 @@
     document.getElementById('cameraList').replaceChildren();
     document.getElementById('downloadCloud').hidden = true;
     document.getElementById('removeSpatialView').hidden = true;
+    refreshButton.disabled = true;
+    refreshButton.textContent = 'Refresh geometry';
+    refreshMessage.hidden = true;
+  }
+
+  async function refreshGeometry() {
+    if (!state.scene || !state.run?.artifacts?.point_cloud || state.pendingRun) return;
+    const sceneId = state.scene.id;
+    refreshButton.disabled = true;
+    refreshButton.textContent = 'Queuing geometry…';
+    refreshMessage.hidden = false;
+    refreshMessage.className = 'sp-refresh-message busy';
+    refreshMessage.textContent = 'Requesting a new reconstruction. The current model remains active.';
+    try {
+      const response = await fetch(
+        '/api/spatial/scenes/' + encodeURIComponent(sceneId) + '/runs',
+        { method: 'POST' },
+      );
+      if (!response.ok) throw await responseError(response, 'Unable to refresh geometry');
+      const payload = await response.json();
+      renderRefreshState(payload.run || { status: 'queued', created_at: new Date().toISOString() });
+      await refreshScenes();
+      const updated = state.scenes.find(scene => scene.id === sceneId);
+      if (updated && state.scene?.id === sceneId) {
+        sceneSelect.value = sceneId;
+        await openScene(updated);
+      }
+    } catch (error) {
+      console.error(error);
+      renderRefreshState(null, { error: error.message });
+    }
   }
   async function removeCurrentScene() {
     if (!state.scene) return;
@@ -792,6 +944,7 @@
   document.querySelectorAll('[data-close-spatial-modal]').forEach(button => button.addEventListener('click', closeCreateModal));
   checkButton.addEventListener('click', checkFeasibility);
   createButton.addEventListener('click', createScene);
+  refreshButton.addEventListener('click', refreshGeometry);
   document.getElementById('removeSpatialView').addEventListener('click', removeCurrentScene);
   document.addEventListener('keydown', event => { if (event.key === 'Escape' && !createModal.hidden) closeCreateModal(); });
 

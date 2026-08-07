@@ -2901,6 +2901,48 @@ def make_app(
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
+    async def api_spatial_runs(request: Request) -> Response:
+        scene_id = request.path_params.get("scene_id", "")
+        scene = next(
+            (item for item in spatial_store.list_scenes() if item["id"] == scene_id),
+            None,
+        )
+        if scene is None:
+            return JSONResponse({"error": "spatial view not found"}, status_code=404)
+        active_ids = {source["id"] for source in _sources_list(config, source_db)}
+        missing = [
+            camera_id for camera_id in scene["camera_ids"]
+            if camera_id not in active_ids
+        ]
+        if missing:
+            return JSONResponse(
+                {"error": f"camera not found: {missing[0]}"}, status_code=409
+            )
+        try:
+            manifest, created = await asyncio.to_thread(
+                spatial_store.queue_run, scene_id
+            )
+        except FileNotFoundError:
+            return JSONResponse({"error": "spatial view not found"}, status_code=404)
+        except SpatialStoreError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        run = {
+            **manifest["run"],
+            "artifacts": manifest["artifacts"],
+            "stats": manifest.get("stats", {}),
+            "warnings": manifest.get("warnings", []),
+        }
+        return JSONResponse({
+            "scene_id": scene_id,
+            "run": run,
+            "run_id": run["id"],
+            "queued": created,
+            "message": (
+                "Geometry reconstruction queued."
+                if created else "Geometry reconstruction is already in progress."
+            ),
+        }, status_code=202 if created else 200)
+
     async def api_spatial_scene(request: Request) -> Response:
         scene_id = request.path_params.get("scene_id", "")
         try:
@@ -2934,6 +2976,7 @@ def make_app(
         Route("/api/health",                api_health),
         Route("/api/spatial/scenes",        api_spatial_scenes, methods=["GET", "POST"]),
         Route("/api/spatial/scenes/{scene_id}", api_spatial_scene, methods=["DELETE"]),
+        Route("/api/spatial/scenes/{scene_id}/runs", api_spatial_runs, methods=["POST"]),
         Route("/api/spatial/feasibility",   api_spatial_feasibility, methods=["POST"]),
         Route("/api/spatial/{scene_id}/{run_id}/{artifact_name}", api_spatial_artifact),
         Route("/api/thumb",                 api_thumb),

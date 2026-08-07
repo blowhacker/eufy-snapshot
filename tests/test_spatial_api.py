@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
 
 from wanyard.config import AppConfig
 from wanyard.db import RtspSourceRow, SourceDB
+from wanyard.spatial import SpatialStore
 from wanyard.video import VideoSegmentDB
 from wanyard.web import make_app
 
@@ -182,6 +183,36 @@ class SpatialApiTests(unittest.TestCase):
             self.assertEqual(removed.status_code, 200)
             self.assertTrue(json.loads(removed.body)["recoverable"])
             self.assertEqual(json.loads(listed.body)["scenes"], [])
+
+    def test_geometry_refresh_queues_one_idempotent_replacement_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(directory)
+            store = SpatialStore(Path(directory) / "spatial")
+            initial = store.create_scene("Front", ["front", "garden"])
+            scene_id = initial["scene"]["id"]
+            store.update_run(
+                scene_id, initial["run"]["id"], status="ready", artifacts={}
+            )
+            route = self._route(app, "/api/spatial/scenes/{scene_id}/runs")
+            request = lambda: _request(
+                f"/api/spatial/scenes/{scene_id}/runs", None,
+                path_params={"scene_id": scene_id},
+            )
+
+            queued = asyncio.run(route.endpoint(request()))
+            duplicate = asyncio.run(route.endpoint(request()))
+            queued_payload = json.loads(queued.body)
+            duplicate_payload = json.loads(duplicate.body)
+
+            self.assertEqual(queued.status_code, 202)
+            self.assertTrue(queued_payload["queued"])
+            self.assertEqual(duplicate.status_code, 200)
+            self.assertFalse(duplicate_payload["queued"])
+            self.assertEqual(queued_payload["run_id"], duplicate_payload["run_id"])
+            self.assertEqual(
+                [run["status"] for run in store.list_scenes()[0]["runs"]],
+                ["queued", "ready"],
+            )
 
 
 if __name__ == "__main__":

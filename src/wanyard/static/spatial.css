@@ -167,6 +167,7 @@
   text-transform: uppercase;
   backdrop-filter: blur(12px);
 }
+.sp-run-badge.busy { color: var(--amber); border-color: rgba(232, 165, 88, .3); }
 
 .sp-view-tools { display: flex; gap: 7px; align-items: center; }
 .sp-view-tools label {
@@ -180,6 +181,8 @@
 .sp-view-tools input { width: 70px; accent-color: var(--sp-cyan); }
 .sp-view-tools button { padding: 6px 8px; background: var(--sp-glass); font-size: 11px; }
 .sp-view-tools button:hover { color: var(--txt); }
+.sp-view-tools button:disabled { opacity: .55; cursor: not-allowed; }
+#refreshGeometry:disabled { cursor: wait; }
 .sp-view-tools button[aria-pressed="true"] { color: var(--sp-cyan); border-color: rgba(101, 226, 221, .42); }
 
 .sp-loading {
@@ -252,6 +255,9 @@
 .sp-facts dt { color: var(--txt-3); }
 .sp-facts dd { color: var(--txt-2); text-align: right; }
 #runStatus i { display: inline-block; width: 5px; height: 5px; margin: 0 4px 1px 0; border-radius: 50%; background: var(--green); }
+.sp-refresh-message { margin-top: 10px; color: var(--txt-3); font-size: 10px; line-height: 1.45; }
+.sp-refresh-message.busy { color: #c9ab83; }
+.sp-refresh-message.failed { color: #dc897d; }
 
 .sp-warning {
   margin-top: 24px;

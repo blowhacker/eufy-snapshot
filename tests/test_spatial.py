@@ -100,6 +100,50 @@ class SpatialStoreTests(unittest.TestCase):
                 store.run_directory(jobs[0]["scene_id"], jobs[0]["run_id"]).is_dir()
             )
 
+    def test_queue_run_is_idempotent_and_preserves_scene_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpatialStore(directory)
+            first = store.create_scene(
+                "Front", ["front", "garden"], {"id": "check-1", "mergeable": True}
+            )
+            scene_id = first["scene"]["id"]
+            first_id = first["run"]["id"]
+            store.update_run(scene_id, first_id, status="ready", artifacts={})
+
+            queued, created = store.queue_run(scene_id)
+            duplicate, duplicate_created = store.queue_run(scene_id)
+
+            self.assertTrue(created)
+            self.assertFalse(duplicate_created)
+            self.assertEqual(duplicate["run"]["id"], queued["run"]["id"])
+            self.assertNotEqual(queued["run"]["id"], first_id)
+            self.assertEqual(queued["scene"], first["scene"])
+            self.assertEqual(queued["feasibility"], first["feasibility"])
+
+    def test_prune_ready_runs_retains_three_newest_successes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpatialStore(directory)
+            manifest = store.create_scene("Front", ["front", "garden"])
+            scene_id = manifest["scene"]["id"]
+            run_ids = []
+            for index in range(5):
+                if index:
+                    manifest, created = store.queue_run(scene_id)
+                    self.assertTrue(created)
+                run_id = manifest["run"]["id"]
+                run_ids.append(run_id)
+                store.update_run(scene_id, run_id, status="ready", artifacts={})
+
+            removed = store.prune_ready_runs(scene_id, keep=3)
+
+            self.assertEqual(set(removed), set(run_ids[:2]))
+            self.assertEqual(
+                {run["id"] for run in store.list_scenes()[0]["runs"]},
+                set(run_ids[2:]),
+            )
+            for run_id in removed:
+                self.assertFalse((Path(directory) / scene_id / run_id).exists())
+
     def test_create_scene_rejects_unsafe_camera_identifiers(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(SpatialStoreError):
