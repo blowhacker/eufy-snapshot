@@ -780,6 +780,12 @@
 .s-field-row input:focus,
 .s-field-row select:focus { border-color: var(--amber-ring); }
 .s-field-hint { font-size: 11.5px; color: var(--txt-3); white-space: nowrap; }
+.s-field-row-area .s-field-hint {
+  grid-column: 2 / -1;
+  grid-row: 2;
+  white-space: normal;
+  line-height: 1.45;
+}
 
 /* Card sections */
 .s-card-section { padding: 20px; }
