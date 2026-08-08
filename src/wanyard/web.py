@@ -1229,12 +1229,41 @@ def make_app(
             headers={"Cache-Control": "no-store"},
         )
 
-    async def api_delete_source(request: Request) -> JSONResponse:
+    async def api_source(request: Request) -> JSONResponse:
         source_id = request.path_params["source_id"]
         if source_db is None:
             return JSONResponse({"error": "db_path not configured"}, status_code=501)
         if source_id not in source_db.ids():
             return JSONResponse({"error": "source not found"}, status_code=404)
+        if request.method == "PATCH":
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "invalid JSON"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"error": "request body must be a JSON object"}, status_code=400
+                )
+            raw_name = body.get("name")
+            if not isinstance(raw_name, str):
+                return JSONResponse({"error": "name must be a string"}, status_code=400)
+            name = raw_name.strip()
+            if not name:
+                return JSONResponse({"error": "name is required"}, status_code=400)
+            if len(name) > 80:
+                return JSONResponse(
+                    {"error": "name must be 80 characters or fewer"}, status_code=400
+                )
+            if any(ord(char) < 32 or ord(char) == 127 for char in name):
+                return JSONResponse(
+                    {"error": "name cannot contain control characters"}, status_code=400
+                )
+            if not source_db.rename(source_id, name):
+                return JSONResponse({"error": "source not found"}, status_code=404)
+            return JSONResponse({
+                "ok": True,
+                "source": {"id": source_id, "name": name},
+            })
         try:
             raw_body = await request.body()
             body = json.loads(raw_body) if raw_body else {}
@@ -3042,7 +3071,7 @@ def make_app(
         Route("/video/live/{source_id}/{filename}", serve_live_hls),
         Route("/video/native-live/{source_path}/{asset}", serve_native_live_hls),
         Route("/api/sources",                    api_sources,             methods=["GET", "POST"]),
-        Route("/api/sources/{source_id}",        api_delete_source,       methods=["DELETE"]),
+        Route("/api/sources/{source_id}",        api_source,              methods=["PATCH", "DELETE"]),
         Route("/api/settings/status",            api_settings_status),
         Route("/api/settings/media-health",      api_settings_media_health),
         Route("/api/settings/camera/test",       api_settings_camera_test, methods=["POST"]),

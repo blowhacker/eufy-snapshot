@@ -93,6 +93,15 @@ class SourceDB:
             cur = conn.execute("DELETE FROM rtsp_sources WHERE id = ?", (source_id,))
             return cur.rowcount > 0
 
+    def rename(self, source_id: str, name: str) -> bool:
+        """Change only the camera's display name; its stable ID is untouched."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE rtsp_sources SET name = ? WHERE id = ?",
+                (name, source_id),
+            )
+            return cur.rowcount > 0
+
     def ids(self) -> set[str]:
         with self._connect() as conn:
             rows = conn.execute("SELECT id FROM rtsp_sources").fetchall()

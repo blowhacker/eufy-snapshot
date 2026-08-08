@@ -463,6 +463,25 @@
     </main>
   </div>
 
+  <dialog id="renameCameraDialog" class="s-remove-dialog s-rename-dialog" aria-labelledby="renameCameraTitle">
+    <form id="renameCameraForm">
+      <div class="s-rename-kicker">Camera name</div>
+      <h2 id="renameCameraTitle">Rename camera</h2>
+      <p>The internal ID and existing recordings will not change.</p>
+      <label class="s-rename-field" for="renameCameraName">
+        <span>Display name</span>
+        <input id="renameCameraName" type="text" maxlength="80" autocomplete="off" required>
+      </label>
+      <div class="s-rename-actions">
+        <span id="renameCameraMsg" class="s-save-msg" role="status"></span>
+        <div>
+          <button id="cancelRenameCamera" class="s-btn" type="button">Cancel</button>
+          <button id="saveRenameCamera" class="s-btn s-btn-primary" type="submit">Save name</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="removeCameraDialog" class="s-remove-dialog" aria-labelledby="removeCameraTitle">
     <form method="dialog">
       <div class="s-remove-kicker">Remove camera</div>
@@ -482,6 +501,6 @@
     </form>
   </dialog>
 
-  <script src="/settings.js?v=camera-delete-1"></script>
+  <script src="/settings.js?v=camera-rename-1"></script>
 </body>
 </html>

@@ -476,6 +476,8 @@
 .s-cam-info { flex: 1; min-width: 0; }
 .s-cam-name { font-size: 13.5px; font-weight: 500; color: var(--txt); margin-bottom: 2px; }
 .s-cam-meta { font: 400 11px var(--font-mono); color: var(--txt-3); letter-spacing: 0.02em; }
+.s-cam-actions { display: flex; align-items: center; gap: 4px; }
+.s-cam-edit,
 .s-cam-remove {
   display: flex !important;
   align-items: center !important;
@@ -488,6 +490,11 @@
   cursor: pointer;
   transition: color 120ms, border-color 120ms, background 120ms;
   flex-shrink: 0;
+}
+.s-cam-edit:hover:not(:disabled) {
+  color: var(--amber) !important;
+  border-color: var(--amber-ring) !important;
+  background: var(--amber-soft) !important;
 }
 .s-cam-remove:hover:not(:disabled) {
   color: var(--red) !important;
@@ -563,6 +570,42 @@
   font-size: 12px !important;
 }
 .s-remove-cancel:hover { color: var(--txt) !important; }
+
+.s-rename-dialog form { padding: 24px; }
+.s-rename-kicker {
+  margin-bottom: 5px;
+  color: var(--amber);
+  font: 600 10px var(--font-mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.s-rename-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 20px;
+}
+.s-rename-field span { color: var(--txt-2); font-size: 12px; }
+.s-rename-field input {
+  width: 100%;
+  padding: 9px 10px;
+  color: var(--txt);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  outline: none;
+  font: 500 14px var(--font-ui);
+}
+.s-rename-field input:focus { border-color: var(--amber-ring); }
+.s-rename-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 20px;
+}
+.s-rename-actions > div { display: flex; align-items: center; gap: 8px; }
+.s-rename-actions .s-save-msg { min-width: 0; }
 
 /* Notification rules */
 .s-rule-summary {

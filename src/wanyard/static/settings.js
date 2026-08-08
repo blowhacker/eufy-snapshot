@@ -84,9 +84,19 @@ async function loadStatus() {
     const row = document.createElement('div');
     row.className = 's-source-row';
     const pct = d.disk?.total ? Math.round(bytes/d.disk.total*100) : 0;
-    row.innerHTML = `<span class="s-source-name">${src}</span>
-      <div class="s-source-bar"><div class="s-source-fill" style="width:${pct}%"></div></div>
-      <span class="s-source-bytes">${fmt.bytes(bytes)}</span>`;
+    const label = document.createElement('span');
+    label.className = 's-source-name';
+    label.textContent = sourceName(src);
+    const bar = document.createElement('div');
+    bar.className = 's-source-bar';
+    const fill = document.createElement('div');
+    fill.className = 's-source-fill';
+    fill.style.width = `${pct}%`;
+    bar.appendChild(fill);
+    const size = document.createElement('span');
+    size.className = 's-source-bytes';
+    size.textContent = fmt.bytes(bytes);
+    row.append(label, bar, size);
     sizes.appendChild(row);
   }
 
@@ -366,6 +376,73 @@ window.addEventListener('resize', () => {
 });
 
 // ── Cameras ───────────────────────────────────────────
+const renameCameraDialog = document.getElementById('renameCameraDialog');
+const renameCameraForm = document.getElementById('renameCameraForm');
+const renameCameraInput = document.getElementById('renameCameraName');
+let _renamingSourceId = null;
+
+function openCameraRename(source) {
+  _renamingSourceId = source.id;
+  renameCameraInput.value = source.name || source.id;
+  const msg = document.getElementById('renameCameraMsg');
+  msg.textContent = '';
+  msg.className = 's-save-msg';
+  renameCameraDialog.showModal();
+  requestAnimationFrame(() => { renameCameraInput.focus(); renameCameraInput.select(); });
+}
+
+document.getElementById('cancelRenameCamera')?.addEventListener('click', () => {
+  renameCameraDialog.close();
+});
+
+renameCameraDialog?.addEventListener('close', () => {
+  _renamingSourceId = null;
+});
+
+renameCameraForm?.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!_renamingSourceId) return;
+  const name = renameCameraInput.value.trim();
+  const msg = document.getElementById('renameCameraMsg');
+  const save = document.getElementById('saveRenameCamera');
+  if (!name) {
+    msg.textContent = 'Enter a name';
+    msg.className = 's-save-msg err';
+    renameCameraInput.focus();
+    return;
+  }
+  save.disabled = true;
+  msg.textContent = 'Saving…';
+  msg.className = 's-save-msg';
+  let response;
+  let result;
+  try {
+    response = await fetch('/api/sources/' + encodeURIComponent(_renamingSourceId), {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name}),
+    });
+    result = await response.json().catch(() => ({}));
+  } catch (_error) {
+    save.disabled = false;
+    msg.textContent = 'Unable to reach Wanyard';
+    msg.className = 's-save-msg err';
+    return;
+  }
+  save.disabled = false;
+  if (!response.ok) {
+    msg.textContent = result.error || `Unable to rename camera (${response.status})`;
+    msg.className = 's-save-msg err';
+    return;
+  }
+  renameCameraDialog.close();
+  await loadCameras();
+  loadStatus();
+  loadMediaHealth();
+  loadCleanupConfig();
+  loadNotificationRules();
+});
+
 function chooseCameraRemoval(source) {
   const dialog = document.getElementById('removeCameraDialog');
   document.getElementById('removeCameraName').textContent = source.name || source.id;
@@ -390,23 +467,52 @@ async function loadCameras() {
 
     const row = document.createElement('div');
     row.className = 's-cam-row';
-    row.innerHTML = `
-      <span class="s-cam-dot ${dotCls}" data-cam-dot="${s.id}"></span>
-      <div class="s-cam-info">
-        <div class="s-cam-name">${s.name||s.id}</div>
-        <div class="s-cam-meta">${s.id}${s.record_mode === 'live_only' ? ' · live-only' : ''}</div>
-      </div>
-      ${s.mutable
-        ? `<button class="s-cam-remove" data-del="${s.id}" title="Remove ${s.name||s.id}" type="button" aria-label="Remove camera">
-             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2.5 2.5l9 9M11.5 2.5l-9 9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-           </button>`
-        : '<span></span>'}`;
+    const dot = document.createElement('span');
+    dot.className = `s-cam-dot ${dotCls}`;
+    dot.dataset.camDot = s.id;
+    const info = document.createElement('div');
+    info.className = 's-cam-info';
+    const name = document.createElement('div');
+    name.className = 's-cam-name';
+    name.textContent = s.name || s.id;
+    const meta = document.createElement('div');
+    meta.className = 's-cam-meta';
+    meta.textContent = s.id + (s.record_mode === 'live_only' ? ' · live-only' : '');
+    info.append(name, meta);
+    row.append(dot, info);
+    if (s.mutable) {
+      const actions = document.createElement('div');
+      actions.className = 's-cam-actions';
+      const edit = document.createElement('button');
+      edit.className = 's-cam-edit';
+      edit.type = 'button';
+      edit.dataset.rename = s.id;
+      edit.title = `Rename ${s.name || s.id}`;
+      edit.setAttribute('aria-label', 'Rename camera');
+      edit.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M9.9 1.8l2.3 2.3-7.1 7.1-3 .7.7-3 7.1-7.1Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg>';
+      const remove = document.createElement('button');
+      remove.className = 's-cam-remove';
+      remove.type = 'button';
+      remove.dataset.del = s.id;
+      remove.title = `Remove ${s.name || s.id}`;
+      remove.setAttribute('aria-label', 'Remove camera');
+      remove.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2.5 2.5l9 9M11.5 2.5l-9 9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+      actions.append(edit, remove);
+      row.appendChild(actions);
+    }
     list.appendChild(row);
 
     const opt = document.createElement('option');
     opt.value = s.id; opt.textContent = s.name || s.id;
     cleanupSel.appendChild(opt);
   }
+
+  list.querySelectorAll('[data-rename]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const source = _sources.find(item => item.id === btn.dataset.rename);
+      if (source) openCameraRename(source);
+    });
+  });
 
   list.querySelectorAll('[data-del]').forEach(btn => {
     btn.addEventListener('click', async () => {
@@ -1139,7 +1245,7 @@ document.getElementById('cleanupBtn').addEventListener('click', async () => {
   const days = parseInt(document.getElementById('cleanupDays').value);
   const src  = document.getElementById('cleanupSource').value || undefined;
   const msg  = document.getElementById('cleanupMsg');
-  const cameraLabel = src || 'all cameras';
+  const cameraLabel = src ? sourceName(src) : 'all cameras';
   if (!confirm(`Delete all footage older than ${days} days from ${cameraLabel}? This cannot be undone.`)) return;
   msg.textContent = 'Deleting…'; msg.className = 's-save-msg';
   const r = await fetch('/api/settings/cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days,source_id:src})});
@@ -1174,7 +1280,7 @@ sections.forEach(s => observer.observe(s));
 // ── Init ──────────────────────────────────────────────
 loadStatus();
 Promise.all([loadCameras(), loadNtfyConfig()])
-  .then(() => { loadNotificationRules(); });
+  .then(() => { loadNotificationRules(); loadStatus(); });
 loadDetectionConfig();
 loadMediaHealth();
 loadCleanupConfig();
