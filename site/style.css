@@ -535,6 +535,7 @@ hr{border:none;border-top:1px solid var(--line-soft);margin:0}
 .flow .cam{color:var(--accent)}
 .flow .core{color:var(--txt)}
 .flow .yolo{color:var(--green)}
+.flow .spatial-flow{color:#6aa7f2}
 .flow .arrow{color:var(--txt-4)}
 .flow-side h3{
   font:500 18px var(--font-ui); letter-spacing:-0.015em; color:var(--txt);
@@ -1165,6 +1166,104 @@ hr{border:none;border-top:1px solid var(--line-soft);margin:0}
   white-space:nowrap;
 }
 
+/* ─────────── Spatial showcase ─────────── */
+.spatial-sec{
+  border-top:1px solid var(--line-soft);
+  border-bottom:1px solid var(--line-soft);
+  background:
+    radial-gradient(ellipse at 82% 50%, rgba(78,201,138,.08), transparent 42%),
+    var(--bg-2);
+}
+.spatial-layout{
+  display:grid;
+  grid-template-columns:minmax(320px,.82fr) minmax(0,1.28fr);
+  gap:54px;
+  align-items:center;
+}
+.spatial-copy h2{
+  margin:18px 0 20px;
+  color:var(--txt);
+  font:600 42px/1.08 var(--font-ui);
+  letter-spacing:-.035em;
+  text-wrap:balance;
+}
+.spatial-copy h2 .accent{color:var(--accent)}
+.spatial-copy > .lede{font-size:16px;line-height:1.65}
+.spatial-steps{
+  margin-top:28px;
+  display:flex;
+  flex-direction:column;
+  border-top:1px solid var(--line);
+}
+.spatial-steps > div{
+  display:grid;
+  grid-template-columns:34px 1fr;
+  gap:10px;
+  padding:15px 0;
+  border-bottom:1px solid var(--line-soft);
+}
+.spatial-steps > div > span{
+  padding-top:3px;
+  color:var(--accent);
+  font:600 10px var(--font-mono);
+}
+.spatial-steps p{color:var(--txt-2);font-size:13px;line-height:1.52}
+.spatial-steps b{display:block;margin-bottom:2px;color:var(--txt);font-weight:500}
+.spatial-caveat{
+  margin-top:22px;
+  padding:16px 18px;
+  border:1px solid var(--accent-line);
+  border-radius:8px;
+  background:var(--accent-soft);
+}
+.spatial-caveat span{
+  display:block;
+  margin-bottom:5px;
+  color:var(--accent);
+  font:600 9px var(--font-mono);
+  letter-spacing:.1em;
+}
+.spatial-caveat p{color:var(--txt-2);font-size:12.5px;line-height:1.55}
+.spatial-visual{
+  min-width:0;
+  overflow:hidden;
+  border:1px solid var(--line);
+  border-radius:13px;
+  background:#080a0e;
+  box-shadow:0 32px 70px -35px rgba(0,0,0,.95);
+}
+.spatial-visual-bar{
+  min-height:42px;
+  padding:0 15px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+  border-bottom:1px solid var(--line-soft);
+  color:var(--txt-3);
+  background:var(--surf);
+  font:500 10px var(--font-mono);
+}
+.spatial-visual-bar span:first-child{color:var(--txt-2)}
+.spatial-visual-bar i{
+  display:inline-block;
+  width:6px;height:6px;margin-right:7px;
+  border-radius:50%;background:var(--green);
+  box-shadow:0 0 0 3px rgba(78,201,138,.12);
+}
+.spatial-visual img{width:100%;height:auto;background:#05070b}
+.spatial-visual figcaption{
+  padding:10px 14px;
+  display:flex;
+  justify-content:space-between;
+  gap:16px;
+  border-top:1px solid var(--line-soft);
+  color:var(--txt-4);
+  font:500 9px var(--font-mono);
+  letter-spacing:.04em;
+}
+.spatial-visual figcaption span{color:var(--green);letter-spacing:.08em}
+
 /* ─────────── Responsive layout ─────────── */
 @media (max-width:1100px){
   .topbar{padding:0 24px}
@@ -1177,6 +1276,9 @@ hr{border:none;border-top:1px solid var(--line-soft);margin:0}
   .feat-grid{grid-template-columns:repeat(2,1fr)}
   .flow-wrap{grid-template-columns:1fr;gap:28px}
   .flow-side{max-width:680px}
+  .spatial-layout{grid-template-columns:1fr;gap:38px}
+  .spatial-copy{max-width:680px}
+  .spatial-visual{width:min(900px,100%)}
 }
 @media (max-width:760px){
   .wrap{padding:0 20px}
@@ -1217,6 +1319,9 @@ hr{border:none;border-top:1px solid var(--line-soft);margin:0}
   .journey{min-height:320px}
   .privacy-band{grid-template-columns:auto 1fr;padding:18px}
   .privacy-status{grid-column:2}
+  .spatial-copy h2{font-size:34px}
+  .spatial-visual-bar span:last-child{display:none}
+  .spatial-visual figcaption{flex-direction:column;gap:3px}
   .cams{padding:22px}
   .cams .row{gap:8px 16px;font-size:13px}
   .flow{padding:22px 18px;font-size:10.5px}

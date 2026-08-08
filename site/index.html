@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>wanyard — find the moments in your camera footage</title>
-<meta name="description" content="A self-hosted NVR that turns RTSP camera footage into filterable encounters. Detection wall, tracked previews, mobile feed. Local, open source, no subscription.">
+<meta name="description" content="A self-hosted NVR that turns RTSP camera footage into filterable encounters, with experimental multi-camera Spatial views. Local, open source, no subscription.">
 <meta name="theme-color" content="#e8a558">
 
 <!-- Favicons -->
@@ -15,7 +15,7 @@
 
 <!-- Open Graph / social -->
 <meta property="og:title" content="wanyard — find the moments in your camera footage">
-<meta property="og:description" content="A self-hosted NVR with a filterable detection wall, tracked encounter previews, and a mobile feed. Your cameras, your hardware, your footage.">
+<meta property="og:description" content="A self-hosted NVR with filterable encounters and experimental multi-camera 3D Spatial views. Your cameras, your hardware, your footage.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://wanyard.com">
 <meta property="og:image" content="https://wanyard.com/assets/og-mark.png">
@@ -23,7 +23,7 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=Geist:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -40,6 +40,7 @@
     </div>
     <nav class="tb-nav">
       <a href="#detections">detections</a>
+      <a href="#spatial">spatial</a>
       <a href="#what">underneath</a>
       <a href="#cameras">cameras</a>
       <a href="#install">install</a>
@@ -190,8 +191,41 @@
     </div>
   </section>
 
+  <!-- ─────────── Spatial reconstruction ─────────── -->
+  <section class="sec spatial-sec" id="spatial" data-screen-label="03 Spatial">
+    <div class="wrap">
+      <div class="spatial-layout">
+        <div class="spatial-copy">
+          <span class="eyebrow"><span class="dot"></span>experimental spatial views</span>
+          <h2>Several cameras.<br><span class="accent">One place you can move through.</span></h2>
+          <p class="lede">Choose two or more cameras with overlapping coverage and Wanyard reconstructs their shared view as an interactive 3D point cloud.</p>
+
+          <div class="spatial-steps">
+            <div><span>01</span><p><b>Discover overlap</b>Select a camera set. Wanyard checks whether the views connect before creating it.</p></div>
+            <div><span>02</span><p><b>Reconstruct on demand</b>Build new geometry when the scene changes, at the density your GPU can handle.</p></div>
+            <div><span>03</span><p><b>Explore it live</b>Orbit and zoom in the browser, apply current camera colour, or download the PLY point cloud.</p></div>
+          </div>
+
+          <div class="spatial-caveat">
+            <span>EXPERIMENTAL</span>
+            <p>Geometry is reconstructed on demand; live colour is projected onto that model. Scale is relative until the cameras are calibrated, and sky, reflections, moving subjects or weak overlap can leave noise and gaps.</p>
+          </div>
+        </div>
+
+        <figure class="spatial-visual">
+          <div class="spatial-visual-bar">
+            <span><i></i> Spatial / courtyard study</span>
+            <span>3 cameras · full density</span>
+          </div>
+          <img src="assets/spatial-synthetic.webp" width="1536" height="1024" loading="lazy" alt="Synthetic three-camera point-cloud reconstruction of a fictional courtyard">
+          <figcaption><span>SYNTHETIC SCENE</span> No real camera footage or location data.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
   <!-- ─────────── What it does ─────────── -->
-  <section class="sec" id="what" data-screen-label="03 Underneath">
+  <section class="sec" id="what" data-screen-label="04 Underneath">
     <div class="wrap">
       <div class="sec-h">
         <span class="eyebrow"><span class="dot"></span>underneath the finding</span>
@@ -219,10 +253,10 @@
           <div class="gloss">tracking · groups · complete encounter windows</div>
         </div>
         <div class="feat">
-          <div class="lbl"><span class="n">04</span> STORAGE</div>
-          <h3>Timeline, wall and feed</h3>
-          <p>Use the full recording timeline when you know when, the detection wall when you know what, and the feed when you just want to see what visited.</p>
-          <div class="gloss">desktop + mobile · shareable moments</div>
+          <div class="lbl"><span class="n">04</span> VIEWS</div>
+          <h3>Timeline, wall, feed and Spatial</h3>
+          <p>Find moments in the timeline, detection wall and feed. When cameras overlap, step out of the frames and explore their shared scene in 3D.</p>
+          <div class="gloss">desktop + mobile · point clouds + PLY</div>
         </div>
         <div class="feat">
           <div class="lbl"><span class="n">05</span> STORAGE</div>
@@ -241,7 +275,7 @@
   </section>
 
   <!-- ─────────── Cameras strip ─────────── -->
-  <section class="sec thin" id="cameras" data-screen-label="04 Cameras">
+  <section class="sec thin" id="cameras" data-screen-label="05 Cameras">
     <div class="wrap">
       <div class="sec-h" style="margin-bottom:24px">
         <span class="eyebrow"><span class="dot"></span>any rtsp camera</span>
@@ -269,35 +303,42 @@
   </section>
 
   <!-- ─────────── Flow ASCII ─────────── -->
-  <section class="sec" id="how" data-screen-label="05 How">
+  <section class="sec" id="how" data-screen-label="06 How">
     <div class="wrap">
       <div class="sec-h">
         <span class="eyebrow"><span class="dot"></span>under the hood</span>
         <h2>One camera pull, several useful views. <span class="accent">Decoupled on purpose.</span></h2>
       </div>
       <div class="flow-wrap">
-        <pre class="flow">  <span class="cam">+--------+</span>  rtsp   <span class="core">+---------+</span>  relay  <span class="core">+--------------------+</span>
-  <span class="cam">| camera |</span> <span class="arrow">------&gt;</span>  <span class="core">| go2rtc |</span> <span class="arrow">------&gt;</span> <span class="core">| mediamtx + stamper |</span>
-  <span class="cam">+--------+</span>         <span class="core">+----+----+</span>         <span class="core">+-----+--------+-----+</span>
-                            <span class="arrow">|</span> WebRTC          <span class="arrow">|</span>        <span class="arrow">|</span>
-                            <span class="arrow">v</span>                  <span class="arrow">v</span>        <span class="arrow">v</span>
-                      <span class="core">+-----+-----+</span>      <span class="core">+--------+</span> <span class="yolo">+--------+</span>
-                      <span class="core">| live wall |</span>      <span class="core">| MP4 disk |</span> <span class="yolo">|  YOLO  |</span>
-                      <span class="core">+-----------+</span>      <span class="core">+----+---+</span> <span class="yolo">+---+----+</span>
-                                                  <span class="arrow">|</span> events <span class="arrow">|</span>
-                                                  <span class="arrow">v</span>        <span class="arrow">v</span>
-                                             <span class="core">+----------------+</span>
-                                             <span class="core">| viewer + wall  |</span>
-                                             <span class="core">+----------------+</span></pre>
+        <pre class="flow"> <span class="cam">+-----------+</span>  rtsp   <span class="core">+---------+</span>  relay  <span class="core">+--------------------+</span>
+ <span class="cam">| camera(s) |</span> <span class="arrow">------&gt;</span> <span class="core">| go2rtc |</span> <span class="arrow">------&gt;</span> <span class="core">| mediamtx + stamper |</span>
+ <span class="cam">+-----------+</span>        <span class="core">+----+----+</span>         <span class="core">+-----+--------+-----+</span>
+                             <span class="arrow">|</span> WebRTC          <span class="arrow">|</span>        <span class="arrow">|</span>
+                             <span class="arrow">v</span>                  <span class="arrow">v</span>        <span class="arrow">v</span>
+                       <span class="core">+-----+-----+</span>      <span class="core">+--------+</span> <span class="yolo">+--------+</span>
+                       <span class="core">| live wall |</span>      <span class="core">| MP4 disk |</span> <span class="yolo">|  YOLO  |</span>
+                       <span class="core">+-----------+</span>      <span class="core">+----+---+</span> <span class="yolo">+---+----+</span>
+                                                   <span class="arrow">|</span>        <span class="arrow">|</span>
+                                      synced frames <span class="arrow">|</span>        <span class="arrow">|</span> events
+                                                   <span class="arrow">v</span>        <span class="arrow">v</span>
+                              <span class="spatial-flow">+--------+      +----------------+</span>
+                              <span class="spatial-flow">|  VGGT  |      | viewer + wall  |</span>
+                              <span class="spatial-flow">+---+----+      +----------------+</span>
+                                  <span class="arrow">|</span> on demand
+                                  <span class="arrow">v</span>
+                              <span class="spatial-flow">+---------------+</span>
+                              <span class="spatial-flow">| Spatial + PLY |</span>
+                              <span class="spatial-flow">+---------------+</span></pre>
 
         <div class="flow-side">
           <h3>Decoupled by design.</h3>
-          <p><b>go2rtc owns the camera connection</b> and serves low-latency WebRTC. MediaMTX relays the recording stream; the stamper carries a frame-accurate clock in <b>SEI metadata</b>. The recorder writes MP4 while YOLO tags the same timeline with detections.</p>
+          <p><b>go2rtc owns the camera connection</b> and serves low-latency WebRTC. MediaMTX relays the recording stream; the stamper carries a frame-accurate clock in <b>SEI metadata</b>. Recording and detection stay independent while Spatial reconstructs synchronized frames only when asked.</p>
           <ul>
             <li><span class="tick">→</span><span><b>go2rtc</b> pulls each camera once and fans it out</span></li>
             <li><span class="tick">→</span><span><b>Recorder</b> never blocks on inference</span></li>
             <li><span class="tick">→</span><span><b>YOLO</b> runs real-time on the stamped stream, backfills MP4</span></li>
             <li><span class="tick">→</span><span><b>Viewer</b> reads from disk; no central broker</span></li>
+            <li><span class="tick">→</span><span><b>Spatial</b> cannot interrupt recording or detection</span></li>
           </ul>
         </div>
       </div>
@@ -305,7 +346,7 @@
   </section>
 
   <!-- ─────────── Comparison ─────────── -->
-  <section class="sec" id="compare" data-screen-label="06 Compare">
+  <section class="sec" id="compare" data-screen-label="07 Compare">
     <div class="wrap">
       <div class="sec-h">
         <span class="eyebrow"><span class="dot"></span>vs. the alternatives</span>
@@ -368,12 +409,12 @@
   </section>
 
   <!-- ─────────── Quickstart ─────────── -->
-  <section class="sec" id="install" data-screen-label="07 Install">
+  <section class="sec" id="install" data-screen-label="08 Install">
     <div class="wrap">
       <div class="sec-h">
         <span class="eyebrow"><span class="dot"></span>install</span>
         <h2>One <span class="accent">docker compose up</span> and you're recording.</h2>
-        <p class="lede">Wanyard needs Docker and a directory to write footage to. That's it. The YOLO model downloads automatically on first run.</p>
+        <p class="lede">Wanyard needs Docker and a directory to write footage to. The recorder and detector work immediately; experimental Spatial views are an optional CUDA setup.</p>
       </div>
 
       <div class="qs">
@@ -415,6 +456,8 @@ docker compose logs <span class="arg">wanyard-yolo</span></pre>
             <dd>A 4-core x86 box with <b>8 GB RAM</b> and a 1 TB drive. Handles 1–2 cams at 1080p on CPU comfortably.</dd>
             <dt>RECOMMENDED</dt>
             <dd>Anything with an <b>NVIDIA GPU</b> (even a 1060). 4–8 cams real-time with backfill keeping pace.</dd>
+            <dt>SPATIAL (EXPERIMENTAL)</dt>
+            <dd>A CUDA-capable NVIDIA GPU and a separately downloaded <b>VGGT checkpoint</b> at <code>models/vggt/model.pt</code>. More cameras and full-density output need more VRAM.</dd>
             <dt>OVERKILL</dt>
             <dd>You already have a NAS and a homelab. Wanyard is happy to live in a corner of it.</dd>
           </dl>
@@ -427,6 +470,8 @@ docker compose logs <span class="arg">wanyard-yolo</span></pre>
             <dd>The live wall and viewer. Live streams, timeline, tracked playback, clip export.</dd>
             <dt>:8091/detections</dt>
             <dd>The filterable detection wall and full-height encounter feed.</dd>
+            <dt>:8091/spatial</dt>
+            <dd>Create multi-camera views, reconstruct them on demand, explore live colour and export PLY.</dd>
             <dt>:8091/settings</dt>
             <dd>Add cameras, select detector classes, draw per-camera areas and configure retention.</dd>
             <dt>./data &amp; ./footage</dt>
@@ -438,7 +483,7 @@ docker compose logs <span class="arg">wanyard-yolo</span></pre>
   </section>
 
   <!-- ─────────── FAQ ─────────── -->
-  <section class="sec" id="faq" data-screen-label="08 FAQ">
+  <section class="sec" id="faq" data-screen-label="09 FAQ">
     <div class="wrap" style="max-width:1080px">
       <div class="sec-h">
         <span class="eyebrow"><span class="dot"></span>faq</span>
@@ -448,7 +493,19 @@ docker compose logs <span class="arg">wanyard-yolo</span></pre>
       <div class="faq">
         <div class="faq-row">
           <div class="q">Does this work without a GPU?</div>
-          <div class="a">Yes. The YOLO worker runs on CPU and handles 1–2 cameras at 1080p in real time. For 4+ cameras you'll want a GPU — even an old 1060 makes a substantial difference, especially for backfill catching up after a downtime.</div>
+          <div class="a">Recording and detection do. The YOLO worker runs on CPU and handles 1–2 cameras at 1080p in real time. Spatial reconstruction currently requires an NVIDIA CUDA GPU and separately downloaded VGGT weights.</div>
+        </div>
+        <div class="faq-row">
+          <div class="q">What exactly is a Spatial view?</div>
+          <div class="a">It is an interactive 3D point cloud inferred from synchronized frames from two or more overlapping cameras. Wanyard reconstructs the geometry on demand, then can project current camera colour onto it while you orbit and zoom in the browser.</div>
+        </div>
+        <div class="faq-row">
+          <div class="q">Can I measure things in Spatial?</div>
+          <div class="a">Not yet. VGGT produces coherent geometry at <b>relative scale</b>; it does not know how many metres apart your cameras are. Metric measurements need camera calibration. Until then, treat Spatial as an exploratory view rather than a survey instrument.</div>
+        </div>
+        <div class="faq-row">
+          <div class="q">Do more cameras always make a better reconstruction?</div>
+          <div class="a">Only when their views overlap usefully. More distinct angles can reveal more shape, but sky, reflections, motion, blank surfaces and weak overlap can create holes or noise. Wanyard checks whether a selected camera set forms a connected view before creating it.</div>
         </div>
         <div class="faq-row">
           <div class="q">Do I need Home Assistant?</div>
@@ -460,7 +517,7 @@ docker compose logs <span class="arg">wanyard-yolo</span></pre>
         </div>
         <div class="faq-row">
           <div class="q">Is my footage private?</div>
-          <div class="a">By default, yes — wanyard runs LAN-only. There are no telemetry calls. The only outbound request is the YOLO model download on first run, from the Ultralytics CDN. If you want remote access, put it behind a Tailscale or Wireguard tunnel; don't port-forward it.</div>
+          <div class="a">By default, yes — wanyard runs LAN-only and does not upload footage or telemetry. Installation may download container layers, dependencies and model weights. If you want remote access, put it behind a Tailscale or WireGuard tunnel; don't port-forward it.</div>
         </div>
         <div class="faq-row">
           <div class="q">Will there ever be a hosted version?</div>
@@ -472,14 +529,14 @@ docker compose logs <span class="arg">wanyard-yolo</span></pre>
         </div>
         <div class="faq-row" style="border-bottom:none">
           <div class="q">License?</div>
-          <div class="a">MIT. Use it, fork it, run it for a customer. The model weights are subject to Ultralytics' license — read theirs if that matters to you.</div>
+          <div class="a">Wanyard's own code is MIT. Its dependencies and model checkpoints retain their own licences. In particular, the original VGGT checkpoint is non-commercial; choose a checkpoint whose terms fit your use.</div>
         </div>
       </div>
     </div>
   </section>
 
   <!-- ─────────── Closer ─────────── -->
-  <section class="closer" data-screen-label="09 Closer">
+  <section class="closer" data-screen-label="10 Closer">
     <div class="wrap">
       <h2>It's <span class="accent">just a docker compose up</span>.</h2>
       <p>Stop renting your own footage.</p>

@@ -34,7 +34,34 @@ docker compose up --build -d
 - **Live wall (god view)** — all cameras at once on the landing page, instant
   load with near-zero-latency WebRTC; click a camera to open its full viewer
 - Web UI: live view, timeline filmstrip, event feed with class filtering, clip export
+- **Spatial views (experimental)** — reconstruct synchronized frames from two or
+  more overlapping cameras as an interactive point cloud, with live colour and
+  PLY export
 - Auto-cleanup of old footage by age or disk usage
+
+## Spatial views (experimental)
+
+Spatial views require the GPU Compose override, an NVIDIA CUDA GPU, and a VGGT
+checkpoint. Wanyard does not download that checkpoint automatically because
+VGGT checkpoints have their own licence terms:
+
+1. Choose a checkpoint from the
+   [official VGGT project](https://github.com/facebookresearch/vggt). The
+   original `VGGT-1B` checkpoint is non-commercial; use a checkpoint licensed
+   for your intended use.
+2. Save the downloaded checkpoint as `models/vggt/model.pt`.
+3. Start Wanyard with `docker-compose.gpu.yml`, then open
+   `http://localhost:8091/spatial`.
+
+Select two or more cameras with overlapping coverage, check the connection, and
+create a view. Geometry is reconstructed on demand; current camera colour can
+then be projected onto the result. Density presets trade filtering and browser
+load for more points, up to a two-million-point safety cap at Full density.
+
+VGGT geometry has relative scale. Camera calibration is required before lengths
+or distances can be interpreted as metric measurements. Sky, reflections,
+moving subjects, low-texture surfaces, and weak overlap can produce noise or
+missing geometry.
 
 ## Architecture
 
@@ -90,5 +117,6 @@ configuration or production footage.
 
 - `http://localhost:8091` — live wall (all cameras); click one for its viewer
 - `http://localhost:8091/detections` — object-tag filters and detection thumbnails grouped by camera
+- `http://localhost:8091/spatial` — multi-camera Spatial views, on-demand reconstruction, live colour, and PLY export
 - `http://localhost:8091/?source=<id>&live=1` — single-camera timeline viewer + event feed
 - `http://localhost:8091/settings` — cameras, detection classes, media health history, notifications, and storage

@@ -1,13 +1,14 @@
 # wanyard.com
 
-The marketing site. Three files, no build step.
+The marketing site. Static files, no build step.
 
 ```
 site/
 ├── index.html      ← copy lives here
 ├── style.css       ← visuals live here
 └── assets/
-    └── feed.jpg    ← swap for a better screenshot when you have one
+    ├── feed.jpg                 ← detection-feed screenshot
+    └── spatial-synthetic.webp  ← fictional point-cloud scene; safe for public use
 ```
 
 ## Deploy
