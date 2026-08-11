@@ -129,6 +129,30 @@
     timestampForMediaTime(mediaTime) {
       return this.match(mediaTime)?.timestamp ?? null;
     }
+
+    mediaTimeForTimestamp(timestamp, maxDistanceSeconds = 0.25) {
+      const target = Number(timestamp);
+      const frames = this.frames;
+      if (!Number.isFinite(target) || !frames.length) return null;
+
+      let lo = 0, hi = frames.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (frames[mid].timestamp < target) lo = mid + 1;
+        else hi = mid;
+      }
+      const candidates = [];
+      if (lo < frames.length) candidates.push(frames[lo]);
+      if (lo > 0) candidates.push(frames[lo - 1]);
+      candidates.sort(
+        (a, b) => Math.abs(a.timestamp - target) - Math.abs(b.timestamp - target)
+      );
+      const best = candidates[0];
+      const tolerance = Math.max(0, Number(maxDistanceSeconds) || 0);
+      return best && Math.abs(best.timestamp - target) <= tolerance
+        ? best.pts
+        : null;
+    }
   }
 
   return { PAYLOAD_UUID, decodeUserdataSample, LiveSeiClock };

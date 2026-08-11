@@ -77,7 +77,9 @@ let feedActivationFrame = null;
 let feedKeyboardCard = null;
 let feedPreload = null;
 const liveWindowCache = new Map();
+const previewFrameClockCache = new Map();
 const previewTracker = window.DetectionPreviewTrack;
+const PreviewFrameClock = window.WanyardLiveSeiClock?.LiveSeiClock;
 
 const moreObserver = "IntersectionObserver" in window
   ? new IntersectionObserver(entries => {
@@ -224,6 +226,8 @@ function previewAbsoluteTime(item, mediaTime = item.video.currentTime) {
   const start = Number(item.start);
   const current = Number(mediaTime);
   if (![startTs, start, current].every(Number.isFinite)) return null;
+  const frameTs = item.frameClock?.timestampForMediaTime(current);
+  if (Number.isFinite(frameTs)) return frameTs;
   return startTs + current - start;
 }
 
@@ -244,10 +248,9 @@ function updatePreviewPan(item, mediaTime) {
   };
   const currentMediaTime = Number(mediaTime);
   if (item.panMediaTime == null) {
-    // The stored event box can come from later in the episode, while previews
-    // include a second of pre-roll. Start at the track's box for the frame
-    // actually being shown; easing from the later event box makes fast movers
-    // pan backwards briefly before reversing into their true direction.
+    // Start at the track's box for the frame actually being shown. Easing from
+    // stale thumbnail state makes fast movers pan backwards before reversing
+    // into their true direction.
     item.panCenter = target;
     item.panMediaTime = currentMediaTime;
   } else {
@@ -340,11 +343,41 @@ async function loadPreviewTrack(item, refreshesLeft = 0) {
   }
 }
 
+async function loadPreviewFrameClock(item, preview) {
+  if (!PreviewFrameClock || !preview?.url?.endsWith(".mp4")) return false;
+  const clockUrl = `${preview.url}.clock.json`;
+  let clockPromise = previewFrameClockCache.get(clockUrl);
+  if (!clockPromise) {
+    clockPromise = fetch(clockUrl, { cache: "no-store" })
+      .then(response => response.ok ? response.json() : null)
+      .then(payload => {
+        if (payload?.version !== 1) return null;
+        const clock = new PreviewFrameClock();
+        return clock.ingestFrameClock(payload.frames || []) ? clock : null;
+      })
+      .catch(() => null);
+    previewFrameClockCache.set(clockUrl, clockPromise);
+    clockPromise.then(clock => {
+      if (!clock && previewFrameClockCache.get(clockUrl) === clockPromise) {
+        previewFrameClockCache.delete(clockUrl);
+      }
+    });
+    while (previewFrameClockCache.size > 12) {
+      previewFrameClockCache.delete(previewFrameClockCache.keys().next().value);
+    }
+  }
+  const clock = await clockPromise;
+  if (activePreview !== item || !clock) return false;
+  item.frameClock = clock;
+  return true;
+}
+
 function revealPreview(item) {
   if (
     activePreview !== item
     || !item.videoPlaying
     || !item.trackReady
+    || !item.clockReady
   ) return;
   clearTimeout(item.trackRevealTimer);
   item.trackRevealTimer = null;
@@ -515,22 +548,37 @@ function startMp4Preview(item, preview, { sourceLoaded = false } = {}) {
   const { card, video } = item;
   item.mode = "mp4";
   item.preview = preview;
+  item.clockReady = false;
+  item.frameClock = null;
   item.start = Math.max(0, Number(preview.start) || 0);
   item.end = Math.max(0, Number(preview.end) || 0);
   const requestedStart = item.start;
-  const ready = () => {
+  const clockPromise = loadPreviewFrameClock(item, preview);
+  const ready = async () => {
     if (
       activePreview !== item
       || item.mode !== "mp4"
       || !Number.isFinite(video.duration)
     ) return;
+    await clockPromise;
+    if (activePreview !== item || item.mode !== "mp4") return;
+    const clockStart = item.frameClock?.mediaTimeForTimestamp(
+      Number(preview.start_ts)
+    );
+    const clockEnd = item.frameClock?.mediaTimeForTimestamp(
+      Number(preview.end_ts)
+    );
+    if (Number.isFinite(clockStart)) item.start = clockStart;
+    if (Number.isFinite(clockEnd)) item.end = clockEnd;
     item.start = Math.min(item.start, Math.max(0, video.duration - .1));
     item.end = Math.min(
       video.duration,
       Math.max(item.start + .25, item.end)
     );
-    item.timelineStartTs = Number(preview.start_ts)
-      + (item.start - requestedStart);
+    item.timelineStartTs = item.frameClock
+      ? Number(preview.start_ts)
+      : Number(preview.start_ts) + (item.start - requestedStart);
+    item.clockReady = true;
     layoutActivePreview();
     const play = () => {
       if (activePreview === item && item.mode === "mp4") {
@@ -598,7 +646,7 @@ async function fallbackToRecordedPreview(item) {
     ? Math.max(0, duration - .1)
     : Infinity;
   const eventTs = Number(preview.event_ts ?? preview.start_ts);
-  const desiredStartTs = eventTs - 1;
+  const desiredStartTs = Number(preview.start_ts);
   const desiredEndTs = Math.min(
     desiredStartTs + 90,
     Math.max(desiredStartTs + 3, Number(preview.end_ts))
@@ -759,6 +807,8 @@ function startPreview(card, preview, { force = false } = {}) {
     timelineStartTs: Number(preview.start_ts),
     track: null,
     trackAbort: null,
+    frameClock: null,
+    clockReady: preview.kind === "hls",
     trackRefreshTimer: null,
     loopTimer: null,
     looping: false,

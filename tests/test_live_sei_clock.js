@@ -77,4 +77,25 @@ test("loads a finalized MP4 frame-clock sidecar", () => {
   ]), 2);
   assert.equal(clock.timestampForMediaTime(0.1), 1783255587.7);
   assert.equal(clock.timestampForMediaTime(0.15), 1783255587.75);
+  assert.equal(clock.mediaTimeForTimestamp(1783255587.7), 0.1);
+  assert.equal(clock.mediaTimeForTimestamp(1783255587.74), 0.15);
+  assert.equal(clock.mediaTimeForTimestamp(1783255590), null);
+});
+
+test("inverts a frame clock whose media origin differs from its clock anchor", () => {
+  const clock = new LiveSeiClock();
+  clock.ingestFrameClock([
+    [180.878855556, 178645106921],
+    [181.928855556, 178645107026],
+    [186.428855556, 178645107476],
+  ]);
+
+  assert.equal(
+    clock.mediaTimeForTimestamp(1786451070.26),
+    181.928855556
+  );
+  assert.equal(
+    clock.timestampForMediaTime(181.928855556),
+    1786451070.26
+  );
 });
