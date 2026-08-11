@@ -486,7 +486,7 @@ def _detection_wall_preview(
         start_ts = max(window_start, event_ts)
         end_ts = min(
             window_end,
-            max(start_ts + 3.0, event_ts + duration + 1.0),
+            max(start_ts + 3.0, event_ts + duration),
         )
         end_ts = min(
             end_ts,
@@ -520,7 +520,7 @@ def _detection_wall_preview(
     start = max(0.0, start_off)
     end = min(
         start + _DETECTION_PREVIEW_MAX_SECONDS,
-        max(start + 3.0, end_off + 1.0),
+        max(start + 3.0, end_off),
     )
     return {
         "url": f"/video/files/{quote(seg_path, safe='/')}",

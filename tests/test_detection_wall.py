@@ -376,9 +376,9 @@ class DetectionWallCameraTests(unittest.TestCase):
                 "class": "person",
                 "event_ts": 100.0,
                 "start_ts": 100.0,
-                "end_ts": 105.0,
+                "end_ts": 104.0,
                 "start": 6.0,
-                "end": 11.0,
+                "end": 10.0,
                 "box": {
                     "x1": 0.2,
                     "y1": 0.25,
@@ -413,7 +413,7 @@ class DetectionWallCameraTests(unittest.TestCase):
                 "class": "person",
                 "event_ts": 100.0,
                 "start_ts": 100.0,
-                "end_ts": 104.0,
+                "end_ts": 103.0,
                 "box": {
                     "x1": 0.2,
                     "y1": 0.2,
@@ -437,9 +437,9 @@ class DetectionWallCameraTests(unittest.TestCase):
         preview = _detection_wall_preview(recorded, "person")
 
         self.assertEqual(preview["start"], 20.0)
-        self.assertEqual(preview["end"], 94.8)
+        self.assertEqual(preview["end"], 93.8)
         self.assertEqual(preview["start_ts"], 100.0)
-        self.assertEqual(preview["end_ts"], 174.8)
+        self.assertEqual(preview["end_ts"], 173.8)
 
         recorded["end_off"] = 250.0
         capped = _detection_wall_preview(recorded, "person")
@@ -466,7 +466,7 @@ class DetectionWallCameraTests(unittest.TestCase):
         )
 
         self.assertEqual(preview["start_ts"], 100.0)
-        self.assertEqual(preview["end_ts"], 174.8)
+        self.assertEqual(preview["end_ts"], 173.8)
 
     def test_omits_preview_outside_live_window_or_for_unusable_event(self) -> None:
         provisional = _event(
