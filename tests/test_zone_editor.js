@@ -35,3 +35,25 @@ test("zone name always follows an explicit selection change", () => {
   assert.doesNotMatch(chrome, /document\.activeElement/);
   assert.match(chrome, /el\.zoneName\.value\s*=\s*nextName/);
 });
+
+test("zone editor toolbar is draggable only from its dedicated handle", () => {
+  const listeners = between(
+    'el.zonePrev?.addEventListener("click"',
+    'el.zoneName?.addEventListener("input"',
+  );
+
+  assert.match(listeners, /zoneDragHandle\?\.addEventListener\("pointerdown", startZoneBarDrag\)/);
+  assert.doesNotMatch(listeners, /zoneBar\?\.addEventListener\("pointerdown"/);
+});
+
+test("zone editor toolbar drag is clamped and keyboard accessible", () => {
+  const drag = between(
+    "function zoneBarOffsetInsideStage(",
+    "function setZoneEditing(",
+  );
+
+  assert.match(drag, /getBoundingClientRect\(\)/);
+  assert.match(drag, /setPointerCapture/);
+  assert.match(drag, /ArrowLeft/);
+  assert.match(drag, /event\.key === "Home"/);
+});

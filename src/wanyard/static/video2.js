@@ -1210,6 +1210,7 @@ const el = {
   notifyList: $("v2NotificationsList"),
   notifyReadAll: $("v2NotificationsReadAll"),
   zoneBar: $("v2ZoneBar"),
+  zoneDragHandle: $("v2ZoneDragHandle"),
   zoneName: $("v2ZoneName"),
   zoneTypeBadge: $("v2ZoneTypeBadge"),
   zoneHelp: $("v2ZoneHelp"),
@@ -1272,6 +1273,8 @@ const st = {
     dragPoint: null,
     dragPoly: false,
     last: null,
+    panelOffset: { x: 0, y: 0 },
+    panelDrag: null,
   },
   clip: {
     active: false,
@@ -4442,6 +4445,12 @@ el.zoneDelete?.addEventListener("click", deleteSelectedZoneDraft);
 el.zoneSave?.addEventListener("click", saveZoneEditor);
 el.zoneReset?.addEventListener("click", resetZoneEditor);
 el.zoneCancel?.addEventListener("click", cancelZoneEditor);
+el.zoneDragHandle?.addEventListener("pointerdown", startZoneBarDrag);
+el.zoneDragHandle?.addEventListener("pointermove", moveZoneBarDrag);
+el.zoneDragHandle?.addEventListener("pointerup", finishZoneBarDrag);
+el.zoneDragHandle?.addEventListener("pointercancel", finishZoneBarDrag);
+el.zoneDragHandle?.addEventListener("lostpointercapture", finishZoneBarDrag);
+el.zoneDragHandle?.addEventListener("keydown", moveZoneBarWithKeyboard);
 el.zoneName?.addEventListener("input", () => {
   const z = selectedDraftZone();
   if (z) z.name = el.zoneName.value.slice(0, 80);
@@ -5287,6 +5296,107 @@ function drawZones() {
   });
 }
 
+function zoneBarOffsetInsideStage(x, y) {
+  if (!el.zoneBar || !el.stage || el.zoneBar.hidden) return { x, y };
+  const current = st.zoneEdit.panelOffset;
+  const bar = el.zoneBar.getBoundingClientRect();
+  const stage = el.stage.getBoundingClientRect();
+  const base = {
+    left: bar.left - current.x,
+    right: bar.right - current.x,
+    top: bar.top - current.y,
+    bottom: bar.bottom - current.y,
+  };
+  const margin = 8;
+  const minX = stage.left + margin - base.left;
+  const maxX = stage.right - margin - base.right;
+  const minY = stage.top + margin - base.top;
+  const maxY = stage.bottom - margin - base.bottom;
+  return {
+    x: minX <= maxX ? Math.max(minX, Math.min(maxX, x)) : (minX + maxX) / 2,
+    y: minY <= maxY ? Math.max(minY, Math.min(maxY, y)) : (minY + maxY) / 2,
+  };
+}
+
+function setZoneBarOffset(x, y) {
+  if (!el.zoneBar) return;
+  const next = zoneBarOffsetInsideStage(x, y);
+  st.zoneEdit.panelOffset = next;
+  el.zoneBar.style.setProperty("--zone-drag-x", `${next.x}px`);
+  el.zoneBar.style.setProperty("--zone-drag-y", `${next.y}px`);
+}
+
+function resetZoneBarOffset() {
+  finishZoneBarDrag();
+  st.zoneEdit.panelOffset = { x: 0, y: 0 };
+  el.zoneBar?.style.removeProperty("--zone-drag-x");
+  el.zoneBar?.style.removeProperty("--zone-drag-y");
+}
+
+function constrainZoneBarOffset() {
+  if (!st.zoneEdit.active) return;
+  const { x, y } = st.zoneEdit.panelOffset;
+  setZoneBarOffset(x, y);
+}
+
+function startZoneBarDrag(event) {
+  if (!st.zoneEdit.active || event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  st.zoneEdit.panelDrag = {
+    pointerId: event.pointerId,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    x: st.zoneEdit.panelOffset.x,
+    y: st.zoneEdit.panelOffset.y,
+  };
+  el.zoneBar?.classList.add("dragging");
+  el.zoneDragHandle?.setPointerCapture?.(event.pointerId);
+}
+
+function moveZoneBarDrag(event) {
+  const drag = st.zoneEdit.panelDrag;
+  if (!drag || event.pointerId !== drag.pointerId) return;
+  event.preventDefault();
+  setZoneBarOffset(
+    drag.x + event.clientX - drag.clientX,
+    drag.y + event.clientY - drag.clientY,
+  );
+}
+
+function finishZoneBarDrag(event) {
+  const drag = st.zoneEdit.panelDrag;
+  if (drag && event?.pointerId != null && event.pointerId !== drag.pointerId) return;
+  st.zoneEdit.panelDrag = null;
+  el.zoneBar?.classList.remove("dragging");
+  if (drag && event?.pointerId != null && el.zoneDragHandle?.hasPointerCapture?.(event.pointerId)) {
+    el.zoneDragHandle.releasePointerCapture(event.pointerId);
+  }
+}
+
+function moveZoneBarWithKeyboard(event) {
+  if (!st.zoneEdit.active) return;
+  if (event.key === "Home") {
+    event.preventDefault();
+    resetZoneBarOffset();
+    return;
+  }
+  const directions = {
+    ArrowLeft: [-1, 0],
+    ArrowRight: [1, 0],
+    ArrowUp: [0, -1],
+    ArrowDown: [0, 1],
+  };
+  const direction = directions[event.key];
+  if (!direction) return;
+  event.preventDefault();
+  const step = event.shiftKey ? 40 : 12;
+  setZoneBarOffset(
+    st.zoneEdit.panelOffset.x + direction[0] * step,
+    st.zoneEdit.panelOffset.y + direction[1] * step,
+  );
+}
+
 function setZoneEditing(active) {
   st.zoneEdit.active = active;
   el.stage?.classList.toggle("zone-editing", active);
@@ -5382,6 +5492,7 @@ function startZoneEditor() {
   st.zoneEdit.dragPoint = null;
   st.zoneEdit.dragPoly = false;
   st.zoneEdit.last = null;
+  resetZoneBarOffset();
   setZoneEditing(true);
 }
 
@@ -5392,6 +5503,7 @@ function cancelZoneEditor() {
   st.zoneEdit.dragPoly = false;
   st.zoneEdit.last = null;
   setZoneEditing(false);
+  resetZoneBarOffset();
 }
 
 async function saveZoneEditor() {
@@ -5489,6 +5601,7 @@ setInterval(async () => {
 window.addEventListener("resize", () => {
   timeline.draw();
   drawZones();
+  constrainZoneBarOffset();
 });
 
 // ── Deep links ────────────────────────────────────────

@@ -689,6 +689,10 @@ body {
   background: rgba(8, 10, 14, 0.88);
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.32);
   backdrop-filter: blur(12px);
+  transform: translate3d(var(--zone-drag-x, 0px), var(--zone-drag-y, 0px), 0);
+}
+.v2-zone-bar.dragging {
+  user-select: none;
 }
 .v2-zone-bar[hidden] {
   display: none;
@@ -705,6 +709,31 @@ body {
   display: flex;
   align-items: center;
   gap: 7px;
+}
+.v2-viewer .v2-zone-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 28px;
+  flex: 0 0 26px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--txt-3);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.v2-viewer .v2-zone-drag-handle:hover,
+.v2-viewer .v2-zone-drag-handle:focus-visible {
+  border-color: rgba(232, 165, 88, 0.42);
+  color: var(--amber);
+  outline: none;
+}
+.v2-zone-bar.dragging .v2-zone-drag-handle {
+  cursor: grabbing;
+  color: var(--amber);
 }
 .v2-zone-type-badge {
   flex: 0 0 auto;

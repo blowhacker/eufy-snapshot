@@ -13,7 +13,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/app.css">
-    <link rel="stylesheet" href="/video2.css?v=exclusion-areas-1">
+    <link rel="stylesheet" href="/video2.css?v=zone-drag-1">
   </head>
   <body>
     <div id="v2LoadBar" class="v2-load-bar"></div>
@@ -100,6 +100,9 @@
         <div id="v2ZoneBar" class="v2-zone-bar" hidden>
           <div class="v2-zone-meta">
             <div class="v2-zone-title-row">
+              <button id="v2ZoneDragHandle" class="v2-zone-drag-handle" type="button" title="Drag to move the area editor · Home to reset" aria-label="Move area editor" aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight Home">
+                <svg width="12" height="18" viewBox="0 0 12 18" fill="currentColor" aria-hidden="true"><circle cx="3" cy="3" r="1.2"/><circle cx="9" cy="3" r="1.2"/><circle cx="3" cy="9" r="1.2"/><circle cx="9" cy="9" r="1.2"/><circle cx="3" cy="15" r="1.2"/><circle cx="9" cy="15" r="1.2"/></svg>
+              </button>
               <span id="v2ZoneTypeBadge" class="v2-zone-type-badge">Activity</span>
               <input id="v2ZoneName" class="v2-zone-name" type="text" placeholder="Area name" maxlength="80" autocomplete="off">
             </div>
@@ -189,6 +192,6 @@
     <script src="/d3.min.js?v=7.9.0"></script>
     <script src="/live-sei-clock.js?v=2"></script>
     <script src="/stage-zoom.js?v=2"></script>
-    <script src="/video2.js?v=exclusion-areas-2"></script>
+    <script src="/video2.js?v=zone-drag-1"></script>
   </body>
 </html>
