@@ -167,6 +167,79 @@ class DetectionWallCameraTests(unittest.TestCase):
         self.assertIn("cls=person", event["target_url"])
         self.assertTrue(event["provisional"])
 
+    def test_coalesces_duplicate_derivations_of_one_encounter(self) -> None:
+        first = _event(
+            1703295,
+            1786420307.23,
+            "dog",
+            boxes=[_box(0.4301, 0.1771, "dog")],
+        )
+        first["start_off"] = 209.498
+        first["end_off"] = 223.468
+        first["confidence"] = 0.8645
+        duplicate = _event(
+            1703290,
+            1786420307.28,
+            "dog",
+            boxes=[_box(0.4300, 0.1766, "dog")],
+        )
+        duplicate["start_off"] = 209.548
+        duplicate["end_off"] = 225.328
+        duplicate["confidence"] = 0.8544
+
+        camera = _detection_wall_camera(
+            FakeVideoDB([first, duplicate]),
+            self.source,
+            ["dog"],
+            limit=8,
+            before=None,
+        )
+
+        self.assertEqual([event["id"] for event in camera["events"]], ["1703295"])
+
+    def test_keeps_near_simultaneous_subjects_in_different_places(self) -> None:
+        camera = _detection_wall_camera(
+            FakeVideoDB([
+                _event(1, 100.0, "dog", boxes=[_box(0.2, 0.2, "dog")]),
+                _event(2, 100.05, "dog", boxes=[_box(0.8, 0.8, "dog")]),
+            ]),
+            self.source,
+            ["dog"],
+            limit=8,
+            before=None,
+        )
+
+        self.assertEqual(len(camera["events"]), 2)
+
+    def test_duplicate_does_not_return_on_the_next_page(self) -> None:
+        older_duplicate = _event(
+            1, 100.0, "dog", boxes=[_box(0.4, 0.2, "dog")]
+        )
+        older_duplicate["confidence"] = 0.7
+        newer_duplicate = _event(
+            2, 100.05, "dog", boxes=[_box(0.401, 0.2, "dog")]
+        )
+        newer_duplicate["confidence"] = 0.9
+        db = FakeVideoDB([
+            older_duplicate,
+            newer_duplicate,
+            _event(3, 90.0, "dog", boxes=[_box(0.7, 0.2, "dog")]),
+        ])
+
+        first = _detection_wall_camera(
+            db, self.source, ["dog"], limit=1, before=None
+        )
+        second = _detection_wall_camera(
+            db,
+            self.source,
+            ["dog"],
+            limit=1,
+            before=first["next_before"],
+        )
+
+        self.assertEqual([event["id"] for event in first["events"]], ["2"])
+        self.assertEqual([event["id"] for event in second["events"]], ["3"])
+
     def test_pagination_cursor_is_source_local_and_exclusive(self) -> None:
         db = FakeVideoDB([
             _event(index, float(200 - index), "person")
@@ -302,9 +375,9 @@ class DetectionWallCameraTests(unittest.TestCase):
                 "source_id": "front",
                 "class": "person",
                 "event_ts": 100.0,
-                "start_ts": 99.0,
+                "start_ts": 100.0,
                 "end_ts": 105.0,
-                "start": 5.0,
+                "start": 6.0,
                 "end": 11.0,
                 "box": {
                     "x1": 0.2,
@@ -339,7 +412,7 @@ class DetectionWallCameraTests(unittest.TestCase):
                 "source_id": "front",
                 "class": "person",
                 "event_ts": 100.0,
-                "start_ts": 99.0,
+                "start_ts": 100.0,
                 "end_ts": 104.0,
                 "box": {
                     "x1": 0.2,
@@ -363,16 +436,16 @@ class DetectionWallCameraTests(unittest.TestCase):
 
         preview = _detection_wall_preview(recorded, "person")
 
-        self.assertEqual(preview["start"], 19.0)
+        self.assertEqual(preview["start"], 20.0)
         self.assertEqual(preview["end"], 94.8)
-        self.assertEqual(preview["start_ts"], 99.0)
+        self.assertEqual(preview["start_ts"], 100.0)
         self.assertEqual(preview["end_ts"], 174.8)
 
         recorded["end_off"] = 250.0
         capped = _detection_wall_preview(recorded, "person")
-        self.assertEqual(capped["start"], 19.0)
-        self.assertEqual(capped["end"], 109.0)
-        self.assertEqual(capped["end_ts"], 189.0)
+        self.assertEqual(capped["start"], 20.0)
+        self.assertEqual(capped["end"], 110.0)
+        self.assertEqual(capped["end_ts"], 190.0)
 
     def test_live_preview_follows_long_provisional_encounter(self) -> None:
         provisional = _event(
@@ -392,7 +465,7 @@ class DetectionWallCameraTests(unittest.TestCase):
             {"start_ts": 50.0, "end_ts": 200.0},
         )
 
-        self.assertEqual(preview["start_ts"], 99.0)
+        self.assertEqual(preview["start_ts"], 100.0)
         self.assertEqual(preview["end_ts"], 174.8)
 
     def test_omits_preview_outside_live_window_or_for_unusable_event(self) -> None:

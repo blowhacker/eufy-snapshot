@@ -164,7 +164,10 @@ def _detection_wall_camera(
     Keep pagination source-local: a quiet camera must not drag a busy camera's
     cursor backwards and make the busy camera skip events.
     """
-    fetch_limit = limit + 1
+    # Fetch beyond the visible page so a duplicate derivation row cannot
+    # consume a card slot. This can happen when live and archive detection
+    # both finish the same segment during recorder rotation.
+    fetch_limit = limit * 3 + 1
     exclusions = exclusions or []
     if zone_filter_active and not polygons:
         recorded = []
@@ -217,15 +220,25 @@ def _detection_wall_camera(
         candidates[event_id] = event
 
     events = sorted(
-        candidates.values(),
+        _coalesce_detection_wall_events(candidates.values()),
         key=lambda event: (
             float(event.get("display_ts", event.get("abs_ts", 0))),
             str(event.get("id", "")),
         ),
         reverse=True,
     )
-    has_more = len(events) > limit
+    has_more = len(events) > limit or len(recorded) >= fetch_limit
     events = events[:limit]
+    page_cursor = min(
+        (
+            float(event.get(
+                "_wall_cursor_ts",
+                event.get("display_ts", event.get("abs_ts", 0)),
+            ))
+            for event in events
+        ),
+        default=None,
+    )
 
     public_events = []
     for event in events:
@@ -260,8 +273,8 @@ def _detection_wall_camera(
         # are frame-clock values, so subtracting a microsecond preserves the
         # immediately preceding frame without returning the last row again.
         "next_before": (
-            public_events[-1]["display_ts"] - 0.000001
-            if has_more and public_events else None
+            page_cursor - 0.000001
+            if has_more and page_cursor is not None else None
         ),
     }
 
@@ -299,6 +312,110 @@ def _detection_wall_filtered_recorded(
             break
         cursor = next_cursor
     return matched[:limit]
+
+
+def _coalesce_detection_wall_events(events) -> list[dict]:
+    """Hide duplicate derivations of the same physical encounter.
+
+    Detection rows are normally unique. Around a segment rotation, however,
+    live and archive inference can both derive the same encounter with clocks
+    a fraction of a second apart. They have different database ids, so id-only
+    de-duplication is insufficient. The encounter grouper already treats
+    nearby same-class boxes as one subject; apply that same semantic here.
+    """
+    ordered = sorted(
+        events,
+        key=lambda event: float(
+            event.get("display_ts", event.get("abs_ts", 0))
+        ),
+        reverse=True,
+    )
+    coalesced: list[dict] = []
+    for event in ordered:
+        duplicate_index = next(
+            (
+                index for index, existing in enumerate(coalesced)
+                if _detection_wall_events_overlap(existing, event)
+            ),
+            None,
+        )
+        if duplicate_index is None:
+            coalesced.append(event)
+            continue
+        existing = coalesced[duplicate_index]
+        cursor_ts = min(
+            float(existing.get(
+                "_wall_cursor_ts",
+                existing.get("display_ts", existing.get("abs_ts", 0)),
+            )),
+            float(event.get(
+                "_wall_cursor_ts",
+                event.get("display_ts", event.get("abs_ts", 0)),
+            )),
+        )
+        # Prefer finalized data, then the stronger observation. Keeping one
+        # row intact preserves the timestamp/box pairing used by the preview.
+        event_rank = (
+            not bool(event.get("provisional")),
+            float(event.get("confidence") or 0),
+            float(event.get("end_off") or 0)
+            - float(event.get("start_off") or 0),
+        )
+        existing_rank = (
+            not bool(existing.get("provisional")),
+            float(existing.get("confidence") or 0),
+            float(existing.get("end_off") or 0)
+            - float(existing.get("start_off") or 0),
+        )
+        if event_rank > existing_rank:
+            coalesced[duplicate_index] = {**event, "_wall_cursor_ts": cursor_ts}
+        else:
+            existing["_wall_cursor_ts"] = cursor_ts
+    return coalesced
+
+
+def _detection_wall_events_overlap(first: dict, second: dict) -> bool:
+    if first.get("class") != second.get("class"):
+        return False
+    try:
+        first_ts = float(first.get("display_ts", first["abs_ts"]))
+        second_ts = float(second.get("display_ts", second["abs_ts"]))
+        if abs(first_ts - second_ts) > 0.75:
+            return False
+        first_end = first_ts + max(
+            0.0,
+            float(first.get("end_off") or 0)
+            - float(first.get("start_off") or 0),
+        )
+        second_end = second_ts + max(
+            0.0,
+            float(second.get("end_off") or 0)
+            - float(second.get("start_off") or 0),
+        )
+        if min(first_end, second_end) < max(first_ts, second_ts):
+            return False
+        first_boxes = json.loads(first.get("boxes_json") or "[]")
+        second_boxes = json.loads(second.get("boxes_json") or "[]")
+        first_box = _select_event_box(first_boxes, str(first.get("class") or ""))
+        second_box = _select_event_box(second_boxes, str(second.get("class") or ""))
+        if not first_box or not second_box:
+            return False
+        first_cx = (float(first_box["x1"]) + float(first_box["x2"])) / 2
+        first_cy = (float(first_box["y1"]) + float(first_box["y2"])) / 2
+        second_cx = (float(second_box["x1"]) + float(second_box["x2"])) / 2
+        second_cy = (float(second_box["y1"]) + float(second_box["y2"])) / 2
+        first_size = max(
+            float(first_box["x2"]) - float(first_box["x1"]),
+            float(first_box["y2"]) - float(first_box["y1"]),
+        )
+        second_size = max(
+            float(second_box["x2"]) - float(second_box["x1"]),
+            float(second_box["y2"]) - float(second_box["y1"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    distance = math.hypot(first_cx - second_cx, first_cy - second_cy)
+    return distance <= max(0.08, 0.65 * max(first_size, second_size))
 
 
 def _detection_wall_preview(
@@ -364,7 +481,9 @@ def _detection_wall_preview(
             return None
         event_ts = max(window_start, min(window_end, event_ts))
         duration = max(0.0, end_off - start_off)
-        start_ts = max(window_start, event_ts - 1.0)
+        # A wall preview should open on its subject, not on empty pre-roll
+        # while the crop waits at the subject's future entrance point.
+        start_ts = max(window_start, event_ts)
         end_ts = min(
             window_end,
             max(start_ts + 3.0, event_ts + duration + 1.0),
@@ -398,7 +517,7 @@ def _detection_wall_preview(
         return None
     if not source_id or not math.isfinite(event_ts):
         return None
-    start = max(0.0, start_off - 1.0)
+    start = max(0.0, start_off)
     end = min(
         start + _DETECTION_PREVIEW_MAX_SECONDS,
         max(start + 3.0, end_off + 1.0),
