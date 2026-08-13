@@ -4821,12 +4821,15 @@ class VideoWorker:
         if not url or not ffmpeg:
             self._record_failure("recorder_unavailable")
             return
+        # An offline source may wait here indefinitely. Retire a stale live
+        # playlist before that wait so yesterday's HLS cannot make the whole
+        # service unhealthy while the camera is disconnected.
+        self._prune_live_dir()
         if not self._wait_for_relay_path(url):
             self._record_failure("relay_unavailable")
             return
         archive_dir = self.video_dir / self.source.id
         archive_dir.mkdir(parents=True, exist_ok=True)
-        self._prune_live_dir()
         run_id = int(ts * 1000)
         pattern = archive_dir / f"segment_{run_id:013d}_%06d.mp4"
         self._archive_seen = set(archive_dir.glob("segment_*.mp4"))

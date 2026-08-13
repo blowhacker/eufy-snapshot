@@ -164,6 +164,19 @@ class VideoWorkerTests(unittest.TestCase):
             self.assertNotIn("-t", command)
             self.assertEqual(popen.call_count, 2)  # archive + isolated HLS
 
+    def test_start_segment_prunes_stale_live_playlist_before_relay_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = self._worker(Path(tmpdir), mock.Mock())
+            with mock.patch("wanyard.capture.resolve_rtsp_url",
+                            return_value="rtsp://relay/camera"), \
+                 mock.patch("wanyard.video.shutil.which", return_value="/usr/bin/ffmpeg"), \
+                 mock.patch.object(worker, "_prune_live_dir") as prune, \
+                 mock.patch.object(worker, "_wait_for_relay_path", return_value=False) as wait:
+                worker._start_segment(1_781_600_000.0)
+
+            prune.assert_called_once_with()
+            wait.assert_called_once_with("rtsp://relay/camera")
+
     def test_ffmpeg_monitor_drains_large_stderr_without_blocking_child(self) -> None:
         payload_bytes = 2 * 1024 * 1024
         code = (
