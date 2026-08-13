@@ -252,6 +252,24 @@ class VideoWorkerTests(unittest.TestCase):
                 [100.0, 101.0],
             )
 
+    def test_sealed_archive_discards_all_live_detections_without_frame_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = VideoSegmentDB(root / "video.sqlite")
+            segment_id = db.open_segment("camera", "camera/segment.mp4", 100.0)
+            db.insert_live_detections(segment_id, "camera", [
+                {"abs_ts": 100.0, "has_human": True, "confidence": .8,
+                 "boxes": [], "classes": ["person"]},
+            ])
+            worker = self._worker(root, db)
+
+            removed = worker._discard_unarchived_live_detections(
+                segment_id, None
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(db.detections_for_segment(segment_id), [])
+
     def test_stop_segment_removes_only_empty_failed_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = mock.Mock()

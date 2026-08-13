@@ -5064,15 +5064,15 @@ class VideoWorker:
         MP4 frame-clock is authoritative; a normal event/preview may only be
         derived from a timestamp represented there.
         """
-        if sidecar is None:
-            return 0
+        clock_values: list[int] = []
         try:
-            frames = json.loads(sidecar.read_text("utf-8")).get("frames") or []
-            clock_values = [int(frame[1]) for frame in frames]
+            if sidecar is not None:
+                frames = json.loads(sidecar.read_text("utf-8")).get("frames") or []
+                clock_values = [int(frame[1]) for frame in frames]
         except (OSError, TypeError, ValueError, IndexError, json.JSONDecodeError):
-            return 0
-        if not clock_values:
-            return 0
+            # Fail closed. Without an authoritative frame clock we cannot
+            # prove that any live-only detection has corresponding pixels.
+            clock_values = []
         try:
             with self.db._connect() as conn:
                 rows = conn.execute(
