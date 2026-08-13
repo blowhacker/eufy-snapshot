@@ -358,6 +358,36 @@ class RecorderFaultIntegrationTests(unittest.TestCase):
             self._assert_segment_files_valid(db_a, root / "video")
             self._assert_segment_files_valid(db_b, root / "video")
 
+    def test_storage_rotation_keeps_one_archive_rtsp_subscription(self) -> None:
+        publisher = _Publisher("persistent-source", "h264")
+        publisher.start()
+        self.addCleanup(publisher.stop)
+
+        with tempfile.TemporaryDirectory(prefix="wanyard-persistent-fault-") as tmp:
+            root = Path(tmp)
+            worker, db, thread = self._new_worker(
+                root, "persistent-camera", "persistent-source"
+            )
+            thread.start()
+            try:
+                _wait_for(
+                    "first archive segment to open",
+                    lambda: worker._seg_id is not None and worker._proc is not None,
+                )
+                archive_pid = worker._proc.pid
+                _wait_for(
+                    "two storage boundaries without reconnect",
+                    lambda: worker.status()["completed_segments"] >= 2,
+                    timeout=15,
+                )
+                self.assertIsNotNone(worker._proc)
+                self.assertEqual(worker._proc.pid, archive_pid)
+                self.assertIsNone(worker.status()["last_failure_kind"])
+            finally:
+                self._cleanup_worker(worker, thread)
+
+            self._assert_segment_files_valid(db, root / "video")
+
 
 if __name__ == "__main__":
     unittest.main()

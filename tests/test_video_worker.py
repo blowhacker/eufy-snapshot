@@ -5,6 +5,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from fractions import Fraction
@@ -19,7 +21,8 @@ if str(SRC) not in sys.path:
 from wanyard.config import SourceConfig
 from wanyard import sei, video
 from wanyard.sei import encode_value
-from wanyard.video import VideoWorker
+from wanyard.video import VideoWorker, _FFmpegMonitor
+from wanyard.video import VideoSegmentDB
 
 
 class VideoWorkerTests(unittest.TestCase):
@@ -153,9 +156,99 @@ class VideoWorkerTests(unittest.TestCase):
                  mock.patch("wanyard.video.subprocess.Popen", return_value=proc) as popen:
                 worker._start_segment(1_781_600_000.0)
 
-            command = popen.call_args.args[0]
+            command = popen.call_args_list[0].args[0]
             self.assertIn("-c:v", command)
             self.assertIn("copy", command)
+            self.assertIn("segment", command)
+            self.assertIn("-segment_time", command)
+            self.assertNotIn("-t", command)
+            self.assertEqual(popen.call_count, 2)  # archive + isolated HLS
+
+    def test_ffmpeg_monitor_drains_large_stderr_without_blocking_child(self) -> None:
+        payload_bytes = 2 * 1024 * 1024
+        code = (
+            "import sys;"
+            f"sys.stderr.write('x'*{payload_bytes});sys.stderr.flush();"
+            "sys.stdout.write('frame=42\\nprogress=end\\n');sys.stdout.flush()"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        monitor = _FFmpegMonitor(proc, "camera", "archive")
+        try:
+            proc.wait(timeout=5)
+        finally:
+            monitor.close()
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(monitor.last_frame, 42)
+        self.assertEqual(
+            len(monitor.diagnostic_tail()), video._RECORD_DIAGNOSTIC_TAIL_BYTES
+        )
+
+    def test_ffmpeg_monitor_detects_missing_video_progress(self) -> None:
+        proc = mock.Mock(stdout=None, stderr=None)
+        monitor = _FFmpegMonitor(proc, "camera", "archive")
+        monitor.last_video_progress_wall = time.monotonic() - 30
+        self.assertTrue(monitor.video_stalled(20))
+
+    def test_archive_rotation_closes_file_without_restarting_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = mock.Mock()
+            db.open_segment.side_effect = [11, 12]
+            worker = self._worker(root, db)
+            archive_dir = root / "camera"
+            archive_dir.mkdir()
+            first = archive_dir / "segment_00000000000000000001.mp4"
+            second = archive_dir / "segment_00000000000000000002.mp4"
+            first.write_bytes(b"one")
+            worker._sync_archive_segments()
+            active_proc = mock.Mock()
+            worker._proc = active_proc
+
+            second.write_bytes(b"two")
+            with mock.patch.object(
+                worker, "_close_active_segment", return_value=True
+            ) as close_active:
+                worker._sync_archive_segments()
+
+            close_active.assert_called_once()
+            self.assertIs(worker._proc, active_proc)
+            self.assertEqual(worker._seg_id, 12)
+            self.assertEqual(worker._seg_path, second)
+
+    def test_sealed_archive_discards_live_detections_beyond_frame_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = VideoSegmentDB(root / "video.sqlite")
+            segment_id = db.open_segment("camera", "camera/segment.mp4", 100.0)
+            db.insert_live_detections(segment_id, "camera", [
+                {"abs_ts": 100.0, "has_human": True, "confidence": .8,
+                 "boxes": [], "classes": ["person"]},
+                {"abs_ts": 101.0, "has_human": True, "confidence": .7,
+                 "boxes": [], "classes": ["person"]},
+                {"abs_ts": 130.0, "has_human": True, "confidence": .9,
+                 "boxes": [], "classes": ["person"]},
+            ])
+            sidecar = root / "segment.mp4.clock.json"
+            sidecar.write_text(json.dumps({
+                "version": 1,
+                "frames": [[0.0, 10000], [1.0, 10100]],
+            }))
+            worker = self._worker(root, db)
+
+            removed = worker._discard_unarchived_live_detections(
+                segment_id, sidecar
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(
+                [row["abs_ts"] for row in db.detections_for_segment(segment_id)],
+                [100.0, 101.0],
+            )
 
     def test_stop_segment_removes_only_empty_failed_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -201,6 +294,7 @@ class VideoWorkerTests(unittest.TestCase):
             self.assertEqual(recovered["completed_segments"], 1)
 
     def test_production_retry_defaults_remain_bounded(self) -> None:
+        self.assertEqual(video._RECORD_POLL_SECONDS, 1.0)
         self.assertEqual(video._RECORD_RETRY_INITIAL_SECONDS, 5.0)
         self.assertEqual(video._RECORD_RETRY_MAX_SECONDS, 300.0)
         delay = video._RECORD_RETRY_INITIAL_SECONDS

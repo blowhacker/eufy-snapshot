@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import io
 import json
 import logging
 import math
@@ -13,7 +14,6 @@ import subprocess
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 import urllib.request
@@ -69,11 +69,113 @@ _CLOCK_ZERO_CONTAINER_PTS = "container_pts"
 _CLOCK_ZERO_FIRST_FRAME = "first_frame"
 _FRAME_CLOCK_VERSION = 1
 _RECORD_RELAY_WAIT_SECONDS = 180.0
-_RECORD_POLL_SECONDS = 5.0
+_RECORD_POLL_SECONDS = 1.0
 _RECORD_RETRY_INITIAL_SECONDS = 5.0
 _RECORD_RETRY_MAX_SECONDS = 300.0
 _RECORD_SUCCESS_SECONDS = 30.0
 _RECORD_EXCEPTION_RETRY_SECONDS = 30.0
+_RECORD_VIDEO_STALL_SECONDS = 20.0
+_RECORD_PROGRESS_PERIOD_SECONDS = 1.0
+_RECORD_DIAGNOSTIC_TAIL_BYTES = 64 * 1024
+
+
+class _FFmpegMonitor:
+    """Continuously drain an ffmpeg child and track actual video progress.
+
+    Both pipes must be consumed for the entire child lifetime.  In particular,
+    leaving stderr=PIPE unread eventually blocks ffmpeg in write(2), which can
+    silently stop archive output while another RTSP subscriber keeps working.
+    """
+
+    def __init__(self, proc: subprocess.Popen, source_id: str, role: str) -> None:
+        self.proc = proc
+        self.source_id = source_id
+        self.role = role
+        self.started_wall = time.monotonic()
+        self.last_video_progress_wall = self.started_wall
+        self.last_frame = -1
+        self._tail = bytearray()
+        self._lock = threading.Lock()
+        self._threads: list[threading.Thread] = []
+        if isinstance(proc.stdout, (io.BufferedIOBase, io.TextIOBase)):
+            self._start(self._drain_progress, f"ffmpeg-progress-{source_id}-{role}")
+        if isinstance(proc.stderr, (io.BufferedIOBase, io.TextIOBase)):
+            self._start(self._drain_stderr, f"ffmpeg-stderr-{source_id}-{role}")
+
+    def _start(self, target, name: str) -> None:
+        thread = threading.Thread(target=target, daemon=True, name=name)
+        self._threads.append(thread)
+        thread.start()
+
+    def _drain_progress(self) -> None:
+        stream = self.proc.stdout
+        if stream is None:
+            return
+        while True:
+            raw = stream.readline()
+            if not raw:
+                return
+            try:
+                line = raw.decode("utf-8", "replace").strip()
+            except AttributeError:
+                line = str(raw).strip()
+            if not line.startswith("frame="):
+                continue
+            try:
+                frame = int(line.split("=", 1)[1])
+            except ValueError:
+                continue
+            with self._lock:
+                if frame > self.last_frame:
+                    self.last_frame = frame
+                    self.last_video_progress_wall = time.monotonic()
+
+    def _drain_stderr(self) -> None:
+        stream = self.proc.stderr
+        if stream is None:
+            return
+        while True:
+            reader = getattr(stream, "read1", stream.read)
+            chunk = reader(4096)
+            if not chunk:
+                return
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", "replace")
+            with self._lock:
+                self._tail.extend(chunk)
+                overflow = len(self._tail) - _RECORD_DIAGNOSTIC_TAIL_BYTES
+                if overflow > 0:
+                    del self._tail[:overflow]
+
+    def video_stalled(self, seconds: float = _RECORD_VIDEO_STALL_SECONDS) -> bool:
+        with self._lock:
+            age = time.monotonic() - self.last_video_progress_wall
+        return age >= seconds
+
+    def diagnostic_tail(self) -> str:
+        with self._lock:
+            return bytes(self._tail).decode("utf-8", "replace")
+
+    def close(self) -> None:
+        for stream in (self.proc.stdout, self.proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        for thread in self._threads:
+            thread.join(timeout=1.0)
+
+
+def _close_process_streams(proc: subprocess.Popen | None) -> None:
+    if not proc:
+        return
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS segments (
@@ -4436,6 +4538,10 @@ class VideoWorker:
         self.db        = db
         self._stop     = threading.Event()
         self._proc: subprocess.Popen | None = None
+        self._live_proc: subprocess.Popen | None = None
+        self._proc_monitor: _FFmpegMonitor | None = None
+        self._live_monitor: _FFmpegMonitor | None = None
+        self._archive_seen: set[Path] = set()
         self._seg_id:    int | None  = None
         self._seg_path:  Path | None = None
         self._seg_start: float       = 0.0
@@ -4626,56 +4732,59 @@ class VideoWorker:
                 ts = time.time()
                 self._start_segment(ts)
                 if self._proc:
-                    early_stderr = ""
-                    returncode = None
-                    # Poll every 5s so we detect ffmpeg exit within 5 seconds
-                    deadline = time.time() + _MAX_SEGMENT_SECONDS
-                    while time.time() < deadline and not self._stop.is_set():
-                        if self._proc.poll() is not None:
-                            err = b""
-                            try:
-                                err = self._proc.stderr.read() or b""
-                            except Exception:
-                                pass
-                            early_stderr = err.decode("utf-8", "replace")
-                            returncode = self._proc.returncode
-                            LOG.warning("ffmpeg exited early for %s (rc=%s): %s",
-                                        self.source.id, returncode,
-                                        early_stderr[-1200:])
+                    failure_kind = None
+                    while not self._stop.is_set():
+                        returncode = self._proc.poll()
+                        if returncode is not None:
+                            if returncode != 0:
+                                failure_kind = "ffmpeg_early_exit"
+                                LOG.warning(
+                                    "archive ffmpeg exited for %s (rc=%s): %s",
+                                    self.source.id, returncode,
+                                    (self._proc_monitor.diagnostic_tail()
+                                     if self._proc_monitor else "")[-1200:],
+                                )
+                            else:
+                                LOG.info(
+                                    "archive input epoch ended cleanly for %s",
+                                    self.source.id,
+                                )
                             break
+                        if (
+                            self._proc_monitor
+                            and self._proc_monitor.video_stalled()
+                        ):
+                            failure_kind = "video_progress_stalled"
+                            LOG.error(
+                                "archive video progress stalled for %s; "
+                                "restarting persistent subscriber: %s",
+                                self.source.id,
+                                self._proc_monitor.diagnostic_tail()[-1200:],
+                            )
+                            break
+                        self._sync_archive_segments()
                         if self._seg_id and not getattr(self, "_anchor_set", False):
                             self._observe_marker_anchor()
+                        self._ensure_live_process()
                         self._stop.wait(_RECORD_POLL_SECONDS)
                     elapsed = time.time() - ts
                     stopped_ts = time.time()
                     segment_ok = self._stop_segment(stopped_ts)
-                    clean_epoch_end = returncode == 0 and segment_ok
-                    if returncode is not None:
-                        if clean_epoch_end:
-                            LOG.info(
-                                "recording epoch ended cleanly for %s; "
-                                "starting the next available epoch",
-                                self.source.id,
-                            )
-                            self._record_segment_completed(stopped_ts)
-                        elif segment_ok:
-                            self._record_segment_completed(
-                                stopped_ts, reset_failures=False,
-                            )
-                        if not clean_epoch_end:
-                            self._record_failure("ffmpeg_early_exit")
-                    elif segment_ok:
-                        self._record_segment_completed(stopped_ts)
-                    else:
+                    if segment_ok:
+                        self._record_segment_completed(
+                            stopped_ts, reset_failures=failure_kind is None,
+                        )
+                    if failure_kind:
+                        self._record_failure(failure_kind)
+                    elif not segment_ok and not self._stop.is_set():
                         self._record_failure("empty_segment")
                     # Reset backoff after a segment ran long enough to be healthy.
                     backoff = (
                         _RECORD_RETRY_INITIAL_SECONDS
-                        if clean_epoch_end
-                        or (elapsed > _RECORD_SUCCESS_SECONDS and segment_ok)
+                        if elapsed > _RECORD_SUCCESS_SECONDS and segment_ok
                         else min(backoff * 2, _RECORD_RETRY_MAX_SECONDS)
                     )
-                    if not clean_epoch_end and (
+                    if failure_kind and (
                         elapsed <= _RECORD_SUCCESS_SECONDS or not segment_ok
                     ):
                         LOG.warning("short segment (%.0fs) for %s — backoff %.0fs",
@@ -4697,10 +4806,15 @@ class VideoWorker:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._seg_id or self._proc:
+        if self._seg_id or self._proc or self._live_proc:
             self._stop_segment(time.time())
 
     def _start_segment(self, ts: float) -> None:
+        """Start one persistent archive subscription and an isolated HLS helper.
+
+        Archive file rotation happens inside ffmpeg's segment muxer; it never
+        tears down RTSP merely because a ten-minute storage boundary arrived.
+        """
         from .capture import resolve_rtsp_url
         url    = resolve_rtsp_url(self.source)
         ffmpeg = shutil.which("ffmpeg")
@@ -4710,15 +4824,17 @@ class VideoWorker:
         if not self._wait_for_relay_path(url):
             self._record_failure("relay_unavailable")
             return
-        dt       = datetime.fromtimestamp(ts, tz=timezone.utc)
-        date_dir = self.video_dir / self.source.id / dt.strftime("%Y/%m/%d")
-        date_dir.mkdir(parents=True, exist_ok=True)
+        archive_dir = self.video_dir / self.source.id
+        archive_dir.mkdir(parents=True, exist_ok=True)
         self._prune_live_dir()
-        seg_path = date_dir / dt.strftime("%Y-%m-%d_%H-%M-%S.mp4")
-        rel_path = seg_path.relative_to(self.video_dir).as_posix()
+        run_id = int(ts * 1000)
+        pattern = archive_dir / f"segment_{run_id:013d}_%06d.mp4"
+        self._archive_seen = set(archive_dir.glob("segment_*.mp4"))
         try:
             self._proc = subprocess.Popen(
                 [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
+                 "-nostats", "-stats_period", str(_RECORD_PROGRESS_PERIOD_SECONDS),
+                 "-progress", "pipe:1",
                  # Preserve the stamper's rtp-based pts as the MP4/HLS container
                  # timeline. -use_wallclock_as_timestamps would overwrite it with
                  # bursty recorder arrival time, compressing the early frames so
@@ -4727,50 +4843,99 @@ class VideoWorker:
                  # monotonic pts that track the SEI clock.
                  "-rtsp_transport", self.source.rtsp_transport,
                  "-i", url,
-                 # Archive: fragmented MP4 while recording — moov up front,
-                 # one self-contained fragment per keyframe. The open file is
-                 # readable/probe-able at any instant and a crash loses at
-                 # most one GOP instead of the whole segment (faststart wrote
-                 # the index only at finalize, so a killed writer left an
-                 # unreadable blob). Sealed segments are remuxed to classic
-                 # faststart in _stop_segment for byte-range seeking.
-                 # flush_packets: fragments hit the disk as they complete
-                 # instead of sitting in the 32KB avio buffer — without it a
-                 # crash can still eat several seconds at low bitrates.
+                 # One RTSP session for the lifetime of the recording epoch.
+                 # The segment muxer rotates storage files without reconnecting.
+                 "-map", "0:v:0", "-map", "0:a?",
                  "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
-                 "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                  "-flush_packets", "1",
-                 str(seg_path),
-                 # Live: rolling HLS. ffmpeg deletes the active window; startup
-                 # pruning clears unreferenced files from older ffmpeg writers.
-                 "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
-                 "-f", "hls",
-                 "-hls_time", str(_LIVE_HLS_SEGMENT_SECONDS),
-                 "-hls_list_size", str(_LIVE_HLS_LIST_SIZE),
-                 "-hls_start_number_source", "epoch",
-                 "-hls_flags", "delete_segments+omit_endlist+temp_file+program_date_time",
-                 "-hls_segment_filename", str(self._live_dir / "seg_%010d.ts"),
-                 str(self._live_dir / "live.m3u8"),
+                 "-f", "segment",
+                 "-segment_time", str(_MAX_SEGMENT_SECONDS),
+                 "-segment_atclocktime", "1",
+                 "-reset_timestamps", "1",
+                 "-segment_format", "mp4",
+                 "-segment_format_options",
+                 "movflags=+frag_keyframe+empty_moov+default_base_moof",
+                 str(pattern),
                 ],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
         except Exception:
             LOG.exception("failed to start ffmpeg for %s", self.source.id)
             self._proc = None
             self._record_failure("ffmpeg_start_failed")
             return
-        self._seg_path  = seg_path
-        self._seg_start = ts
+        self._proc_monitor = _FFmpegMonitor(
+            self._proc, self.source.id, "archive"
+        )
         with self._status_lock:
             self._last_segment_started_ts = ts
+        self._start_live_process(url, ffmpeg)
+        LOG.info("persistent archive started: %s", self.source.id)
+
+    def _start_live_process(self, url: str, ffmpeg: str) -> None:
         try:
-            self._seg_id = self.db.open_segment(self.source.id, rel_path, ts)
+            proc = subprocess.Popen(
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
+                 "-nostats", "-stats_period", str(_RECORD_PROGRESS_PERIOD_SECONDS),
+                 "-progress", "pipe:1", "-rtsp_transport", self.source.rtsp_transport,
+                 "-i", url, "-map", "0:v:0", "-map", "0:a?",
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
+                 "-f", "hls", "-hls_time", str(_LIVE_HLS_SEGMENT_SECONDS),
+                 "-hls_list_size", str(_LIVE_HLS_LIST_SIZE),
+                 "-hls_start_number_source", "epoch",
+                 "-hls_flags", "delete_segments+omit_endlist+temp_file+program_date_time",
+                 "-hls_segment_filename", str(self._live_dir / "seg_%010d.ts"),
+                 str(self._live_dir / "live.m3u8")],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
         except Exception:
-            self._seg_id = None
-            LOG.exception("failed to open segment row for %s", self.source.id)
-            self._record_failure("database_open_failed")
-        self._anchor_set = False
-        LOG.info("segment started: %s", rel_path)
+            LOG.exception("failed to start live HLS helper for %s", self.source.id)
+            return
+        self._live_proc = proc
+        self._live_monitor = _FFmpegMonitor(proc, self.source.id, "hls")
+
+    def _ensure_live_process(self) -> None:
+        if self._live_proc and self._live_proc.poll() is None:
+            if not self._live_monitor or not self._live_monitor.video_stalled():
+                return
+        self._stop_live_process()
+        from .capture import resolve_rtsp_url
+        url = resolve_rtsp_url(self.source)
+        ffmpeg = shutil.which("ffmpeg")
+        if url and ffmpeg:
+            LOG.warning("restarting isolated live HLS helper for %s", self.source.id)
+            self._start_live_process(url, ffmpeg)
+
+    def _sync_archive_segments(self) -> None:
+        archive_dir = self.video_dir / self.source.id
+        candidates = sorted(
+            path for path in archive_dir.glob("segment_*.mp4")
+            if path not in self._archive_seen
+        )
+        for path in candidates:
+            self._archive_seen.add(path)
+            if self._seg_id:
+                try:
+                    boundary = path.stat().st_mtime
+                except OSError:
+                    boundary = time.time()
+                if self._close_active_segment(boundary):
+                    self._record_segment_completed(boundary)
+            try:
+                started = path.stat().st_mtime
+                rel_path = path.relative_to(self.video_dir).as_posix()
+                self._seg_id = self.db.open_segment(
+                    self.source.id, rel_path, started
+                )
+            except Exception:
+                self._seg_id = None
+                LOG.exception("failed to open segment row for %s", path)
+                self._record_failure("database_open_failed")
+                continue
+            self._seg_path = path
+            self._seg_start = started
+            self._anchor_set = False
+            LOG.info("archive segment opened: %s", rel_path)
 
     def _observe_marker_anchor(self) -> None:
         """Early open-segment anchor: set media_epoch provisionally so the
@@ -4813,25 +4978,10 @@ class VideoWorker:
         LOG.info("CLOCK-ANCHOR-EARLY seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
                  seg_id, self.source.id, media_epoch, media_epoch - seg_start)
 
-    def _stop_segment(self, ts: float) -> bool:
-        proc      = self._proc;     self._proc     = None
+    def _close_active_segment(self, ts: float) -> bool:
         seg_path  = self._seg_path; self._seg_path = None
         seg_id    = self._seg_id
         seg_start = self._seg_start
-        if proc and proc.poll() is None:
-            try:
-                proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
-            except Exception:
-                proc.kill()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
-        if proc and proc.stderr:
-            try:
-                proc.stderr.close()
-            except OSError:
-                pass
         self._seg_id = None
         self._seg_start = 0.0
         if seg_id:
@@ -4859,7 +5009,16 @@ class VideoWorker:
                 playable_duration = _video_stream_duration(seg_path)
                 if media_epoch is not None:
                     self.db.set_segment_media_start(seg_id, media_epoch)
-                    _write_mp4_frame_clock(seg_path)
+                    sidecar = _write_mp4_frame_clock(seg_path)
+                    removed = self._discard_unarchived_live_detections(
+                        seg_id, sidecar
+                    )
+                    if removed:
+                        LOG.error(
+                            "discarded %d live detections without archived frames "
+                            "seg=%d src=%s",
+                            removed, seg_id, self.source.id,
+                        )
                     LOG.info(
                         "CLOCK-ANCHOR seg=%d src=%s media_epoch=%.3f start_ts%+.3f",
                         seg_id, self.source.id, media_epoch, media_epoch - seg_start,
@@ -4876,6 +5035,82 @@ class VideoWorker:
             )
             return True
         return False
+
+    def _discard_unarchived_live_detections(
+        self, segment_id: int, sidecar: Path | None
+    ) -> int:
+        """Remove rows whose stamped time is absent from the sealed archive.
+
+        Live inference and archive recording are separate relay subscribers.
+        A live frame is not evidence that the archive retained it.  The final
+        MP4 frame-clock is authoritative; a normal event/preview may only be
+        derived from a timestamp represented there.
+        """
+        if sidecar is None:
+            return 0
+        try:
+            frames = json.loads(sidecar.read_text("utf-8")).get("frames") or []
+            clock_values = [int(frame[1]) for frame in frames]
+        except (OSError, TypeError, ValueError, IndexError, json.JSONDecodeError):
+            return 0
+        if not clock_values:
+            return 0
+        lo = min(clock_values) / 100.0 - 0.1
+        hi = max(clock_values) / 100.0 + 0.1
+        try:
+            with self.db._connect() as conn:
+                result = conn.execute(
+                    "DELETE FROM video_detections WHERE segment_id=?"
+                    " AND (abs_ts<? OR abs_ts>?)",
+                    (segment_id, lo, hi),
+                )
+                return max(0, int(result.rowcount))
+        except Exception:
+            LOG.exception(
+                "failed to reconcile live detections seg=%d src=%s",
+                segment_id, self.source.id,
+            )
+            return 0
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen | None) -> None:
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    def _stop_live_process(self) -> None:
+        proc, monitor = self._live_proc, self._live_monitor
+        self._live_proc = None
+        self._live_monitor = None
+        self._terminate_process(proc)
+        if monitor:
+            monitor.close()
+        else:
+            _close_process_streams(proc)
+
+    def _stop_segment(self, ts: float) -> bool:
+        proc, monitor = self._proc, self._proc_monitor
+        self._proc = None
+        self._proc_monitor = None
+        self._stop_live_process()
+        self._terminate_process(proc)
+        # ffmpeg can create its first or final segment between the last poll
+        # and process termination. Discover it before sealing the active row.
+        self._sync_archive_segments()
+        result = self._close_active_segment(ts)
+        if monitor:
+            monitor.close()
+        else:
+            _close_process_streams(proc)
+        return result
 
     def _wait_for_relay_path(self, url: str) -> bool:
         relay_host = os.environ.get("WANYARD_RELAY_HOST", "").strip()
