@@ -143,6 +143,55 @@ class VideoWorkerTests(unittest.TestCase):
             record_failure.assert_not_called()
             wait.assert_not_called()
 
+    def test_run_exception_reaps_generation_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = self._worker(Path(tmpdir))
+            proc = mock.Mock()
+            proc.poll.return_value = None
+
+            def start(_ts: float) -> None:
+                worker._proc = proc
+
+            def cleanup(_ts: float) -> bool:
+                worker._proc = None
+                worker._stop.set()
+                return False
+
+            with mock.patch.object(worker, "_start_segment", side_effect=start), \
+                 mock.patch.object(
+                     worker, "_sync_archive_segments",
+                     side_effect=RuntimeError("database locked"),
+                 ), \
+                 mock.patch.object(
+                     worker, "_stop_segment", side_effect=cleanup
+                 ) as stop_segment:
+                worker.run()
+
+            stop_segment.assert_called_once()
+            self.assertIsNone(worker._proc)
+
+    def test_start_segment_reaps_stale_generation_before_spawning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = self._worker(Path(tmpdir), mock.Mock())
+            worker._proc = mock.Mock()
+            worker._live_proc = mock.Mock()
+
+            def cleanup(_ts: float) -> bool:
+                worker._proc = None
+                worker._live_proc = None
+                return False
+
+            with mock.patch.object(
+                     worker, "_stop_segment", side_effect=cleanup
+                 ) as stop_segment, \
+                 mock.patch("wanyard.capture.resolve_rtsp_url",
+                            return_value=None):
+                worker._start_segment(1_781_600_000.0)
+
+            stop_segment.assert_called_once_with(1_781_600_000.0)
+            self.assertIsNone(worker._proc)
+            self.assertIsNone(worker._live_proc)
+
     def test_start_segment_copies_stamped_h264(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = mock.Mock()

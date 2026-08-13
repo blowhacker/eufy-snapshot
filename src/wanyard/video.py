@@ -4801,6 +4801,21 @@ class VideoWorker:
                     self.source.id,
                     _RECORD_EXCEPTION_RETRY_SECONDS,
                 )
+                # An exception in segment discovery, anchoring, or database
+                # finalization must not abandon this generation's FFmpeg
+                # children.  Starting another generation after merely
+                # overwriting self._proc/_live_proc leaks duplicate archive
+                # and HLS subscribers for the same source.
+                try:
+                    self._stop_segment(time.time())
+                except Exception:
+                    # _stop_segment drops the references and terminates both
+                    # children before doing fallible DB/file reconciliation,
+                    # so even a second failure here cannot leak the processes.
+                    LOG.exception(
+                        "recorder generation cleanup failed for %s",
+                        self.source.id,
+                    )
                 self._stop.wait(_RECORD_EXCEPTION_RETRY_SECONDS)
         LOG.info("continuous recording stopped: %s", self.source.id)
 
@@ -4815,6 +4830,13 @@ class VideoWorker:
         Archive file rotation happens inside ffmpeg's segment muxer; it never
         tears down RTSP merely because a ten-minute storage boundary arrived.
         """
+        if self._proc is not None or self._live_proc is not None:
+            LOG.error(
+                "refusing to overlap recorder generations for %s; "
+                "reaping stale generation",
+                self.source.id,
+            )
+            self._stop_segment(ts)
         from .capture import resolve_rtsp_url
         url    = resolve_rtsp_url(self.source)
         ffmpeg = shutil.which("ffmpeg")
