@@ -5073,16 +5073,25 @@ class VideoWorker:
             return 0
         if not clock_values:
             return 0
-        lo = min(clock_values) / 100.0 - 0.1
-        hi = max(clock_values) / 100.0 + 0.1
         try:
             with self.db._connect() as conn:
-                result = conn.execute(
-                    "DELETE FROM video_detections WHERE segment_id=?"
-                    " AND (abs_ts<? OR abs_ts>?)",
-                    (segment_id, lo, hi),
-                )
-                return max(0, int(result.rowcount))
+                rows = conn.execute(
+                    "SELECT id, abs_ts FROM video_detections WHERE segment_id=?",
+                    (segment_id,),
+                ).fetchall()
+                archived_clocks = set(clock_values)
+                missing = [
+                    int(row["id"])
+                    for row in rows
+                    if int(round(float(row["abs_ts"]) * 100.0))
+                    not in archived_clocks
+                ]
+                if missing:
+                    conn.executemany(
+                        "DELETE FROM video_detections WHERE id=?",
+                        [(detection_id,) for detection_id in missing],
+                    )
+                return len(missing)
         except Exception:
             LOG.exception(
                 "failed to reconcile live detections seg=%d src=%s",

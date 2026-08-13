@@ -230,6 +230,8 @@ class VideoWorkerTests(unittest.TestCase):
                  "boxes": [], "classes": ["person"]},
                 {"abs_ts": 101.0, "has_human": True, "confidence": .7,
                  "boxes": [], "classes": ["person"]},
+                {"abs_ts": 100.5, "has_human": True, "confidence": .6,
+                 "boxes": [], "classes": ["person"]},
                 {"abs_ts": 130.0, "has_human": True, "confidence": .9,
                  "boxes": [], "classes": ["person"]},
             ])
@@ -244,7 +246,7 @@ class VideoWorkerTests(unittest.TestCase):
                 segment_id, sidecar
             )
 
-            self.assertEqual(removed, 1)
+            self.assertEqual(removed, 2)
             self.assertEqual(
                 [row["abs_ts"] for row in db.detections_for_segment(segment_id)],
                 [100.0, 101.0],
