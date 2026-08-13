@@ -5007,6 +5007,24 @@ class VideoWorker:
                 _finalize_segment_file(seg_path)
                 media_epoch = _decode_media_epoch(seg_path)
                 playable_duration = _video_stream_duration(seg_path)
+                if playable_duration is None or playable_duration <= 0:
+                    LOG.error(
+                        "discarding unreadable segment seg=%d src=%s path=%s: "
+                        "no playable video timeline",
+                        seg_id, self.source.id, seg_path,
+                    )
+                    self.db.delete_segment(seg_id)
+                    for artifact in (seg_path, _frame_clock_path(seg_path)):
+                        try:
+                            artifact.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            LOG.exception(
+                                "failed to remove unreadable segment artifact: %s",
+                                artifact,
+                            )
+                    return False
                 if media_epoch is not None:
                     self.db.set_segment_media_start(seg_id, media_epoch)
                     sidecar = _write_mp4_frame_clock(seg_path)

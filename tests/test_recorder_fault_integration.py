@@ -270,6 +270,22 @@ class RecorderFaultIntegrationTests(unittest.TestCase):
             path = video_dir / row["path"]
             self.assertTrue(path.exists(), f"database references missing {path}")
             self.assertGreater(path.stat().st_size, 0, f"retained empty {path}")
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name,duration",
+                    "-of", "default=nw=1", str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(
+                probe.returncode, 0,
+                f"database retains unreadable MP4 {path}: {probe.stderr}",
+            )
+            self.assertIn("codec_name=h264", probe.stdout)
+            self.assertIn("duration=", probe.stdout)
         self.assertFalse(
             [path for path in video_dir.rglob("*.mp4") if path.stat().st_size == 0],
             "zero-byte MP4 files were not cleaned up",
