@@ -10,7 +10,7 @@ import urllib.request
 
 
 PROMPT_VERSION = "camera-observation-v1"
-DEFAULT_MODEL = "gemma4:latest"
+DEFAULT_MODEL = "qwen3-vl:2b-instruct"
 DEFAULT_URL = "http://host.docker.internal:11434"
 
 _OBSERVATION_SCHEMA = {
@@ -61,7 +61,11 @@ class OllamaVisionClient:
                 "content": prompt,
                 "images": [base64.b64encode(image).decode("ascii")],
             }],
-            "options": {"temperature": 0},
+            "options": {
+                "temperature": 0,
+                "num_ctx": 4096,
+                "num_predict": 160,
+            },
             # Keep the model warm across this search's small candidate batch,
             # then let Ollama release its GPU allocation promptly.
             "keep_alive": "60s",
