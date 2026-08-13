@@ -243,6 +243,46 @@ class MediaEpochAnchorTests(unittest.TestCase):
 
 
 class VideoDbLogicTests(unittest.TestCase):
+    def test_whole_frame_class_counts_skip_exclusion_geometry(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wanyard-class-counts-") as tmp:
+            db = VideoSegmentDB(Path(tmp) / "video.sqlite")
+            segment_id = db.open_segment("front", "front/segment.mp4", 100.0)
+            db.set_segment_media_start(segment_id, 100.0)
+            db.close_segment(segment_id, 130.0, None, None)
+
+            def box(cx: float, cy: float) -> dict:
+                return {
+                    "cls": "person", "x1": cx - 0.02, "y1": cy - 0.02,
+                    "x2": cx + 0.02, "y2": cy + 0.02,
+                }
+
+            db.insert_events([
+                {
+                    "segment_id": segment_id, "source_id": "front",
+                    "abs_ts": 101.0 + index, "class": "person",
+                    "start_off": 1.0 + index, "end_off": 2.0 + index,
+                    "confidence": 0.8, "boxes_json": json.dumps([event_box]),
+                }
+                for index, event_box in enumerate((box(0.1, 0.1), box(0.8, 0.8)))
+            ])
+            db.save_zone("front", {
+                "name": "Ignore corner", "type": "exclusion_area",
+                "polygon": [
+                    {"x": 0.0, "y": 0.0}, {"x": 0.3, "y": 0.0},
+                    {"x": 0.3, "y": 0.3}, {"x": 0.0, "y": 0.3},
+                ],
+            })
+
+            whole_frame = db.class_counts(
+                "front", include_provisional=False, zone_id="none"
+            )
+            exclusion_filtered = db.class_counts(
+                "front", include_provisional=False
+            )
+
+        self.assertEqual(whole_frame, {"person": 2})
+        self.assertEqual(exclusion_filtered, {"person": 1})
+
     def test_live_status_returns_requested_detection_window(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wanyard-live-status-") as tmp:
             db = VideoSegmentDB(Path(tmp) / "video.sqlite")
@@ -453,6 +493,73 @@ class VideoDbLogicTests(unittest.TestCase):
             segment = db.get_segment(segment_id)
             assert segment is not None
             self.assertEqual(segment["media_epoch"], 1_781_600_002.0)
+
+
+class DirectionalGapResolveTests(unittest.TestCase):
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE segments(
+                id INTEGER PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                start_ts REAL NOT NULL,
+                end_ts REAL,
+                media_epoch REAL,
+                duration_sec REAL
+            );
+            INSERT INTO segments VALUES
+                (1, 'garden', 'garden/one.mp4', 100, 120, 100, 20),
+                (3, 'garden', 'garden/unanchored.mp4', 121, 179, NULL, 58),
+                (2, 'garden', 'garden/two.mp4', 180, 200, 180, 20);
+        """)
+        return conn
+
+    def test_backward_navigation_lands_at_previous_recording_edge(self) -> None:
+        location = media_time.resolve(
+            self._conn(), Path("/missing"), "garden", 170, direction="backward"
+        )
+
+        self.assertEqual(location.provider, "mp4")
+        self.assertEqual(location.segment_id, 1)
+        self.assertEqual(location.reason, "gap-backward")
+        self.assertEqual(location.media_offset, 20)
+
+    def test_forward_navigation_lands_at_next_recording_edge(self) -> None:
+        location = media_time.resolve(
+            self._conn(), Path("/missing"), "garden", 130, direction="forward"
+        )
+
+        self.assertEqual(location.provider, "mp4")
+        self.assertEqual(location.segment_id, 2)
+        self.assertEqual(location.reason, "gap-forward")
+        self.assertEqual(location.media_offset, 0)
+
+    def test_plain_timestamp_resolution_does_not_hide_a_gap(self) -> None:
+        location = media_time.resolve(
+            self._conn(), Path("/missing"), "garden", 120.75
+        )
+
+        self.assertEqual(location.provider, "none")
+        self.assertEqual(location.reason, "gap")
+
+    def test_directional_navigation_skips_an_unanchored_file(self) -> None:
+        location = media_time.resolve(
+            self._conn(), Path("/missing"), "garden", 150, direction="backward"
+        )
+
+        self.assertEqual(location.provider, "mp4")
+        self.assertEqual(location.segment_id, 1)
+        self.assertEqual(location.reason, "gap-backward")
+
+    def test_plain_timestamp_surfaces_an_unanchored_file(self) -> None:
+        location = media_time.resolve(
+            self._conn(), Path("/missing"), "garden", 150
+        )
+
+        self.assertEqual(location.provider, "none")
+        self.assertEqual(location.reason, "no_anchor")
 
 
 class RoundTripInvariantTests(unittest.TestCase):

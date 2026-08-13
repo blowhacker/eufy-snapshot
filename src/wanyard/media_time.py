@@ -171,6 +171,54 @@ def _resolve_recorded(conn: sqlite3.Connection, source_id: str,
     return None
 
 
+def _resolve_recorded_gap(conn: sqlite3.Connection, source_id: str,
+                          t: float, direction: str) -> MediaLocation | None:
+    """Resolve a navigation step which landed between playable recordings.
+
+    Ordinary timestamp resolution remains exact.  Explicit player navigation
+    may instead ask for the closest playable edge in its direction, so a
+    rewind across a recorder gap does not become a dead button.
+    """
+    if direction not in {"backward", "forward"}:
+        return None
+    epoch = _recorded_media_epoch_sql()
+    duration = "COALESCE(duration_sec, end_ts - start_ts)"
+    coverage_end = f"({epoch} + {duration})"
+    if direction == "backward":
+        edge_predicate = f"{coverage_end}<=?"
+        ordering = f"{coverage_end} DESC"
+    else:
+        edge_predicate = f"{epoch}>=?"
+        ordering = f"{epoch} ASC"
+    row = conn.execute(
+        "SELECT id, path, start_ts, end_ts,"
+        f" duration_sec, {epoch} AS media_epoch"
+        " FROM segments"
+        " WHERE source_id=? AND end_ts IS NOT NULL"
+        f"   AND {epoch} IS NOT NULL AND {duration} IS NOT NULL"
+        f"   AND {edge_predicate}"
+        f" ORDER BY {ordering} LIMIT 1",
+        (source_id, t),
+    ).fetchone()
+    if not row:
+        return None
+    media_epoch = _recorded_media_epoch(row)
+    media_duration = _recorded_duration(row)
+    if media_epoch is None or media_duration is None:
+        return None
+    anchor = Anchor("mp4", row["path"], media_epoch, media_duration)
+    edge_ts = media_epoch + media_duration if direction == "backward" else media_epoch
+    return MediaLocation(
+        provider="mp4",
+        url=f"/video/files/{row['path']}",
+        media_offset=anchor.clock_to_media(edge_ts),
+        coverage=Coverage(media_epoch, media_epoch + media_duration),
+        anchor=anchor,
+        reason=f"gap-{direction}",
+        segment_id=int(row["id"]),
+    )
+
+
 # ── live HLS ────────────────────────────────────────────────────────────────
 
 def _safe_live_source_id(source_id: str | None) -> bool:
@@ -454,7 +502,8 @@ def _nearest_coverage(conn: sqlite3.Connection, source_id: str,
 # ── public entry point ──────────────────────────────────────────────────────
 
 def resolve(conn: sqlite3.Connection, video_dir: Path,
-            source_id: str, t: float) -> MediaLocation:
+            source_id: str, t: float,
+            direction: str | None = None) -> MediaLocation:
     """The only place clock time is converted to media time.
 
     Closed recorded MP4 wins for the past; live HLS for the recent edge
@@ -468,8 +517,13 @@ def resolve(conn: sqlite3.Connection, video_dir: Path,
     if live is not None:
         return live
 
-    # Recorded-but-unusable (no_anchor) takes precedence over a bare gap so the
-    # unknown is not silently masked.
+    adjacent = _resolve_recorded_gap(conn, source_id, t, direction or "")
+    if adjacent is not None:
+        return adjacent
+
+    # Recorded-but-unusable (no_anchor) takes precedence over a bare gap for
+    # exact lookups. Directional navigation above deliberately skips such a
+    # file and lands on the next anchored, playable edge.
     if recorded is not None:
         return recorded
 

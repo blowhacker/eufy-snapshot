@@ -1607,12 +1607,17 @@ def make_app(
         source_id = request.query_params.get("source") or None
         if not source_id:
             return JSONResponse({"error": "source required"}, status_code=400)
+        direction = request.query_params.get("direction") or None
+        if direction not in {None, "backward", "forward"}:
+            return JSONResponse({"error": "invalid direction"}, status_code=400)
 
         from wanyard import media_time
 
         def _resolve():
             with video_db._connect() as conn:
-                return media_time.resolve(conn, video_dir, source_id, ts)
+                return media_time.resolve(
+                    conn, video_dir, source_id, ts, direction=direction
+                )
 
         loc = await asyncio.to_thread(_resolve)
         media_epoch = loc.anchor.media_epoch if loc.anchor else None

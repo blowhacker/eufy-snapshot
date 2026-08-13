@@ -2459,6 +2459,9 @@ async function resolveVideoTimestamp(sourceId, ts, opts = {}) {
   });
   if (Number.isFinite(Number(opts.preRoll))) p.set("pre_roll", String(Math.max(0, Number(opts.preRoll))));
   if (Number.isFinite(Number(opts.window))) p.set("window", String(Math.max(2, Number(opts.window))));
+  if (opts.direction === "backward" || opts.direction === "forward") {
+    p.set("direction", opts.direction);
+  }
   const r = await fetch(`/api/video/resolve?${p}`, { cache: "no-store" }).catch(() => null);
   if (!r?.ok) return null;
   return await r.json().catch(() => null);
@@ -2506,6 +2509,7 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
       resolved = await resolveVideoTimestamp(srcId, lookupTs, {
         preRoll: options.resolvePreRoll,
         window: options.resolveWindow,
+        direction: options.direction,
       });
     }
     if (seq !== absoluteSeekSeq) return false;
@@ -2514,7 +2518,14 @@ async function seekToTimestamp(sourceId, ts, options = {}) {
       const mediaEpoch = Number(resolved.media_epoch);
       const duration = Number(resolved.duration);
       const maxPosition = Number.isFinite(duration) ? Math.max(0, duration - 0.25) : Infinity;
-      const startPosition = Math.max(0, Math.min(maxPosition, desiredTs - mediaEpoch));
+      // A rewind which crosses missing footage resolves to the previous file's
+      // trailing edge. Give the user ten seconds of playable context there,
+      // rather than painting its final frame for a fraction of a second.
+      const resolvedOffset = Number(resolved.media_offset);
+      const requestedPosition = resolved.reason === "gap-backward" && Number.isFinite(resolvedOffset)
+        ? resolvedOffset - 10
+        : desiredTs - mediaEpoch;
+      const startPosition = Math.max(0, Math.min(maxPosition, requestedPosition));
       const resolvedSource = resolved.source_id ?? srcId;
       const changingSource = Boolean(
         player.currentSeg?.source_id &&
@@ -4246,7 +4257,7 @@ el.rewind.addEventListener("click", () => {
   if (wasLive) stopLiveTail(false);
   if (ts != null) {
     const target = ts - 10;
-    seekToTimestamp(src, target, { scroll: false });
+    seekToTimestamp(src, target, { scroll: false, direction: "backward" });
   }
 });
 el.loop.addEventListener("click",   () => {

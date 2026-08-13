@@ -2235,7 +2235,14 @@ class VideoSegmentDB:
         table = "object_events" if self.object_events_available(source_id) else "video_events"
         episode_filter = "event_type='appeared'" if table == "object_events" else "1"
         polygons = self.zone_polygons(source_id, zone_id)
-        exclusions_active = self.has_exclusion_areas(source_id)
+        # ``zone=none`` drives the class picker for the whole frame.  These
+        # counts are only discovery metadata, and must stay an indexed SQL
+        # aggregate; applying exclusion geometry here decoded every historical
+        # boxes_json row on every viewer load (seconds on a mature database).
+        exclusions_active = (
+            not _zone_filter_disabled(zone_id)
+            and self.has_exclusion_areas(source_id)
+        )
         if polygons or exclusions_active:
             where, params = [episode_filter], []
             if source_id and source_id != "all":
