@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Search — Wanyard</title>
+    <meta name="theme-color" content="#06080b">
+    <link rel="icon" href="/favicon.ico" sizes="any">
+    <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+    <link rel="stylesheet" href="/app.css">
+    <link rel="stylesheet" href="/search.css?v=1">
+  </head>
+  <body>
+    <header class="search-head">
+      <a class="search-brand" href="/?view=wall" aria-label="Open live camera wall">
+        <img src="/assets/favicon.svg" alt="">
+        <span>Search</span>
+      </a>
+      <nav aria-label="Wanyard sections">
+        <a href="/detections">Detections</a>
+        <a href="/spatial">Spatial</a>
+        <a href="/settings">Settings</a>
+      </nav>
+    </header>
+
+    <main class="search-main">
+      <section class="search-intro">
+        <p class="eyebrow">CAMERA MEMORY · FIRST LOOK</p>
+        <h1>Ask what happened.</h1>
+        <p>Wanyard searches recorded evidence and shows its receipts. Visual descriptions and recurring-animal memory come next.</p>
+      </section>
+
+      <form id="searchForm" class="search-form">
+        <label for="searchQuery">Question</label>
+        <div class="search-field">
+          <input id="searchQuery" name="query" type="search" maxlength="300" autocomplete="off" autofocus
+                 placeholder="Was the black cat spotted yesterday?">
+          <button id="searchSubmit" type="submit">
+            <span>Search recordings</span>
+            <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true"><circle cx="7.2" cy="7.2" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="m10.6 10.6 3.3 3.3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <div class="search-prompts" aria-label="Example searches">
+          <button type="button">Was the black cat spotted yesterday?</button>
+          <button type="button">Did a fox visit last night?</button>
+          <button type="button">What time did the bins move?</button>
+        </div>
+      </form>
+
+      <section id="searchResult" class="search-result" aria-live="polite" hidden>
+        <div class="answer-head">
+          <span id="searchConfidence" class="confidence"></span>
+          <span id="searchScope" class="scope"></span>
+        </div>
+        <p id="searchAnswer" class="answer"></p>
+        <p id="searchLimitation" class="limitation" hidden></p>
+        <div id="searchEvidence" class="evidence"></div>
+      </section>
+
+      <section id="searchEmpty" class="search-empty">
+        <div>
+          <span class="step">NOW</span>
+          <strong>Detection evidence</strong>
+          <p>People, cats, dogs, vehicles and other indexed objects, filtered by camera and time.</p>
+        </div>
+        <div>
+          <span class="step next">NEXT</span>
+          <strong>Visual understanding</strong>
+          <p>Colours, foxes, actions and recurring animals, backed by inspected frames.</p>
+        </div>
+        <div>
+          <span class="step later">LATER</span>
+          <strong>Scene memory</strong>
+          <p>Changes to bins, gates and other things that detectors normally ignore.</p>
+        </div>
+      </section>
+    </main>
+    <script src="/search.js?v=1"></script>
+  </body>
+</html>

@@ -1930,6 +1930,39 @@ class VideoSegmentDB:
             rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
         return [_worldize_event_row(row) for row in rows]
 
+    def search_detection_events(
+        self,
+        source_ids: list[str],
+        classes: list[str] | None,
+        since: float,
+        until: float,
+        limit: int = 48,
+    ) -> list[dict]:
+        """Search finalized encounter evidence inside an absolute time window."""
+        source_ids = list(dict.fromkeys(str(value) for value in source_ids if value))
+        if not source_ids:
+            return []
+        where = ["e.event_type!='disappeared'", "e.abs_ts>=?", "e.abs_ts<?"]
+        params: list[object] = [float(since), float(until)]
+        source_marks = ",".join("?" for _ in source_ids)
+        where.append(f"e.source_id IN ({source_marks})")
+        params.extend(source_ids)
+        if classes:
+            class_marks = ",".join("?" for _ in classes)
+            where.append(f"e.class IN ({class_marks})")
+            params.extend(classes)
+        params.append(max(1, min(200, int(limit))))
+        sql = (
+            "SELECT e.*, s.path as seg_path, s.spritesheet,"
+            " s.media_epoch as seg_media_epoch"
+            " FROM video_events e JOIN segments s ON s.id=e.segment_id"
+            f" WHERE {' AND '.join(where)}"
+            " ORDER BY e.abs_ts DESC, e.id DESC LIMIT ?"
+        )
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+        return [_worldize_event_row(row) for row in rows]
+
     def detection_class_counts(
         self,
         source_id: str | None = None,

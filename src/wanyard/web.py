@@ -50,6 +50,7 @@ from .retention import (
     source_cleanup_days,
     validate_record_mode,
 )
+from .search import plan_search, summarize_search
 from .spatial import (
     DEFAULT_SPATIAL_DENSITY,
     SpatialStore,
@@ -1347,6 +1348,84 @@ def make_app(
             await asyncio.to_thread(_payload),
             headers={"Cache-Control": "no-store"},
         )
+
+    async def api_search(request: Request) -> JSONResponse:
+        """Answer a natural-language question with inspectable event evidence."""
+        if video_db is None:
+            return JSONResponse(
+                {"error": "recording index is unavailable"}, status_code=503
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "request body must be a JSON object"}, status_code=400
+            )
+        sources = _sources_list(config, source_db)
+        try:
+            plan = plan_search(body.get("query", ""), sources)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        source_ids = list(plan.source_ids) or [source["id"] for source in sources]
+        known_sources = {source["id"]: source for source in sources}
+        if not source_ids:
+            return JSONResponse({
+                "query": plan.query,
+                "answer": "There are no cameras to search.",
+                "confidence": "no cameras",
+                "plan": plan.payload(),
+                "evidence": [],
+                "limitations": [],
+            })
+        raw_events = []
+        if plan.intent != "scene_change":
+            raw_events = await asyncio.to_thread(
+                video_db.search_detection_events,
+                source_ids,
+                list(plan.classes),
+                plan.since,
+                plan.until,
+                48,
+            )
+        answer, confidence = summarize_search(plan, raw_events)
+        evidence = []
+        for event in raw_events:
+            event_id = str(event.get("id", ""))
+            source_id = str(event.get("source_id") or "")
+            event_ts = float(event.get("display_ts", event.get("abs_ts", 0)))
+            cls = str(event.get("class") or "motion")
+            source = known_sources.get(source_id, {})
+            evidence.append({
+                "id": event_id,
+                "source_id": source_id,
+                "source_name": source.get("name") or source_id,
+                "abs_ts": event_ts,
+                "class": cls,
+                "confidence": float(event.get("confidence") or 0),
+                "thumb_url": f"/api/video/event-thumb/{quote(event_id, safe='')}",
+                "target_url": (
+                    f"/?{urlencode({'source': source_id, 'ts': f'{event_ts:.3f}', 'cls': cls, 'zone': 'none'})}"
+                ),
+            })
+        limitations = []
+        if plan.evidence_level == "visual-verification-required":
+            limitations.append(
+                "Visual attributes and species are not indexed yet; these are detector candidates."
+            )
+        if plan.evidence_level == "scene-index-required":
+            limitations.append(
+                "Fixed objects need periodic scene snapshots before movement can be verified."
+            )
+        return JSONResponse({
+            "query": plan.query,
+            "answer": answer,
+            "confidence": confidence,
+            "plan": plan.payload(),
+            "evidence": evidence,
+            "limitations": limitations,
+        }, headers={"Cache-Control": "no-store"})
 
     async def api_source(request: Request) -> JSONResponse:
         source_id = request.path_params["source_id"]
@@ -3150,6 +3229,7 @@ def make_app(
                           else "wall.html"),
             headers={"Cache-Control": "no-cache"})),
         Route("/detections",               lambda r: FileResponse(static_dir / "detections.html", headers={"Cache-Control": "no-cache"})),
+        Route("/search",                   lambda r: FileResponse(static_dir / "search.html", headers={"Cache-Control": "no-cache"})),
         Route("/spatial",                  lambda r: FileResponse(static_dir / "spatial.html", headers={"Cache-Control": "no-cache"})),
         Route("/settings",                  lambda r: FileResponse(static_dir / "settings.html", headers={"Cache-Control": "no-cache"})),
         Route("/api/health",                api_health),
@@ -3168,6 +3248,7 @@ def make_app(
         Route("/api/video/classes",         api_video_class_counts),
         Route("/api/video/activity-summary", api_video_activity_summary),
         Route("/api/detections/wall",       api_detection_wall),
+        Route("/api/search",                api_search, methods=["POST"]),
         Route("/api/video/zones",           api_video_zones, methods=["GET", "PUT"]),
         Route("/api/video/zones/new",       api_video_zone_create, methods=["POST"]),
         Route("/api/video/zones/{zone_uid}", api_video_zone, methods=["PUT", "DELETE"]),
