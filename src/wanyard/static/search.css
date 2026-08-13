@@ -41,6 +41,7 @@ body { margin: 0; background: var(--bg-stage); color: var(--txt); }
 .evidence-meta { display: block; padding: 10px 11px 12px; }
 .evidence-meta strong { display: block; font-size: 12px; font-weight: 500; text-transform: capitalize; }
 .evidence-meta span { display: block; margin-top: 4px; overflow: hidden; color: var(--txt-3); font: 400 9.5px/1.25 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.evidence-meta em { display: block; margin-top: 8px; color: var(--txt-2); font-size: 11px; font-style: normal; line-height: 1.35; }
 .search-empty { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-top: 66px; border: 1px solid var(--line-soft); border-radius: var(--r-lg); overflow: hidden; background: var(--line-soft); }
 .search-empty > div { min-height: 170px; padding: 22px; background: var(--bg); }
 .step { color: var(--green); font: 500 9px/1 var(--font-mono); letter-spacing: .1em; }

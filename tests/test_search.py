@@ -14,6 +14,11 @@ if str(SRC) not in sys.path:
 
 from wanyard.search import plan_search, summarize_search
 from wanyard.video import VideoSegmentDB
+from wanyard.visual_search import (
+    VisualSearchError,
+    normalize_observation,
+    observation_matches,
+)
 
 
 SOURCES = [
@@ -92,6 +97,46 @@ class SearchEvidenceTests(unittest.TestCase):
             [(row["class"], row["abs_ts"]) for row in rows],
             [("dog", 130.0), ("cat", 120.0)],
         )
+
+    def test_visual_observations_are_versioned_and_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            observation = {
+                "subject": "fox",
+                "colours": ["red", "white"],
+                "action": "walking",
+                "description": "A fox walking across grass.",
+                "confidence": 0.86,
+            }
+            db.store_visual_observation("42", "vision-model", "prompt-v1", observation)
+
+            cached = db.visual_observation("42", "vision-model", "prompt-v1")
+            other_version = db.visual_observation("42", "vision-model", "prompt-v2")
+
+        self.assertEqual(cached["subject"], "fox")
+        self.assertIn("created_at", cached)
+        self.assertIsNone(other_version)
+
+
+class VisualObservationTests(unittest.TestCase):
+    def test_normalizes_untrusted_model_output(self) -> None:
+        observation = normalize_observation({
+            "subject": "FOX",
+            "colours": [" Red ", "red", "White"],
+            "action": "walking",
+            "description": "Likely fox",
+            "confidence": 1.4,
+        })
+
+        self.assertEqual(observation["subject"], "fox")
+        self.assertEqual(observation["colours"], ["red", "white"])
+        self.assertEqual(observation["confidence"], 1.0)
+        self.assertTrue(observation_matches("fox", ("species",), observation))
+        self.assertFalse(observation_matches("cat", ("black",), observation))
+
+    def test_rejects_non_object_observation(self) -> None:
+        with self.assertRaises(VisualSearchError):
+            normalize_observation(["fox"])
 
 
 if __name__ == "__main__":

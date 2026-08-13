@@ -51,6 +51,12 @@ from .retention import (
     validate_record_mode,
 )
 from .search import plan_search, summarize_search
+from .visual_search import (
+    OllamaVisionClient,
+    PROMPT_VERSION,
+    VisualSearchError,
+    observation_matches,
+)
 from .spatial import (
     DEFAULT_SPATIAL_DENSITY,
     SpatialStore,
@@ -799,6 +805,59 @@ def _extract_video_thumb(seg_path: Path, cache_file: Path, t: float,
     return False
 
 
+def _search_candidate_image(video_dir: Path, event: dict) -> bytes | None:
+    """Materialize the same evidence crop shown to the user for VLM review."""
+    try:
+        segment = (video_dir / str(event["seg_path"])).resolve()
+        segment.relative_to(video_dir.resolve())
+        media_epoch = float(event["seg_media_epoch"])
+        event_ts = float(event.get("display_ts", event["abs_ts"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not segment.is_file():
+        return None
+    try:
+        boxes = json.loads(event.get("boxes_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        boxes = []
+    box = _select_event_box(boxes, str(event.get("class") or ""))
+    safe_ref = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_"
+        for char in str(event.get("id") or "event")
+    )
+    cache_file = segment.parent / ".thumbcache" / f"search_{safe_ref}_v1.jpg"
+    if not cache_file.exists() and not _extract_video_thumb(
+        segment, cache_file, max(0.0, event_ts - media_epoch), box
+    ):
+        return None
+    try:
+        image = cache_file.read_bytes()
+    except OSError:
+        return None
+    return image if 0 < len(image) <= 5_000_000 else None
+
+
+def _inspection_sample(events: list[dict], limit: int) -> list[dict]:
+    """Sample distinct moments instead of spending VLM calls on one burst."""
+    buckets: dict[tuple[str, int], dict] = {}
+    for event in events:
+        try:
+            ts = float(event.get("display_ts", event["abs_ts"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        key = (str(event.get("source_id") or ""), int(ts // 120))
+        existing = buckets.get(key)
+        if existing is None or float(event.get("confidence") or 0) > float(
+            existing.get("confidence") or 0
+        ):
+            buckets[key] = event
+    return sorted(
+        buckets.values(),
+        key=lambda event: float(event.get("display_ts", event.get("abs_ts", 0))),
+        reverse=True,
+    )[:limit]
+
+
 # ── Live-thumb (provisional/open-segment event) cache ─────────────────────
 _LIVE_THUMB_CACHE: dict[tuple, tuple[float, bytes | None]] = {}
 _LIVE_THUMB_CACHE_TTL = 30.0
@@ -1389,9 +1448,81 @@ def make_app(
                 plan.until,
                 48,
             )
-        answer, confidence = summarize_search(plan, raw_events)
+        inspect_requested = body.get("inspect", True) is not False
+        inspected_count = 0
+        visual_matches: list[dict] | None = None
+        model_error = None
+        if (
+            inspect_requested
+            and plan.evidence_level == "visual-verification-required"
+            and raw_events
+            and video_dir
+        ):
+            client = OllamaVisionClient()
+            visual_matches = []
+            max_inspections = max(
+                1, min(12, int(os.environ.get("WANYARD_VLM_SEARCH_LIMIT", "6")))
+            )
+            for event in _inspection_sample(raw_events, max_inspections):
+                event_ref = str(event.get("id") or "")
+                observation = await asyncio.to_thread(
+                    video_db.visual_observation,
+                    event_ref,
+                    client.model,
+                    PROMPT_VERSION,
+                )
+                if observation is None:
+                    image = await asyncio.to_thread(
+                        _search_candidate_image, Path(video_dir), event
+                    )
+                    if image is None:
+                        continue
+                    try:
+                        observation = await asyncio.to_thread(
+                            client.inspect, image, str(event.get("class") or "object")
+                        )
+                    except VisualSearchError as exc:
+                        model_error = str(exc)
+                        break
+                    await asyncio.to_thread(
+                        video_db.store_visual_observation,
+                        event_ref,
+                        client.model,
+                        PROMPT_VERSION,
+                        observation,
+                    )
+                inspected_count += 1
+                event["visual_observation"] = observation
+                if observation_matches(
+                    plan.subject, plan.visual_requirements, observation
+                ):
+                    visual_matches.append(event)
+
+        answer_events = (
+            visual_matches
+            if visual_matches is not None and not model_error
+            else raw_events
+        )
+        if visual_matches is not None and not model_error:
+            count = len(visual_matches)
+            if count:
+                noun = plan.subject
+                answer = (
+                    f"The visual model found {count} likely {noun} "
+                    f"match{'es' if count != 1 else ''} {plan.time_label} "
+                    f"among {inspected_count} inspected detector candidates."
+                )
+                confidence = "model inspected"
+            else:
+                answer = (
+                    f"The visual model found no convincing {plan.subject} match "
+                    f"{plan.time_label} among {inspected_count} inspected detector candidates."
+                )
+                confidence = "model inspected"
+        else:
+            answer, confidence = summarize_search(plan, raw_events)
         evidence = []
-        for event in raw_events:
+        for event in answer_events:
             event_id = str(event.get("id", ""))
             source_id = str(event.get("source_id") or "")
             event_ts = float(event.get("display_ts", event.get("abs_ts", 0)))
@@ -1404,15 +1535,24 @@ def make_app(
                 "abs_ts": event_ts,
                 "class": cls,
                 "confidence": float(event.get("confidence") or 0),
+                "visual_observation": event.get("visual_observation"),
                 "thumb_url": f"/api/video/event-thumb/{quote(event_id, safe='')}",
                 "target_url": (
                     f"/?{urlencode({'source': source_id, 'ts': f'{event_ts:.3f}', 'cls': cls, 'zone': 'none'})}"
                 ),
             })
         limitations = []
-        if plan.evidence_level == "visual-verification-required":
+        if model_error:
+            limitations.append(
+                f"Visual inspection stopped: {model_error}. Raw detector candidates are shown."
+            )
+        elif plan.evidence_level == "visual-verification-required" and visual_matches is None:
             limitations.append(
                 "Visual attributes and species are not indexed yet; these are detector candidates."
+            )
+        elif visual_matches is not None:
+            limitations.append(
+                "Visual-model labels are probabilistic interpretations; open the original evidence to verify them."
             )
         if plan.evidence_level == "scene-index-required":
             limitations.append(
@@ -1425,6 +1565,16 @@ def make_app(
             "plan": plan.payload(),
             "evidence": evidence,
             "limitations": limitations,
+            "inspection": {
+                "requested": inspect_requested,
+                "inspected": inspected_count,
+                "model": (
+                    OllamaVisionClient().model
+                    if plan.evidence_level == "visual-verification-required"
+                    else None
+                ),
+                "cached": True,
+            },
         }, headers={"Cache-Control": "no-store"})
 
     async def api_source(request: Request) -> JSONResponse:

@@ -34,6 +34,11 @@ function renderEvidence(events) {
     const detail = document.createElement("span");
     detail.textContent = `${event.source_name} · ${eventTime(event.abs_ts)}`;
     meta.append(title, detail);
+    if (event.visual_observation?.description) {
+      const description = document.createElement("em");
+      description.textContent = event.visual_observation.description;
+      meta.append(description);
+    }
     link.append(image, meta);
     evidence.append(link);
   }
