@@ -81,6 +81,7 @@ services:
       - WANYARD_VLM_URL=${WANYARD_VLM_URL:-http://host.docker.internal:11434}
       - WANYARD_VLM_MODEL=${WANYARD_VLM_MODEL:-qwen3-vl:2b-instruct}
       - WANYARD_VLM_SEARCH_LIMIT=${WANYARD_VLM_SEARCH_LIMIT:-6}
+      - WANYARD_SEARCH_DB=/app/data/search.db
       # App binds this (overrides config.yaml) so per-deploy ports live only in
       # the .env, never as a local edit to the tracked config.yaml. Matches the
       # published port above.

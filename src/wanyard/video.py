@@ -198,16 +198,6 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS visual_observations (
-    event_ref       TEXT NOT NULL,
-    model           TEXT NOT NULL,
-    prompt_version  TEXT NOT NULL,
-    observation_json TEXT NOT NULL,
-    created_at      REAL NOT NULL DEFAULT (unixepoch('now')),
-    PRIMARY KEY(event_ref, model, prompt_version)
-);
-CREATE INDEX IF NOT EXISTS vobs_created ON visual_observations(created_at);
-
 CREATE TABLE IF NOT EXISTS notification_rules (
     id               INTEGER PRIMARY KEY,
     name             TEXT    NOT NULL,
@@ -1972,44 +1962,6 @@ class VideoSegmentDB:
         with self._connect() as conn:
             rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
         return [_worldize_event_row(row) for row in rows]
-
-    def visual_observation(
-        self, event_ref: str, model: str, prompt_version: str
-    ) -> dict | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT observation_json, created_at FROM visual_observations"
-                " WHERE event_ref=? AND model=? AND prompt_version=?",
-                (event_ref, model, prompt_version),
-            ).fetchone()
-        if row is None:
-            return None
-        try:
-            observation = json.loads(row["observation_json"])
-        except (TypeError, json.JSONDecodeError):
-            return None
-        if not isinstance(observation, dict):
-            return None
-        return {**observation, "created_at": float(row["created_at"])}
-
-    def store_visual_observation(
-        self,
-        event_ref: str,
-        model: str,
-        prompt_version: str,
-        observation: dict,
-    ) -> None:
-        encoded = json.dumps(observation, separators=(",", ":"), sort_keys=True)
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO visual_observations"
-                "(event_ref, model, prompt_version, observation_json, created_at)"
-                " VALUES(?,?,?,?,unixepoch('now'))"
-                " ON CONFLICT(event_ref, model, prompt_version) DO UPDATE SET"
-                " observation_json=excluded.observation_json,"
-                " created_at=excluded.created_at",
-                (event_ref, model, prompt_version, encoded),
-            )
 
     def detection_class_counts(
         self,

@@ -16,6 +16,7 @@ from wanyard.search import plan_search, summarize_search
 from wanyard.video import VideoSegmentDB
 from wanyard.visual_search import (
     VisualSearchError,
+    VisualObservationStore,
     normalize_observation,
     observation_matches,
 )
@@ -100,7 +101,7 @@ class SearchEvidenceTests(unittest.TestCase):
 
     def test_visual_observations_are_versioned_and_cached(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            store = VisualObservationStore(Path(tmpdir) / "search.db")
             observation = {
                 "subject": "fox",
                 "colours": ["red", "white"],
@@ -108,10 +109,10 @@ class SearchEvidenceTests(unittest.TestCase):
                 "description": "A fox walking across grass.",
                 "confidence": 0.86,
             }
-            db.store_visual_observation("42", "vision-model", "prompt-v1", observation)
+            store.put("42", "vision-model", "prompt-v1", observation)
 
-            cached = db.visual_observation("42", "vision-model", "prompt-v1")
-            other_version = db.visual_observation("42", "vision-model", "prompt-v2")
+            cached = store.get("42", "vision-model", "prompt-v1")
+            other_version = store.get("42", "vision-model", "prompt-v2")
 
         self.assertEqual(cached["subject"], "fox")
         self.assertIn("created_at", cached)

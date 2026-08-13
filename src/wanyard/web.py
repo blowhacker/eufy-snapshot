@@ -54,6 +54,7 @@ from .search import plan_search, summarize_search
 from .visual_search import (
     OllamaVisionClient,
     PROMPT_VERSION,
+    VisualObservationStore,
     VisualSearchError,
     observation_matches,
 )
@@ -968,6 +969,13 @@ def make_app(
     spatial_store = SpatialStore(
         Path(os.environ.get("WANYARD_SPATIAL_DIR", "data/spatial"))
     )
+    search_store = VisualObservationStore(Path(
+        os.environ.get(
+            "WANYARD_SEARCH_DB",
+            str(Path(video_dir).parent / "data" / "search.db")
+            if video_dir else "data/search.db",
+        )
+    ))
     spatial_feasibility_checks: dict[str, dict] = {}
     health_store = None
     health_collector = None
@@ -1466,7 +1474,7 @@ def make_app(
             for event in _inspection_sample(raw_events, max_inspections):
                 event_ref = str(event.get("id") or "")
                 observation = await asyncio.to_thread(
-                    video_db.visual_observation,
+                    search_store.get,
                     event_ref,
                     client.model,
                     PROMPT_VERSION,
@@ -1485,7 +1493,7 @@ def make_app(
                         model_error = str(exc)
                         break
                     await asyncio.to_thread(
-                        video_db.store_visual_observation,
+                        search_store.put,
                         event_ref,
                         client.model,
                         PROMPT_VERSION,

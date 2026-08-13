@@ -5,8 +5,11 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sqlite3
+import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 PROMPT_VERSION = "camera-observation-v1"
@@ -35,6 +38,66 @@ _OBSERVATION_SCHEMA = {
 
 class VisualSearchError(RuntimeError):
     pass
+
+
+class VisualObservationStore:
+    """Independent derived-data cache; never contends with the recorder DB."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as connection:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS visual_observations (
+                    event_ref TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    observation_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(event_ref, model, prompt_version)
+                );
+                CREATE INDEX IF NOT EXISTS vobs_created
+                    ON visual_observations(created_at);
+            """)
+
+    def _connect(self):
+        connection = sqlite3.connect(str(self.path), timeout=5)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        return connection
+
+    def get(self, event_ref: str, model: str, prompt_version: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT observation_json, created_at FROM visual_observations"
+                " WHERE event_ref=? AND model=? AND prompt_version=?",
+                (event_ref, model, prompt_version),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            observation = json.loads(row["observation_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return (
+            {**observation, "created_at": float(row["created_at"])}
+            if isinstance(observation, dict) else None
+        )
+
+    def put(
+        self, event_ref: str, model: str, prompt_version: str, observation: dict
+    ) -> None:
+        encoded = json.dumps(observation, separators=(",", ":"), sort_keys=True)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO visual_observations"
+                "(event_ref, model, prompt_version, observation_json, created_at)"
+                " VALUES(?,?,?,?,?)"
+                " ON CONFLICT(event_ref, model, prompt_version) DO UPDATE SET"
+                " observation_json=excluded.observation_json,"
+                " created_at=excluded.created_at",
+                (event_ref, model, prompt_version, encoded, time.time()),
+            )
 
 
 class OllamaVisionClient:
