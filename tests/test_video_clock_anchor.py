@@ -21,6 +21,7 @@ if str(SRC) not in sys.path:
 from wanyard import media_time, sei
 from wanyard.video import (
     VideoSegmentDB,
+    VideoWorker,
     _CLOCK_ZERO_FIRST_FRAME,
     _decode_media_epoch,
 )
@@ -243,6 +244,47 @@ class MediaEpochAnchorTests(unittest.TestCase):
 
 
 class VideoDbLogicTests(unittest.TestCase):
+    def test_close_segment_accepts_authoritative_video_duration(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wanyard-duration-") as tmp:
+            db = VideoSegmentDB(Path(tmp) / "video.sqlite")
+            segment_id = db.open_segment("front", "front/segment.mp4", 100.0)
+            db.close_segment(
+                segment_id, 125.0, None, None, playable_duration=9.25
+            )
+
+            segment = db.get_segment(segment_id)
+
+        assert segment is not None
+        self.assertEqual(segment["end_ts"], 125.0)
+        self.assertEqual(segment["duration_sec"], 9.25)
+
+    def test_recent_duration_repair_shrinks_only_suspicious_rows(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wanyard-duration-repair-") as tmp:
+            root = Path(tmp)
+            db = VideoSegmentDB(root / "video.sqlite")
+            segment_id = db.open_segment(
+                "front", "front/segment.mp4", time.time() - 60
+            )
+            db.set_segment_media_start(segment_id, time.time() - 60)
+            db.close_segment(segment_id, time.time(), None, None)
+            media = root / "front/segment.mp4"
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"video")
+            media.with_name(media.name + ".clock.json").write_text(
+                json.dumps({"version": 1, "frames": [[0.0, 1], [8.9, 2]]})
+            )
+            worker = VideoWorker(types.SimpleNamespace(id="front"), root, db)
+
+            with mock.patch(
+                "wanyard.video._video_stream_duration", return_value=9.2
+            ):
+                worker._repair_recent_segment_durations()
+
+            segment = db.get_segment(segment_id)
+
+        assert segment is not None
+        self.assertEqual(segment["duration_sec"], 9.2)
+
     def test_whole_frame_class_counts_skip_exclusion_geometry(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wanyard-class-counts-") as tmp:
             db = VideoSegmentDB(Path(tmp) / "video.sqlite")

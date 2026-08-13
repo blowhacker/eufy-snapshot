@@ -411,20 +411,33 @@ class VideoSegmentDB:
             ).fetchone()["id"]
 
     def close_segment(self, segment_id: int, end_ts: float,
-                      spritesheet: str | None, webvtt: str | None) -> None:
+                      spritesheet: str | None, webvtt: str | None,
+                      playable_duration: float | None = None) -> None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT start_ts FROM segments WHERE id=?",
                 (segment_id,),
             ).fetchone()
-            duration = None
-            if row:
+            duration = (
+                max(0.0, float(playable_duration))
+                if playable_duration is not None
+                else None
+            )
+            if duration is None and row:
                 duration = max(0.0, float(end_ts) - float(row["start_ts"]))
             conn.execute(
                 "UPDATE segments"
                 " SET end_ts=?, duration_sec=?, spritesheet=?, webvtt=?"
                 " WHERE id=?",
                 (end_ts, duration, spritesheet, webvtt, segment_id),
+            )
+
+    def set_segment_duration(self, segment_id: int, duration: float) -> None:
+        """Set authoritative playable video duration, independent of wall time."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE segments SET duration_sec=? WHERE id=?",
+                (max(0.0, float(duration)), segment_id),
             )
 
     def set_segment_media_start(self, segment_id: int, media_epoch: float) -> None:
@@ -4539,6 +4552,7 @@ class VideoWorker:
             try:
                 finalized = _finalize_segment_file(path)
                 media_epoch = _decode_media_epoch(path)
+                playable_duration = _video_stream_duration(path)
                 if media_epoch is not None:
                     self.db.set_segment_media_start(row["id"], media_epoch)
                     _write_mp4_frame_clock(path)
@@ -4546,7 +4560,9 @@ class VideoWorker:
                     # No readable clock: close the row but keep backfill away,
                     # mirroring the unreadable-marker close path.
                     self.db.mark_scanned(row["id"])
-                self.db.close_segment(row["id"], mtime, None, None)
+                self.db.close_segment(
+                    row["id"], mtime, None, None, playable_duration
+                )
                 LOG.warning(
                     "salvaged crashed segment seg=%d src=%s path=%s "
                     "finalized=%s anchored=%s",
@@ -4556,10 +4572,54 @@ class VideoWorker:
             except Exception:
                 LOG.exception("salvage failed for %s", row["path"])
 
+    def _repair_recent_segment_durations(self) -> None:
+        """Repair wall-time coverage left by older recorder versions.
+
+        A stalled camera can keep ffmpeg alive with audio after video frames
+        stop. Older code stored process lifetime as playable duration, so the
+        timeline advertised a tail which did not exist. Frame-clock sidecars
+        cheaply identify suspicious recent rows; only those MP4s are opened.
+        """
+        cutoff = time.time() - 2 * 86400
+        try:
+            with self.db._connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, path, duration_sec FROM segments"
+                    " WHERE source_id=? AND end_ts IS NOT NULL"
+                    " AND media_epoch IS NOT NULL AND start_ts>=?",
+                    (self.source.id, cutoff),
+                ).fetchall()
+        except Exception:
+            LOG.exception("duration repair scan failed for %s", self.source.id)
+            return
+        for row in rows:
+            path = self.video_dir / row["path"]
+            try:
+                payload = json.loads(_frame_clock_path(path).read_text("utf-8"))
+                frames = payload.get("frames") or []
+                last_pts = float(frames[-1][0])
+                stored = float(row["duration_sec"])
+            except (OSError, TypeError, ValueError, IndexError, json.JSONDecodeError):
+                continue
+            if stored <= last_pts + 1.0:
+                continue
+            actual = _video_stream_duration(path)
+            if actual is None or abs(stored - actual) <= 0.5:
+                continue
+            try:
+                self.db.set_segment_duration(row["id"], actual)
+                LOG.warning(
+                    "corrected playable duration seg=%d src=%s wall=%.3fs video=%.3fs",
+                    row["id"], self.source.id, stored, actual,
+                )
+            except Exception:
+                LOG.exception("duration repair failed for %s", row["path"])
+
     def run(self) -> None:
         """Continuous recording loop — call from a daemon thread."""
         LOG.info("continuous recording started: %s", self.source.id)
         self._salvage_orphan_segments()
+        self._repair_recent_segment_durations()
         backoff = _RECORD_RETRY_INITIAL_SECONDS
         while not self._stop.is_set():
             try:
@@ -4796,6 +4856,7 @@ class VideoWorker:
 
                 _finalize_segment_file(seg_path)
                 media_epoch = _decode_media_epoch(seg_path)
+                playable_duration = _video_stream_duration(seg_path)
                 if media_epoch is not None:
                     self.db.set_segment_media_start(seg_id, media_epoch)
                     _write_mp4_frame_clock(seg_path)
@@ -4810,7 +4871,9 @@ class VideoWorker:
                         seg_id, self.source.id,
                     )
                     self.db.mark_scanned(seg_id)
-            self.db.close_segment(seg_id, ts, None, None)
+            self.db.close_segment(
+                seg_id, ts, None, None, playable_duration if seg_path else None
+            )
             return True
         return False
 
@@ -4898,6 +4961,29 @@ def _finalize_segment_file(path: Path, *, timeout: float = 300.0) -> bool:
         except OSError:
             pass
         return False
+
+
+def _video_stream_duration(path: Path) -> float | None:
+    """Return playable video duration, never audio/container wall duration."""
+    container = None
+    try:
+        import av
+
+        container = av.open(str(path))
+        stream = next((item for item in container.streams if item.type == "video"), None)
+        if stream is None or stream.duration is None or stream.time_base is None:
+            return None
+        duration = float(stream.duration * stream.time_base)
+        return duration if math.isfinite(duration) and duration >= 0 else None
+    except Exception:
+        LOG.debug("failed to read video duration from %s", path, exc_info=True)
+        return None
+    finally:
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
 
 
 def _frame_clock_path(path: Path) -> Path:

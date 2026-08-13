@@ -5687,7 +5687,13 @@ async function init() {
     startLiveTail(st.source !== "all" ? st.source : null);
   } else if (urlTs) {
     // Fast path: land on the absolute timestamp while timeline data loads.
-    seekToTimestamp(st.source !== "all" ? st.source : null, urlTs, { scroll: false });
+    // Old detection links can point into a genuine recorder gap after segment
+    // coverage is corrected. In that case, open the preceding playable
+    // footage instead of leaving the player empty and its rewind inert.
+    seekToTimestamp(st.source !== "all" ? st.source : null, urlTs, {
+      scroll: false,
+      direction: "backward",
+    });
     load();
   } else {
     await load();
