@@ -67,6 +67,28 @@ Provider choice is ordinary:
 - neither covers `t` -> gap/no media
 - candidate media has no decoded anchor -> `no_anchor`
 
+## Recording and storage rotation
+
+One archive FFmpeg process subscribes to each stamped MediaMTX path for the
+lifetime of that upstream relay epoch. Its segment muxer rotates fragmented
+MP4 storage files at the configured boundary; rotation does **not** close or
+reopen RTSP. A sealed file is atomically remuxed to fast-start MP4, its
+authoritative SEI frame clock is written beside it, and its database row is
+closed using playable video duration rather than recorder wall time.
+
+Rolling clock-aware HLS is produced by a separate FFmpeg subscriber. The HLS
+helper may be restarted independently and cannot backpressure the archive
+process. The live wall's raw WebRTC/native-HLS preview remains outside this
+clock boundary as described below.
+
+FFmpeg stdout progress and stderr are drained for the complete child lifetime.
+The archive subscriber is restarted only when the upstream epoch exits/fails or
+video progress actually stalls. An unreadable final fragment is discarded
+rather than indexed. Because live inference is another relay subscriber, a
+live detection is provisional until sealing: detections not present in the
+sealed MP4's exact stamped-frame clock are removed and never advertised as
+playable archive evidence.
+
 ## Data Contract
 
 - `video_detections.abs_ts` is clock time.
@@ -113,3 +135,8 @@ Keep these regressions covered:
 - Missing anchors return `no_anchor`, not guessed offsets.
 - Event links, notification links, thumbs, overlays, and live activity filters
   all use the same clock timestamp.
+- MP4 storage rotation retains the same archive FFmpeg/RTSP subscription.
+- FFmpeg progress and diagnostic pipes remain drained under sustained output;
+  missing video progress is detected without one source blocking another.
+- Sealed archive rows reference readable video with real playable duration,
+  and live-only detections are rejected when their stamped frame is absent.

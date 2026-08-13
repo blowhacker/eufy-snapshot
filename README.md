@@ -28,7 +28,8 @@ docker compose up --build -d
 
 - Stamps Unix time onto each frame as an H.264 SEI clock before recording and
   detection (codec copy — zero generation loss, archive = camera bits)
-- Records stamped camera streams as continuous MP4 segments
+- Records stamped camera streams through a persistent RTSP subscription,
+  rotating MP4 storage files without reconnecting at file boundaries
 - Serves rolling live HLS streams for browser playback
 - Runs live YOLO detection plus MP4 backfill, with detections keyed by clock time
 - **Live wall (god view)** — all cameras at once on the landing page, instant
@@ -67,14 +68,29 @@ missing geometry.
 
 Ingest: `camera → go2rtc → mediamtx → stamper → recorder/yolo`. go2rtc is the
 single camera puller; it serves the live wall over WebRTC directly (instant,
-low latency) while mediamtx sources from it for recording/stamping/HLS — no
-extra camera pull.
+low latency) while MediaMTX sources from it for stamping and detection — no
+extra pull from the physical camera.
+
+For each enabled source, the app keeps one archive FFmpeg subscribed to the
+stamped relay for the lifetime of that relay epoch. FFmpeg's segment muxer
+rotates crash-tolerant fragmented MP4 files without closing RTSP; sealed files
+are remuxed to fast-start MP4 and indexed from their decoded SEI frame clocks.
+A second, isolated FFmpeg produces the clock-aware rolling HLS fallback. An HLS
+failure therefore cannot block or restart the archive subscriber. Both
+processes have continuously drained diagnostics and video-progress watchdogs;
+an archive reconnect happens only after upstream EOF/failure or a real progress
+stall, never because a storage boundary was reached.
+
+Live detection is a separate subscriber. When an MP4 is sealed, detections are
+reconciled against its exact stamped-frame clock, so a live detection without
+corresponding archived pixels is not exposed as retained footage.
 
 Main services in `docker-compose.yml`:
 
-- **app** (`wanyard`) — web server, APIs, recording, HLS/MP4 serving
+- **app** (`wanyard`) — web server, APIs, persistent archive recording, and
+  clock-aware HLS/MP4 serving
 - **go2rtc** — camera ingest; serves the live wall over WebRTC (WHEP)
-- **mediamtx** — RTSP relay (sources from go2rtc), live HLS
+- **mediamtx** — RTSP relay (sources from go2rtc) and native low-latency HLS
 - **stamper** — attaches the SEI frame clock and republishes stamped streams
 - **yolo** (`wanyard-yolo`) — live detector, thumbnail crops, MP4 backfill
 
