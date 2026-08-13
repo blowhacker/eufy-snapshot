@@ -1458,6 +1458,8 @@ def make_app(
             )
         inspect_requested = body.get("inspect", True) is not False
         inspected_count = 0
+        cached_inspections = 0
+        new_inspections = 0
         visual_matches: list[dict] | None = None
         model_error = None
         if (
@@ -1471,7 +1473,12 @@ def make_app(
             max_inspections = max(
                 1, min(12, int(os.environ.get("WANYARD_VLM_SEARCH_LIMIT", "6")))
             )
-            for event in _inspection_sample(raw_events, max_inspections):
+
+            # Cached observations are durable derived evidence. Reuse every one
+            # still in this query's candidate set so the answer does not forget
+            # a verified match merely because a later detection changed the
+            # bounded sample selected for fresh inference.
+            for event in raw_events:
                 event_ref = str(event.get("id") or "")
                 observation = await asyncio.to_thread(
                     search_store.get,
@@ -1480,26 +1487,40 @@ def make_app(
                     PROMPT_VERSION,
                 )
                 if observation is None:
-                    image = await asyncio.to_thread(
-                        _search_candidate_image, Path(video_dir), event
-                    )
-                    if image is None:
-                        continue
-                    try:
-                        observation = await asyncio.to_thread(
-                            client.inspect, image, str(event.get("class") or "object")
-                        )
-                    except VisualSearchError as exc:
-                        model_error = str(exc)
-                        break
-                    await asyncio.to_thread(
-                        search_store.put,
-                        event_ref,
-                        client.model,
-                        PROMPT_VERSION,
-                        observation,
-                    )
+                    continue
                 inspected_count += 1
+                cached_inspections += 1
+                event["visual_observation"] = observation
+                if observation_matches(
+                    plan.subject, plan.visual_requirements, observation
+                ):
+                    visual_matches.append(event)
+
+            for event in _inspection_sample(raw_events, max_inspections):
+                if event.get("visual_observation") is not None:
+                    continue
+                event_ref = str(event.get("id") or "")
+                image = await asyncio.to_thread(
+                    _search_candidate_image, Path(video_dir), event
+                )
+                if image is None:
+                    continue
+                try:
+                    observation = await asyncio.to_thread(
+                        client.inspect, image, str(event.get("class") or "object")
+                    )
+                except VisualSearchError as exc:
+                    model_error = str(exc)
+                    break
+                await asyncio.to_thread(
+                    search_store.put,
+                    event_ref,
+                    client.model,
+                    PROMPT_VERSION,
+                    observation,
+                )
+                inspected_count += 1
+                new_inspections += 1
                 event["visual_observation"] = observation
                 if observation_matches(
                     plan.subject, plan.visual_requirements, observation
@@ -1576,12 +1597,14 @@ def make_app(
             "inspection": {
                 "requested": inspect_requested,
                 "inspected": inspected_count,
+                "candidates": len(raw_events),
+                "cached": cached_inspections,
+                "new": new_inspections,
                 "model": (
                     OllamaVisionClient().model
                     if plan.evidence_level == "visual-verification-required"
                     else None
                 ),
-                "cached": True,
             },
         }, headers={"Cache-Control": "no-store"})
 
