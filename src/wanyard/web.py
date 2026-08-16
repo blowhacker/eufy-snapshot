@@ -2529,15 +2529,7 @@ def make_app(
         except Exception:
             pass
         # Disk usage per source
-        source_sizes = {}
-        if video_dir:
-            for src_dir in video_dir.iterdir():
-                if src_dir.is_dir() and not src_dir.name.startswith(".") and src_dir.name != "live":
-                    try:
-                        total = sum(f.stat().st_size for f in src_dir.rglob("*.mp4"))
-                        source_sizes[src_dir.name] = total
-                    except Exception:
-                        pass
+        source_sizes = _source_storage_sizes(video_dir) if video_dir else {}
         recording_threads = capture_worker.thread_health() if capture_worker else {}
         recording_workers = capture_worker.recorder_status() if capture_worker else {}
         return JSONResponse({
@@ -3233,3 +3225,26 @@ def _sources_list(config: AppConfig, source_db=None) -> list:
         }
         for s in sources if s.type == "rtsp"
     ]
+
+
+def _source_storage_sizes(video_dir: Path) -> dict[str, int]:
+    """Return complete per-camera storage, including derived artifacts."""
+    sizes: dict[str, int] = {}
+    for source_dir in Path(video_dir).iterdir():
+        if (
+            not source_dir.is_dir()
+            or source_dir.name.startswith(".")
+            or source_dir.name == "live"
+        ):
+            continue
+        try:
+            total = sum(
+                path.stat().st_size
+                for path in source_dir.rglob("*")
+                if path.is_file()
+            )
+        except OSError:
+            continue
+        if total:
+            sizes[source_dir.name] = total
+    return sizes

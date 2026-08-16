@@ -521,6 +521,10 @@ async function loadCameras() {
       const choice = await chooseCameraRemoval(source);
       if (choice !== 'keep' && choice !== 'purge') return;
       btn.disabled = true;
+      // Removing a recorder and purging its metadata can take several seconds.
+      // Reflect the confirmed choice immediately; reload the authoritative list
+      // below if the server says the camera itself was not removed.
+      row.remove();
       const response = await fetch('/api/sources/'+encodeURIComponent(source.id), {
         method:'DELETE',
         headers:{'Content-Type':'application/json'},
@@ -529,13 +533,14 @@ async function loadCameras() {
       const result = await response.json().catch(()=>({}));
       if (!response.ok) {
         alert(result.error || `Unable to remove camera (${response.status})`);
-        if (!result.camera_removed) btn.disabled = false;
-        if (!result.camera_removed) return;
+        if (!result.camera_removed) {
+          await loadCameras();
+          return;
+        }
       }
-      await loadCameras();
+      await Promise.all([loadCameras(), loadStatus()]);
       loadNotificationRules();
       loadMediaHealth();
-      loadStatus();
     });
   });
 

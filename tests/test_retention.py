@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -422,6 +423,36 @@ class CleanupLoopTests(unittest.TestCase):
                 retention.delete_source_recordings(
                     video_db, video_dir, "../elsewhere"
                 )
+
+    def test_delete_segments_retries_a_busy_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            segment_id, media = self._seg(
+                video_db, video_dir, "desk", 1, "desk"
+            )
+            original_connect = video_db._connect
+            attempts = 0
+
+            def flaky_connect():
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return original_connect()
+
+            with mock.patch.object(video_db, "_connect", side_effect=flaky_connect), \
+                    mock.patch("wanyard.retention.time.sleep"):
+                result = retention.delete_segments(
+                    video_db,
+                    video_dir,
+                    [{"id": segment_id, "path": str(media.relative_to(video_dir))}],
+                )
+
+            self.assertEqual(attempts, 3)  # delete transaction + orphan prune
+            self.assertEqual(result["deleted_segments"], 1)
+            self.assertFalse(media.exists())
 
 
 if __name__ == "__main__":

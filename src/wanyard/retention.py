@@ -17,7 +17,9 @@ Two per-source knobs, each stored where its consumer already reads settings:
 from __future__ import annotations
 
 import math
+import sqlite3
 import shutil
+import time
 from pathlib import Path
 
 RECORD_MODE_CONTINUOUS = "continuous"
@@ -26,6 +28,26 @@ RECORD_MODES = (RECORD_MODE_CONTINUOUS, RECORD_MODE_LIVE_ONLY)
 
 RECORD_MODE_SOURCE_PREFIX = "record_mode_source:"
 CLEANUP_DAYS_SOURCE_PREFIX = "cleanup_days_source:"
+
+_LOCK_RETRY_DELAYS = (0.25, 1.0, 2.0)
+
+
+def _retry_locked(operation):
+    """Retry a bounded maintenance write when another SQLite writer wins.
+
+    VideoSegmentDB already waits ten seconds per connection.  Long detection or
+    notification transactions can occasionally exceed that window, and a
+    one-shot purge must not strand the camera's files merely because it lost
+    that race.
+    """
+    for attempt in range(len(_LOCK_RETRY_DELAYS) + 1):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            if not locked or attempt == len(_LOCK_RETRY_DELAYS):
+                raise
+            time.sleep(_LOCK_RETRY_DELAYS[attempt])
 
 
 def record_mode_key(source_id: str) -> str:
@@ -155,7 +177,9 @@ def delete_segments(
     deleted_notifications = 0
     deleted_confirmations = 0
     cutoffs = notification_cutoffs or {}
-    if selected or cutoffs:
+    def delete_database_rows() -> tuple[int, int]:
+        notifications = 0
+        confirmations = 0
         with video_db._connect() as conn:
             if selected:
                 ids = list(unique)
@@ -176,18 +200,24 @@ def delete_segments(
                     f"DELETE FROM segments WHERE id IN ({placeholders})", ids
                 )
             for source_id, cutoff in cutoffs.items():
-                deleted_notifications += conn.execute(
+                notifications += conn.execute(
                     "DELETE FROM notification_events"
                     " WHERE source_id = ? AND event_ts < ?",
                     (source_id, cutoff),
                 ).rowcount
-                deleted_confirmations += conn.execute(
+                confirmations += conn.execute(
                     "DELETE FROM notification_confirmations"
                     " WHERE source_id = ? AND event_ts < ?",
                     (source_id, cutoff),
                 ).rowcount
+        return notifications, confirmations
 
-    orphaned = video_db.prune_orphan_notifications()
+    if selected or cutoffs:
+        deleted_notifications, deleted_confirmations = _retry_locked(
+            delete_database_rows
+        )
+
+    orphaned = _retry_locked(video_db.prune_orphan_notifications)
     deleted_notifications += orphaned["events"]
     deleted_confirmations += orphaned["confirmations"]
     return {
@@ -277,15 +307,22 @@ def delete_source_recordings(
             (source_id,),
         ).fetchall()]
 
-    result = delete_segments(
-        video_db,
-        video_dir,
-        segments,
-        {source_id: float("inf")},
-    )
-    for directory in source_dirs:
-        if directory.is_dir():
-            shutil.rmtree(directory, ignore_errors=True)
+    try:
+        result = delete_segments(
+            video_db,
+            video_dir,
+            segments,
+            {source_id: float("inf")},
+        )
+    finally:
+        # The user's destructive choice applies to on-disk artifacts even if
+        # metadata cleanup loses a prolonged SQLite lock race.  A later
+        # retention pass can prune database orphans; leaving the footage would
+        # falsely report that "delete recordings" had succeeded while keeping
+        # the bytes indefinitely.
+        for directory in source_dirs:
+            if directory.is_dir():
+                shutil.rmtree(directory, ignore_errors=True)
 
     with video_db._connect() as conn:
         conn.execute(

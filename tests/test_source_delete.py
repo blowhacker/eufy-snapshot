@@ -18,7 +18,7 @@ if str(SRC) not in sys.path:
 from wanyard.config import AppConfig
 from wanyard.db import RtspSourceRow, SourceDB
 from wanyard.video import VideoSegmentDB
-from wanyard.web import make_app
+from wanyard.web import _source_storage_sizes, make_app
 
 
 def _request(path: str, body: bytes = b"") -> Request:
@@ -47,6 +47,19 @@ def _request(path: str, body: bytes = b"") -> Request:
 
 
 class SourceDeleteTests(unittest.TestCase):
+    def test_storage_sizes_include_derived_artifacts_and_skip_empty_dirs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            video_dir = Path(directory)
+            cache = video_dir / "desk" / "2026" / ".thumbcache"
+            cache.mkdir(parents=True)
+            (cache / "crop.jpg").write_bytes(b"thumbnail")
+            (video_dir / "empty-camera").mkdir()
+            live = video_dir / "live" / "desk"
+            live.mkdir(parents=True)
+            (live / "index.m3u8").write_bytes(b"playlist")
+
+            self.assertEqual(_source_storage_sizes(video_dir), {"desk": 9})
+
     def _fixture(self, directory: str):
         root = Path(directory)
         source_db = SourceDB(root / "sources.db")
