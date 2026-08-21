@@ -524,7 +524,7 @@ async function loadCameras() {
       // Removing a recorder and purging its metadata can take several seconds.
       // Reflect the confirmed choice immediately; reload the authoritative list
       // below if the server says the camera itself was not removed.
-      row.remove();
+      btn.closest('.s-cam-row')?.remove();
       let response;
       let result;
       try {
