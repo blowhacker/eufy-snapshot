@@ -525,12 +525,20 @@ async function loadCameras() {
       // Reflect the confirmed choice immediately; reload the authoritative list
       // below if the server says the camera itself was not removed.
       row.remove();
-      const response = await fetch('/api/sources/'+encodeURIComponent(source.id), {
-        method:'DELETE',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({delete_recordings: choice === 'purge'}),
-      });
-      const result = await response.json().catch(()=>({}));
+      let response;
+      let result;
+      try {
+        response = await fetch('/api/sources/'+encodeURIComponent(source.id), {
+          method:'DELETE',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({delete_recordings: choice === 'purge'}),
+        });
+        result = await response.json().catch(()=>({}));
+      } catch (_error) {
+        alert('Unable to reach Wanyard while removing this camera');
+        await loadCameras();
+        return;
+      }
       if (!response.ok) {
         alert(result.error || `Unable to remove camera (${response.status})`);
         if (!result.camera_removed) {
