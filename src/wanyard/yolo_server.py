@@ -617,6 +617,11 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
                     result["deleted_notifications"],
                     result["deleted_confirmations"],
                 )
+            if result["deleted_object_tracks"]:
+                LOG.info(
+                    "auto-cleanup: deleted orphan object tracks=%d",
+                    result["deleted_object_tracks"],
+                )
         except Exception:
             LOG.exception("auto-cleanup error")
 

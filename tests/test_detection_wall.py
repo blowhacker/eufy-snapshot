@@ -553,6 +553,62 @@ class DetectionWallCameraTests(unittest.TestCase):
 
 
 class DetectionWallDatabaseTests(unittest.TestCase):
+    def test_encounter_continuation_uses_indexed_last_observation_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = VideoSegmentDB(Path(tmpdir) / "video.db")
+
+            def persist_segment(media_epoch: float, points: list[tuple[float, float]]):
+                segment_id = db.open_segment(
+                    "front", f"front/{int(media_epoch)}.mp4", media_epoch
+                )
+                db.set_segment_media_start(segment_id, media_epoch)
+                db.close_segment(segment_id, media_epoch + 10.0, None, None)
+                segment = db.get_segment(segment_id)
+                detections = [
+                    {
+                        "abs_ts": ts,
+                        "ts_offset": ts - media_epoch,
+                        "boxes": [_box(cx, 0.45)],
+                    }
+                    for ts, cx in points
+                ]
+                db.insert_encounter_events(
+                    _encounter_events_from_detections(segment, detections)
+                )
+
+            persist_segment(100.0, [(108.5, 0.20), (109.0, 0.21)])
+            # Starts two seconds after the previous observation: same encounter.
+            persist_segment(110.0, [(111.0, 0.23), (111.5, 0.24)])
+
+            with db._connect() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM video_events").fetchone()[0],
+                    1,
+                )
+                head = conn.execute(
+                    "SELECT last_abs_ts FROM detection_encounter_heads"
+                ).fetchone()
+                self.assertAlmostEqual(head["last_abs_ts"], 111.5)
+                plan = conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT event_id"
+                    " FROM detection_encounter_heads"
+                    " WHERE source_id=? AND class=?"
+                    " AND last_abs_ts BETWEEN ? AND ?"
+                    " ORDER BY last_abs_ts DESC LIMIT 100",
+                    ("front", "person", 105.0, 111.0),
+                ).fetchall()
+                self.assertTrue(any(
+                    "dehead_source_class_last" in row["detail"] for row in plan
+                ))
+
+            # A gap beyond the shared six-second policy starts a new encounter.
+            persist_segment(120.0, [(120.1, 0.25), (120.6, 0.26)])
+            with db._connect() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM video_events").fetchone()[0],
+                    2,
+                )
+
     def test_provisional_cache_refreshes_when_a_detection_arrives(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = VideoSegmentDB(Path(tmpdir) / "video.db")

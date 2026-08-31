@@ -226,6 +226,19 @@ CREATE INDEX IF NOT EXISTS vevt_source_class_ts ON video_events(source_id, class
 CREATE INDEX IF NOT EXISTS vevt_ts        ON video_events(abs_ts);
 CREATE INDEX IF NOT EXISTS vevt_seg       ON video_events(segment_id, class);
 
+-- Searchable continuation state for persisted group encounters.  The public
+-- event row keeps the encounter's first timestamp, while this table indexes
+-- its latest observation so cross-segment matching can honor the six-second
+-- continuity window without scanning and sorting the camera's entire history.
+CREATE TABLE IF NOT EXISTS detection_encounter_heads (
+    event_id     INTEGER PRIMARY KEY REFERENCES video_events(id) ON DELETE CASCADE,
+    source_id    TEXT NOT NULL,
+    class        TEXT NOT NULL,
+    last_abs_ts  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS dehead_source_class_last
+    ON detection_encounter_heads(source_id, class, last_abs_ts DESC);
+
 CREATE TABLE IF NOT EXISTS object_tracks (
     id               INTEGER PRIMARY KEY,
     source_id        TEXT    NOT NULL,
@@ -1677,15 +1690,22 @@ class VideoSegmentDB:
                 first_ts = float(
                     event.get("_encounter_first_abs_ts", event["abs_ts"])
                 )
+                state_last_ts = float(
+                    state.get("last_abs_ts", first_ts) if state else first_ts
+                )
                 best: tuple[float, sqlite3.Row, dict] | None = None
                 candidates = conn.execute(
                     "SELECT e.* FROM video_events e"
-                    " WHERE e.source_id=? AND e.class=?"
+                    " JOIN detection_encounter_heads h ON h.event_id=e.id"
+                    " WHERE h.source_id=? AND h.class=?"
+                    " AND h.last_abs_ts BETWEEN ? AND ?"
                     " AND e.event_type='detection' AND e.segment_id<>?"
-                    " ORDER BY e.id DESC LIMIT 100",
+                    " ORDER BY h.last_abs_ts DESC, e.id DESC LIMIT 100",
                     (
                         event["source_id"],
                         event["class"],
+                        first_ts - _ENCOUNTER_GAP_SECONDS,
+                        first_ts,
                         event["segment_id"],
                     ),
                 ).fetchall()
@@ -1757,6 +1777,11 @@ class VideoSegmentDB:
                             candidate["id"],
                         ),
                     )
+                    conn.execute(
+                        "UPDATE detection_encounter_heads SET last_abs_ts=?"
+                        " WHERE event_id=?",
+                        (state_last_ts, candidate["id"]),
+                    )
                     continue
 
                 row = {
@@ -1764,7 +1789,7 @@ class VideoSegmentDB:
                     "event_type": event.get("event_type", "detection"),
                     "track_id": event.get("track_id"),
                 }
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO video_events"
                     "(segment_id, source_id, abs_ts, class, start_off, end_off,"
                     " confidence, boxes_json, event_type, track_id)"
@@ -1772,6 +1797,30 @@ class VideoSegmentDB:
                     " :confidence,:boxes_json,:event_type,:track_id)",
                     row,
                 )
+                conn.execute(
+                    "INSERT INTO detection_encounter_heads"
+                    " (event_id, source_id, class, last_abs_ts) VALUES(?,?,?,?)",
+                    (
+                        cur.lastrowid,
+                        event["source_id"],
+                        event["class"],
+                        state_last_ts,
+                    ),
+                )
+
+    def prune_orphan_object_tracks(self, limit: int = 10_000) -> int:
+        """Remove one bounded batch of inactive tracks with no surviving events."""
+        with self._connect() as conn:
+            return conn.execute(
+                "DELETE FROM object_tracks WHERE id IN ("
+                " SELECT t.id FROM object_tracks t"
+                " WHERE t.active=0"
+                " AND NOT EXISTS ("
+                "   SELECT 1 FROM object_events e WHERE e.track_id=t.id"
+                " ) LIMIT ?"
+                ")",
+                (max(1, int(limit)),),
+            ).rowcount
 
     def track_object_events(self, segment: dict, tracklets: list[dict]) -> list[dict]:
         source_id = segment["source_id"]

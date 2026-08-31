@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import subprocess
+import sqlite3
 import tempfile
 import threading
 import time
@@ -2130,7 +2131,17 @@ def make_app(
     async def api_notifications_read_all(request: Request) -> JSONResponse:
         if not video_db:
             return JSONResponse({"error": "video db not configured"}, status_code=501)
-        updated = await asyncio.to_thread(video_db.mark_all_notifications_read)
+        try:
+            updated = await asyncio.to_thread(video_db.mark_all_notifications_read)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            LOG.warning("notification read-all lost SQLite writer race")
+            return JSONResponse(
+                {"error": "notification database is busy; retry shortly"},
+                status_code=503,
+                headers={"Retry-After": "1"},
+            )
         unread_count = await asyncio.to_thread(video_db.unread_notification_count)
         return JSONResponse({"updated": updated, "unread_count": unread_count})
 

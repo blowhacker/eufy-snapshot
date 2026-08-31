@@ -328,6 +328,42 @@ class CleanupLoopTests(unittest.TestCase):
             self.assertEqual(video_db.prune_orphan_notifications()["events"], 1)
             self.assertEqual(video_db.unread_notification_count(), 0)
 
+    def test_segment_retention_prunes_orphaned_inactive_object_tracks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            segment_id, media = self._seg(
+                video_db, video_dir, "front", 10, "old"
+            )
+            with video_db._connect() as conn:
+                track_id = conn.execute(
+                    "INSERT INTO object_tracks"
+                    " (source_id,class,cx,cy,area,first_seen,last_seen,"
+                    " first_start_off,last_start_off,last_end_off,active,state)"
+                    " VALUES('front','person',.5,.5,.1,1,2,0,0,1,0,'gone')"
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO object_events"
+                    " (track_id,segment_id,source_id,abs_ts,display_ts,class,"
+                    " event_type,start_off,end_off)"
+                    " VALUES(?,?,?,?,?,'person','appeared',0,1)",
+                    (track_id, segment_id, "front", 1.0, 1.0),
+                )
+
+            result = retention.delete_segments(
+                video_db,
+                video_dir,
+                [{"id": segment_id, "path": str(media.relative_to(video_dir))}],
+            )
+
+            self.assertEqual(result["deleted_object_tracks"], 1)
+            with video_db._connect() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM object_tracks").fetchone()[0],
+                    0,
+                )
+
     def test_manual_global_cleanup_uses_shared_executor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             video_dir = Path(tmpdir) / "video"
@@ -450,7 +486,8 @@ class CleanupLoopTests(unittest.TestCase):
                     [{"id": segment_id, "path": str(media.relative_to(video_dir))}],
                 )
 
-            self.assertEqual(attempts, 3)  # delete transaction + orphan prune
+            # Delete transaction + notification prune + object-track prune.
+            self.assertEqual(attempts, 4)
             self.assertEqual(result["deleted_segments"], 1)
             self.assertFalse(media.exists())
 

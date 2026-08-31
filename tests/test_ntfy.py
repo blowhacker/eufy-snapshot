@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -405,6 +406,31 @@ class NtfySettingsApiTests(unittest.TestCase):
         self.assertTrue(payload["settings"]["enabled"])
         self.assertTrue(payload["settings"]["include_thumbnail"])
         send.assert_called_once()
+
+    def test_notification_read_all_reports_transient_database_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = VideoSegmentDB(Path(tmp) / "video.db")
+            app = make_app(
+                AppConfig(),
+                video_dir=Path(tmp) / "video",
+                video_db=db,
+            )
+            route = next(
+                route.endpoint for route in app.app.routes
+                if getattr(route, "path", None) == "/api/notifications/read-all"
+            )
+            with mock.patch.object(
+                db,
+                "mark_all_notifications_read",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ):
+                response = asyncio.run(route(self._request(
+                    "/api/notifications/read-all", "POST"
+                )))
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers["retry-after"], "1")
+        self.assertIn("retry", json.loads(response.body)["error"])
 
 
 if __name__ == "__main__":

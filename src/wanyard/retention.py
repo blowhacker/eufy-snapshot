@@ -220,12 +220,14 @@ def delete_segments(
     orphaned = _retry_locked(video_db.prune_orphan_notifications)
     deleted_notifications += orphaned["events"]
     deleted_confirmations += orphaned["confirmations"]
+    deleted_object_tracks = _retry_locked(video_db.prune_orphan_object_tracks)
     return {
         "deleted_segments": len(selected),
         "deleted_files": deleted_files,
         "freed_bytes": freed_bytes,
         "deleted_notifications": deleted_notifications,
         "deleted_confirmations": deleted_confirmations,
+        "deleted_object_tracks": deleted_object_tracks,
     }
 
 
