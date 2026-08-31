@@ -12,8 +12,9 @@
 #   2. A deploy that forgets the gpu overlay (stale/edited .env COMPOSE_FILE)
 #      recreates app/yolo/stamper without GPUs.
 # This script removes both foot-guns: it always builds COMPOSE_FILE with the gpu
-# overlay itself (independent of .env), always uses `up -d`, never `restart`, and
-# fails the deploy if torch/CUDA or the device reservation is missing afterward.
+# overlay itself (independent of .env), force-recreates the containers instead of
+# merely restarting/reusing them, and fails the deploy if torch/CUDA or the
+# device reservation is missing afterward.
 #
 # Usage:   scripts/deploy.sh
 # Env:     WANYARD_DEPLOY_HOST (default: banana)
@@ -57,10 +58,12 @@ files="$files:docker-compose.gpu.yml"
 export COMPOSE_FILE="$files"
 echo ">> COMPOSE_FILE=$COMPOSE_FILE"
 
-# up -d (re)creates containers so the device reservation is applied. `restart`
-# would not — that is exactly the bug this script prevents.
+# Compose normally reuses a container when its config is unchanged. That leaves
+# stale NVIDIA device/runtime state in place after a host driver reload or reboot,
+# so an apparently successful deploy can still have NVML/CUDA unavailable.
+# Force recreation to re-run the NVIDIA container-runtime setup every deploy.
 echo ">> building + recreating"
-docker compose up -d --build
+docker compose up -d --build --force-recreate
 
 echo ">> verifying GPU passthrough"
 fail=0
@@ -98,7 +101,7 @@ for svc in app yolo; do
 done
 
 if [ "$fail" -ne 0 ]; then
-  echo "DEPLOY FAILED: GPU not fully wired. Fix docker-compose.gpu.yml / .env and re-run." >&2
+  echo "DEPLOY FAILED: GPU not fully wired; inspect the failed checks above and re-run." >&2
   exit 1
 fi
 echo ">> deploy OK — GPU wired for app + yolo + stamper"
