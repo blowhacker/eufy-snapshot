@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from wanyard.web import (
+    _compressed_video_seek_times,
     _detection_wall_all,
     _detection_wall_camera,
     _detection_wall_preview,
@@ -113,6 +114,18 @@ class DetectionWallCameraTests(unittest.TestCase):
         "name": "Front door",
         "record_mode": "continuous",
     }
+
+    def test_maps_seek_for_historical_compressed_video_timestamps(self) -> None:
+        seeks = _compressed_video_seek_times(267.456, 596.015, 0.166656)
+
+        self.assertAlmostEqual(seeks[0], 0.07478, places=4)
+        self.assertEqual(len(seeks), 4)
+
+    def test_does_not_remap_a_healthy_video_timeline(self) -> None:
+        self.assertEqual(
+            _compressed_video_seek_times(267.456, 596.015, 595.9),
+            [],
+        )
 
     def test_combines_selected_classes_newest_first(self) -> None:
         db = FakeVideoDB([

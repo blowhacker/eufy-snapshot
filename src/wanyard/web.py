@@ -698,6 +698,58 @@ def _probe_video_size(path: Path) -> tuple[int, int] | None:
     return (w, h) if w > 0 and h > 0 else None
 
 
+def _probe_video_duration(path: Path) -> float | None:
+    """Return the video stream duration, excluding a possibly-bad audio track."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration", "-of", "csv=p=0",
+             str(path)],
+            capture_output=True, timeout=5, check=False, text=True,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        duration = float(r.stdout.strip().splitlines()[0])
+    except (IndexError, TypeError, ValueError):
+        return None
+    return duration if math.isfinite(duration) and duration > 0 else None
+
+
+def _compressed_video_seek_times(t: float, duration_hint: float | None,
+                                 video_duration: float | None) -> list[float]:
+    """Map wall-clock offsets onto an MP4 whose video PTS range was compressed.
+
+    A retired stamper process wrote some otherwise-decodable recordings with
+    thousands of video frames squeezed into a fraction of a second of PTS. A
+    normal seek therefore lands beyond EOF. The segment database still has the
+    correct wall-clock duration, so its ratio to the encoded video duration can
+    recover the intended frame without an expensive decode from frame zero.
+    """
+    try:
+        expected = float(duration_hint)
+        encoded = float(video_duration)
+        target = float(t)
+    except (TypeError, ValueError):
+        return []
+    if not all(math.isfinite(value) for value in (expected, encoded, target)):
+        return []
+    # Only reinterpret timestamps when the video timeline is unmistakably bad.
+    # A generous threshold avoids hiding ordinary seek/codec failures.
+    if expected <= 0 or encoded <= 0 or encoded >= expected * 0.5:
+        return []
+    scale = encoded / expected
+    return [
+        min(encoded, max(0.0, attempt_t * scale))
+        for attempt_t in (target, target - 1, target - 2, target - 5)
+    ]
+
+
 def _select_event_box(boxes: list, cls: str) -> dict | None:
     candidates = [b for b in boxes if isinstance(b, dict)]
     if not candidates:
@@ -760,7 +812,8 @@ def _crop_from_box(box: dict, frame_w: int, frame_h: int,
 
 
 def _extract_video_thumb(seg_path: Path, cache_file: Path, t: float,
-                         crop_box: dict | None = None) -> bool:
+                         crop_box: dict | None = None,
+                         duration_hint: float | None = None) -> bool:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return False
@@ -777,7 +830,27 @@ def _extract_video_thumb(seg_path: Path, cache_file: Path, t: float,
             )
 
     cache_file.parent.mkdir(parents=True, exist_ok=True)
-    for attempt_t in [t, max(0, t - 1), max(0, t - 2), max(0, t - 5)]:
+    seek_times = [t, max(0, t - 1), max(0, t - 2), max(0, t - 5)]
+    for attempt_t in seek_times:
+        cmd = [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", str(attempt_t), "-i", str(seg_path),
+        ]
+        if vf:
+            cmd += ["-vf", vf]
+        cmd += ["-frames:v", "1", "-q:v", "3", str(cache_file)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=10, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            r = None
+        if r and r.returncode == 0 and cache_file.exists() and cache_file.stat().st_size > 0:
+            return True
+
+    # Recover historical recordings whose frames are intact but whose video
+    # packet timestamps were compressed. This is deliberately after the normal
+    # path so healthy recordings pay no extra ffprobe or seek cost.
+    video_duration = _probe_video_duration(seg_path)
+    for attempt_t in _compressed_video_seek_times(t, duration_hint, video_duration):
         cmd = [
             ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
             "-ss", str(attempt_t), "-i", str(seg_path),
@@ -1527,7 +1600,21 @@ def make_app(
         # came from different observations in the same track.
         cache_file = cache_dir / f"event_{safe_event_id}_crop_v5.jpg"
         if not cache_file.exists():
-            ok = await asyncio.to_thread(_extract_video_thumb, seg_path, cache_file, t, box)
+            duration_hint = None
+            try:
+                duration_hint = (
+                    float(evt["seg_end_ts"]) - float(evt["seg_media_epoch"])
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
+            ok = await asyncio.to_thread(
+                _extract_video_thumb,
+                seg_path,
+                cache_file,
+                t,
+                box,
+                duration_hint,
+            )
             if not ok:
                 live_response = await _try_live_thumb()
                 if live_response is not None:
