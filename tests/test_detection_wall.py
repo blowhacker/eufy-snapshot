@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 from starlette.requests import Request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,7 @@ from wanyard.web import (
     _detection_wall_camera,
     _detection_wall_preview,
     _gzip_path_is_excluded,
+    _probe_video_seek_extent,
     make_app,
 )
 from wanyard.config import AppConfig, SourceConfig
@@ -116,9 +118,9 @@ class DetectionWallCameraTests(unittest.TestCase):
     }
 
     def test_maps_seek_for_historical_compressed_video_timestamps(self) -> None:
-        seeks = _compressed_video_seek_times(267.456, 596.015, 0.166656)
+        seeks = _compressed_video_seek_times(267.456, 596.015, 0.099989)
 
-        self.assertAlmostEqual(seeks[0], 0.07478, places=4)
+        self.assertAlmostEqual(seeks[0], 0.04488, places=4)
         self.assertEqual(len(seeks), 4)
 
     def test_does_not_remap_a_healthy_video_timeline(self) -> None:
@@ -126,6 +128,24 @@ class DetectionWallCameraTests(unittest.TestCase):
             _compressed_video_seek_times(267.456, 596.015, 595.9),
             [],
         )
+
+    @mock.patch("wanyard.web.shutil.which", return_value="/usr/bin/ffprobe")
+    @mock.patch("wanyard.web.subprocess.run")
+    def test_uses_frame_span_when_final_packet_inflates_duration(
+        self, run, _which
+    ) -> None:
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({"streams": [{
+                "duration": "0.166656",
+                "r_frame_rate": "90000/1",
+                "nb_frames": "9000",
+            }]}),
+        )
+
+        extent = _probe_video_seek_extent(Path("compressed.mp4"))
+
+        self.assertAlmostEqual(extent, 8999 / 90000)
 
     def test_combines_selected_classes_newest_first(self) -> None:
         db = FakeVideoDB([

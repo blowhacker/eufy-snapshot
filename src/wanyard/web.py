@@ -698,15 +698,22 @@ def _probe_video_size(path: Path) -> tuple[int, int] | None:
     return (w, h) if w > 0 and h > 0 else None
 
 
-def _probe_video_duration(path: Path) -> float | None:
-    """Return the video stream duration, excluding a possibly-bad audio track."""
+def _probe_video_seek_extent(path: Path) -> float | None:
+    """Return the usable PTS span of the video stream.
+
+    Broken historical streams end with one normal-sized packet after thousands
+    of one-tick packets. ffprobe includes that final packet's duration in the
+    stream duration, making it about 5/3 too large. Frame count / nominal frame
+    rate gives the actual seekable PTS span in that case.
+    """
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return None
     try:
         r = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=duration", "-of", "csv=p=0",
+             "-show_entries", "stream=duration,nb_frames,r_frame_rate",
+             "-of", "json",
              str(path)],
             capture_output=True, timeout=5, check=False, text=True,
         )
@@ -715,10 +722,23 @@ def _probe_video_duration(path: Path) -> float | None:
     if r.returncode != 0:
         return None
     try:
-        duration = float(r.stdout.strip().splitlines()[0])
-    except (IndexError, TypeError, ValueError):
+        stream = json.loads(r.stdout)["streams"][0]
+        duration = float(stream["duration"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    return duration if math.isfinite(duration) and duration > 0 else None
+    if not math.isfinite(duration) or duration <= 0:
+        return None
+    try:
+        numerator, denominator = (
+            float(part) for part in stream["r_frame_rate"].split("/", 1)
+        )
+        frame_count = int(stream["nb_frames"])
+        frame_span = max(0.0, (frame_count - 1) * denominator / numerator)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return duration
+    if frame_span > 0 and duration > frame_span * 1.5:
+        return frame_span
+    return duration
 
 
 def _compressed_video_seek_times(t: float, duration_hint: float | None,
@@ -849,7 +869,7 @@ def _extract_video_thumb(seg_path: Path, cache_file: Path, t: float,
     # Recover historical recordings whose frames are intact but whose video
     # packet timestamps were compressed. This is deliberately after the normal
     # path so healthy recordings pay no extra ffprobe or seek cost.
-    video_duration = _probe_video_duration(seg_path)
+    video_duration = _probe_video_seek_extent(seg_path)
     for attempt_t in _compressed_video_seek_times(t, duration_hint, video_duration):
         cmd = [
             ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
@@ -1598,7 +1618,7 @@ def make_app(
         )
         # v5 also repairs historical rows whose event timestamp and crop box
         # came from different observations in the same track.
-        cache_file = cache_dir / f"event_{safe_event_id}_crop_v5.jpg"
+        cache_file = cache_dir / f"event_{safe_event_id}_crop_v6.jpg"
         if not cache_file.exists():
             duration_hint = None
             try:
