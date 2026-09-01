@@ -31,6 +31,16 @@ CLEANUP_DAYS_SOURCE_PREFIX = "cleanup_days_source:"
 
 _LOCK_RETRY_DELAYS = (0.25, 1.0, 2.0)
 
+ORPHAN_TRACK_BATCH_SIZE = 10_000
+ORPHAN_TRACK_DRAIN_BUDGET_SECONDS = 1.0
+ORPHAN_TRACK_BATCH_PAUSE_SECONDS = 0.05
+ORPHAN_TRACK_BUSY_TIMEOUT_MS = 250
+
+
+def _is_locked_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
 
 def _retry_locked(operation):
     """Retry a bounded maintenance write when another SQLite writer wins.
@@ -44,10 +54,70 @@ def _retry_locked(operation):
         try:
             return operation()
         except sqlite3.OperationalError as exc:
-            locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
-            if not locked or attempt == len(_LOCK_RETRY_DELAYS):
+            if not _is_locked_error(exc) or attempt == len(_LOCK_RETRY_DELAYS):
                 raise
             time.sleep(_LOCK_RETRY_DELAYS[attempt])
+
+
+def drain_orphan_object_tracks(
+    video_db,
+    *,
+    batch_size: int = ORPHAN_TRACK_BATCH_SIZE,
+    time_budget_seconds: float = ORPHAN_TRACK_DRAIN_BUDGET_SECONDS,
+    batch_pause_seconds: float = ORPHAN_TRACK_BATCH_PAUSE_SECONDS,
+    busy_timeout_ms: int = ORPHAN_TRACK_BUSY_TIMEOUT_MS,
+    stop_event=None,
+) -> dict[str, int | float | bool]:
+    """Drain legacy orphan tracks using short, independently committed writes.
+
+    Retention now removes newly orphaned tracks at their source. This scavenger
+    exists for the historical backlog and deliberately yields on contention or
+    after a small wall-clock budget instead of monopolising SQLite's one writer.
+    """
+    batch_size = max(1, int(batch_size))
+    budget = max(0.0, float(time_budget_seconds))
+    pause = max(0.0, float(batch_pause_seconds))
+    started = time.monotonic()
+    deleted = 0
+    batches = 0
+    drained = False
+    busy = False
+    stopped = False
+
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            stopped = True
+            break
+        # A zero budget still permits one bounded batch, which is useful to
+        # callers that want deterministic progress without an unbounded pass.
+        if batches and time.monotonic() - started >= budget:
+            break
+        try:
+            count = video_db.prune_orphan_object_tracks(
+                batch_size,
+                busy_timeout_ms=max(0, int(busy_timeout_ms)),
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_locked_error(exc):
+                raise
+            busy = True
+            break
+        batches += 1
+        deleted += int(count)
+        if count < batch_size:
+            drained = True
+            break
+        if pause:
+            time.sleep(pause)
+
+    return {
+        "deleted": deleted,
+        "batches": batches,
+        "elapsed_seconds": time.monotonic() - started,
+        "drained": drained,
+        "busy": busy,
+        "stopped": stopped,
+    }
 
 
 def record_mode_key(source_id: str) -> str:
@@ -177,13 +247,28 @@ def delete_segments(
     deleted_notifications = 0
     deleted_confirmations = 0
     cutoffs = notification_cutoffs or {}
-    def delete_database_rows() -> tuple[int, int]:
+    def delete_database_rows() -> tuple[int, int, int]:
         notifications = 0
         confirmations = 0
+        object_tracks = 0
         with video_db._connect() as conn:
             if selected:
                 ids = list(unique)
                 placeholders = ",".join("?" * len(ids))
+                # Capture only tracks touched by this retention pass before
+                # deleting their event rows. The temporary primary-key table
+                # de-duplicates tracks spanning several selected segments.
+                conn.execute(
+                    "CREATE TEMP TABLE retention_track_candidates"
+                    " (track_id INTEGER PRIMARY KEY) WITHOUT ROWID"
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO retention_track_candidates(track_id)"
+                    " SELECT track_id FROM object_events"
+                    f" WHERE segment_id IN ({placeholders})"
+                    " AND track_id IS NOT NULL",
+                    ids,
+                )
                 conn.execute(
                     f"DELETE FROM video_events WHERE segment_id IN ({placeholders})",
                     ids,
@@ -199,6 +284,18 @@ def delete_segments(
                 conn.execute(
                     f"DELETE FROM segments WHERE id IN ({placeholders})", ids
                 )
+                # A track can span retained and expired segments. Delete it
+                # only when it is inactive and its final event disappeared in
+                # this transaction; active tracker state is never scavenged.
+                object_tracks = conn.execute(
+                    "DELETE FROM object_tracks"
+                    " WHERE active=0"
+                    " AND id IN (SELECT track_id FROM retention_track_candidates)"
+                    " AND NOT EXISTS ("
+                    "   SELECT 1 FROM object_events e"
+                    "   WHERE e.track_id=object_tracks.id"
+                    " )"
+                ).rowcount
             for source_id, cutoff in cutoffs.items():
                 notifications += conn.execute(
                     "DELETE FROM notification_events"
@@ -210,17 +307,19 @@ def delete_segments(
                     " WHERE source_id = ? AND event_ts < ?",
                     (source_id, cutoff),
                 ).rowcount
-        return notifications, confirmations
+        return notifications, confirmations, object_tracks
 
+    deleted_object_tracks = 0
     if selected or cutoffs:
-        deleted_notifications, deleted_confirmations = _retry_locked(
-            delete_database_rows
-        )
+        (
+            deleted_notifications,
+            deleted_confirmations,
+            deleted_object_tracks,
+        ) = _retry_locked(delete_database_rows)
 
     orphaned = _retry_locked(video_db.prune_orphan_notifications)
     deleted_notifications += orphaned["events"]
     deleted_confirmations += orphaned["confirmations"]
-    deleted_object_tracks = _retry_locked(video_db.prune_orphan_object_tracks)
     return {
         "deleted_segments": len(selected),
         "deleted_files": deleted_files,

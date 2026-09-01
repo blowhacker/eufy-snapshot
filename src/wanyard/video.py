@@ -1808,9 +1808,23 @@ class VideoSegmentDB:
                     ),
                 )
 
-    def prune_orphan_object_tracks(self, limit: int = 10_000) -> int:
-        """Remove one bounded batch of inactive tracks with no surviving events."""
+    def prune_orphan_object_tracks(
+        self,
+        limit: int = 10_000,
+        *,
+        busy_timeout_ms: int | None = None,
+    ) -> int:
+        """Remove one bounded batch of inactive tracks with no surviving events.
+
+        ``busy_timeout_ms`` lets opportunistic background cleanup yield much
+        sooner than ordinary application writes, which retain the connection's
+        normal ten-second timeout.
+        """
         with self._connect() as conn:
+            if busy_timeout_ms is not None:
+                conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int(busy_timeout_ms))}"
+                )
             return conn.execute(
                 "DELETE FROM object_tracks WHERE id IN ("
                 " SELECT t.id FROM object_tracks t"

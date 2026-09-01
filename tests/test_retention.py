@@ -178,6 +178,7 @@ class _OneShotEvent(threading.Event):
     """stop_event whose first wait() ends the loop — runs exactly one cycle."""
 
     def wait(self, timeout=None):  # noqa: ARG002
+        self.last_timeout = timeout
         self.set()
         return True
 
@@ -364,6 +365,129 @@ class CleanupLoopTests(unittest.TestCase):
                     0,
                 )
 
+    def test_segment_retention_preserves_track_with_a_surviving_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            old_id, old_media = self._seg(
+                video_db, video_dir, "front", 10, "old"
+            )
+            kept_id, kept_media = self._seg(
+                video_db, video_dir, "front", 1, "kept"
+            )
+            with video_db._connect() as conn:
+                track_id = conn.execute(
+                    "INSERT INTO object_tracks"
+                    " (source_id,class,cx,cy,area,first_seen,last_seen,"
+                    " first_start_off,last_start_off,last_end_off,active,state)"
+                    " VALUES('front','person',.5,.5,.1,1,2,0,0,1,0,'gone')"
+                ).lastrowid
+                for segment_id, ts in ((old_id, 1.0), (kept_id, 2.0)):
+                    conn.execute(
+                        "INSERT INTO object_events"
+                        " (track_id,segment_id,source_id,abs_ts,display_ts,class,"
+                        " event_type,start_off,end_off)"
+                        " VALUES(?,?,?,?,?,'person','appeared',0,1)",
+                        (track_id, segment_id, "front", ts, ts),
+                    )
+
+            first = retention.delete_segments(
+                video_db,
+                video_dir,
+                [{"id": old_id, "path": str(old_media.relative_to(video_dir))}],
+            )
+            self.assertEqual(first["deleted_object_tracks"], 0)
+            with video_db._connect() as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM object_tracks WHERE id=?", (track_id,)
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT segment_id FROM object_events WHERE track_id=?",
+                        (track_id,),
+                    ).fetchone()[0],
+                    kept_id,
+                )
+
+            final = retention.delete_segments(
+                video_db,
+                video_dir,
+                [{"id": kept_id, "path": str(kept_media.relative_to(video_dir))}],
+            )
+            self.assertEqual(final["deleted_object_tracks"], 1)
+
+    def test_segment_retention_never_deletes_active_track_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            segment_id, media = self._seg(
+                video_db, video_dir, "front", 10, "old"
+            )
+            with video_db._connect() as conn:
+                track_id = conn.execute(
+                    "INSERT INTO object_tracks"
+                    " (source_id,class,cx,cy,area,first_seen,last_seen,"
+                    " first_start_off,last_start_off,last_end_off,active,state)"
+                    " VALUES('front','person',.5,.5,.1,1,2,0,0,1,1,'active')"
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO object_events"
+                    " (track_id,segment_id,source_id,abs_ts,display_ts,class,"
+                    " event_type,start_off,end_off)"
+                    " VALUES(?,?,?,?,?,'person','appeared',0,1)",
+                    (track_id, segment_id, "front", 1.0, 1.0),
+                )
+
+            result = retention.delete_segments(
+                video_db,
+                video_dir,
+                [{"id": segment_id, "path": str(media.relative_to(video_dir))}],
+            )
+
+            self.assertEqual(result["deleted_object_tracks"], 0)
+            self.assertEqual(
+                video_db.prune_orphan_object_tracks(busy_timeout_ms=1), 0
+            )
+            with video_db._connect() as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT active FROM object_tracks WHERE id=?", (track_id,)
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_cleanup_rechecks_legacy_backlog_after_one_minute(self) -> None:
+        from wanyard.yolo_server import _cleanup_loop
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir) / "video"
+            video_dir.mkdir()
+            video_db = VideoSegmentDB(Path(tmpdir) / "video.db")
+            stop_event = _OneShotEvent()
+            drain_result = {
+                "deleted": 10_000,
+                "batches": 1,
+                "elapsed_seconds": 0.2,
+                "drained": False,
+                "busy": False,
+                "stopped": False,
+            }
+            with mock.patch.dict(
+                    "os.environ",
+                    {"CLEANUP_DAYS": "", "CLEANUP_MAX_GB": ""}), \
+                    mock.patch(
+                        "wanyard.retention.drain_orphan_object_tracks",
+                        return_value=drain_result,
+                    ):
+                _cleanup_loop(video_db, video_dir, stop_event)
+
+            self.assertEqual(stop_event.last_timeout, 60)
+
     def test_manual_global_cleanup_uses_shared_executor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             video_dir = Path(tmpdir) / "video"
@@ -486,10 +610,70 @@ class CleanupLoopTests(unittest.TestCase):
                     [{"id": segment_id, "path": str(media.relative_to(video_dir))}],
                 )
 
-            # Delete transaction + notification prune + object-track prune.
-            self.assertEqual(attempts, 4)
+            # Delete transaction (first try locked) + notification prune.
+            self.assertEqual(attempts, 3)
             self.assertEqual(result["deleted_segments"], 1)
             self.assertFalse(media.exists())
+
+
+class OrphanTrackDrainTests(unittest.TestCase):
+    def test_drains_multiple_independently_committed_batches(self) -> None:
+        video_db = mock.Mock()
+        video_db.prune_orphan_object_tracks.side_effect = [2, 2, 1]
+
+        result = retention.drain_orphan_object_tracks(
+            video_db,
+            batch_size=2,
+            time_budget_seconds=10,
+            batch_pause_seconds=0,
+            busy_timeout_ms=17,
+        )
+
+        self.assertEqual(result["deleted"], 5)
+        self.assertEqual(result["batches"], 3)
+        self.assertTrue(result["drained"])
+        self.assertFalse(result["busy"])
+        self.assertEqual(
+            video_db.prune_orphan_object_tracks.call_args_list,
+            [
+                mock.call(2, busy_timeout_ms=17),
+                mock.call(2, busy_timeout_ms=17),
+                mock.call(2, busy_timeout_ms=17),
+            ],
+        )
+
+    def test_zero_budget_still_makes_one_bounded_batch(self) -> None:
+        video_db = mock.Mock()
+        video_db.prune_orphan_object_tracks.return_value = 10
+
+        result = retention.drain_orphan_object_tracks(
+            video_db,
+            batch_size=10,
+            time_budget_seconds=0,
+            batch_pause_seconds=0,
+        )
+
+        self.assertEqual(result["deleted"], 10)
+        self.assertEqual(result["batches"], 1)
+        self.assertFalse(result["drained"])
+        video_db.prune_orphan_object_tracks.assert_called_once()
+
+    def test_busy_database_yields_without_retrying(self) -> None:
+        video_db = mock.Mock()
+        video_db.prune_orphan_object_tracks.side_effect = sqlite3.OperationalError(
+            "database is locked"
+        )
+
+        result = retention.drain_orphan_object_tracks(
+            video_db,
+            batch_pause_seconds=0,
+        )
+
+        self.assertEqual(result["deleted"], 0)
+        self.assertEqual(result["batches"], 0)
+        self.assertTrue(result["busy"])
+        self.assertFalse(result["drained"])
+        video_db.prune_orphan_object_tracks.assert_called_once()
 
 
 if __name__ == "__main__":

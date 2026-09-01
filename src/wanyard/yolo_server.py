@@ -527,7 +527,12 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
     are re-read every cycle, so the loop must keep running even when none are
     set yet (settings can appear at runtime).
     """
-    from .retention import delete_segments, normalize_days, source_cleanup_days
+    from .retention import (
+        delete_segments,
+        drain_orphan_object_tracks,
+        normalize_days,
+        source_cleanup_days,
+    )
 
     def _get_thresholds():
         # DB overrides env vars
@@ -543,6 +548,7 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
 
     LOG.info("auto-cleanup loop started")
     while not stop_event.is_set():
+        next_cleanup_seconds = 3600
         try:
             cleanup_days, cleanup_gb = _get_thresholds()
             day_overrides = source_cleanup_days(video_db)
@@ -619,13 +625,28 @@ def _cleanup_loop(video_db, video_dir: Path, stop_event: threading.Event):
                 )
             if result["deleted_object_tracks"]:
                 LOG.info(
-                    "auto-cleanup: deleted orphan object tracks=%d",
+                    "auto-cleanup: deleted newly orphaned object tracks=%d",
                     result["deleted_object_tracks"],
                 )
+            drain = drain_orphan_object_tracks(video_db, stop_event=stop_event)
+            if drain["deleted"] or drain["busy"]:
+                LOG.info(
+                    "auto-cleanup: legacy orphan drain deleted=%d batches=%d"
+                    " elapsed=%.3fs drained=%s busy=%s",
+                    drain["deleted"],
+                    drain["batches"],
+                    drain["elapsed_seconds"],
+                    drain["drained"],
+                    drain["busy"],
+                )
+            if not drain["drained"] and not drain["stopped"]:
+                # Catch up promptly while debt exists or a writer made this
+                # pass yield. Once drained, return to the normal hourly cycle.
+                next_cleanup_seconds = 60
         except Exception:
             LOG.exception("auto-cleanup error")
 
-        stop_event.wait(3600)
+        stop_event.wait(next_cleanup_seconds)
 
     LOG.info("auto-cleanup loop stopped")
 
