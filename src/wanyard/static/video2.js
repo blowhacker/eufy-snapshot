@@ -1317,7 +1317,7 @@ const stageZoom = new StageZoom(
 window.wanyardStageZoom = stageZoom;
 const EVENTS_BUFFER = 3 * 3600;   // load 3h extra on each side of visible window
 const SEGMENTS_BUFFER = 3600;     // timeline media coverage around visible window
-const NOTIFICATION_POLL_MS = 1000;
+const NOTIFICATION_POLL_MS = 30000;
 let notificationPollTimer = null;
 let notificationPollInFlight = false;
 let notificationPollNeedsRefresh = false;
@@ -1800,7 +1800,7 @@ function renderRuler() {
   });
 }
 
-function setTimelineWindow(from, to) {
+function setTimelineWindow(from, to, { scheduleLoad = true } = {}) {
   st.window.from = from;
   st.window.to = to;
   timeline.setWindow(from, to);
@@ -1811,17 +1811,20 @@ function setTimelineWindow(from, to) {
   const nowTs = Date.now() / 1000;
   const checkTo = Math.min(to, nowTs);
   const needsLoad = checkTo > from && !_eventsRangesCovers(from, checkTo);
-  if (needsLoad) {
+  if (scheduleLoad && needsLoad) {
     clearTimeout(_fetchDebounce);
     _fetchDebounce = setTimeout(() => load(), 350);
+  } else if (!scheduleLoad) {
+    clearTimeout(_fetchDebounce);
+    _fetchDebounce = null;
   }
 }
 
-function centerWindowOn(ts) {
+function centerWindowOn(ts, options = {}) {
   const span = st.window.to - st.window.from;
   st.window.from = ts - span * 0.4;
   st.window.to   = ts + span * 0.6;
-  setTimelineWindow(st.window.from, st.window.to);
+  setTimelineWindow(st.window.from, st.window.to, options);
 }
 
 async function fetchNearestEvents(classes, around, limit = 20) {
@@ -2370,19 +2373,25 @@ async function openNotification(notification) {
     renderClsCtrl();
     renderNearScope();
     setNotificationsOpen(false);
-    if (ts != null) centerWindowOn(ts);
+    // The seek must get first access to the selected MP4. Loading a wide,
+    // polygon-filtered timeline at the same time can saturate the server on a
+    // mature database and make the whole viewer appear frozen.
+    if (ts != null) centerWindowOn(ts, { scheduleLoad: false });
     if (live && ts == null) {
       load();
       startLiveTail(st.source !== "all" ? st.source : null);
       return;
     }
     if (ts != null) {
-      const loading = load();
       const landed = await seekToTimestamp(
         st.source !== "all" ? st.source : null,
         ts,
-        { scroll: true },
+        { scroll: true, frameClock: "lazy" },
       );
+      // Populate the surrounding timeline only after the requested frame has
+      // landed. This is deliberately fire-and-forget on success: playback is
+      // useful without waiting for event and class summaries.
+      const loading = load();
       if (!landed) {
         // The notification panel may have been loaded just before retention or
         // a maintenance migration removed its MP4. Never leave the previous
@@ -5597,13 +5606,16 @@ function pointInPoly(pt, poly) {
 
 // ── Auto-refresh ──────────────────────────────────────
 setInterval(async () => {
+  // A zone-filtered historical load can legitimately take longer than the
+  // refresh period. Do not supersede it with another identical server scan.
+  if (_loadCount > 0) return;
   setStatus(liveTail.active ? "LIVE" : "SYNC");
   const nowTs = Date.now() / 1000;
   // Refresh data in every mode, but move the visible range only while the user
   // is explicitly following live. Clicking Live re-enables this mode.
   if (st.timelineAutoFollow && st.window.to > nowTs - 7200) {
     st.window.to = nowTs + LIVE_TIMELINE_FUTURE_PAD_SECONDS;
-    setTimelineWindow(st.window.from, st.window.to);
+    setTimelineWindow(st.window.from, st.window.to, { scheduleLoad: false });
   }
   await load();
   setStatus(liveTail.active ? "LIVE" : "REPLAY");
@@ -5679,7 +5691,7 @@ async function init() {
   const anchor = urlTs ?? now;
   st.window.from = anchor - 3 * 3600;
   st.window.to   = anchor + 3 * 3600 + LIVE_TIMELINE_FUTURE_PAD_SECONDS;
-  setTimelineWindow(st.window.from, st.window.to);
+  setTimelineWindow(st.window.from, st.window.to, { scheduleLoad: false });
 
   if (urlLive && urlTs == null) {
     // Direct live URL without a timestamp: load data in background, immediately enter live.
