@@ -2797,15 +2797,30 @@ let _loadCount = 0;
 function _loadStart() { _loadCount++; _loadBar?.classList.add("loading"); }
 function _loadEnd()   { if (--_loadCount <= 0) { _loadCount = 0; _loadBar?.classList.remove("loading"); } }
 
-// Supersession token: load() runs concurrently (15s auto-refresh interval,
-// timeline drags, source switches) and applies responses with a WHOLESALE
-// st.segments replace — a stale in-flight response (old source or old
-// window) must never clobber state written by a newer load. Each load bails
-// after any await if another load started since.
+// Loads can be requested by refreshes, timeline gestures, source changes, and
+// notification navigation. Run only one batch at a time and coalesce anything
+// requested while it is running into one latest-state follow-up. Server work
+// dispatched through to_thread cannot be cancelled when fetch is aborted, so
+// concurrent superseded loads merely pile up expensive polygon scans.
 let _loadSeq = 0;
+let _loadQueuedSeq = 0;
+let _loadDrainPromise = null;
 
-async function load() {
-  const seq = ++_loadSeq;
+function load() {
+  _loadQueuedSeq = ++_loadSeq;
+  if (!_loadDrainPromise) {
+    _loadDrainPromise = (async () => {
+      while (_loadQueuedSeq) {
+        const seq = _loadQueuedSeq;
+        _loadQueuedSeq = 0;
+        await _loadOnce(seq);
+      }
+    })().finally(() => { _loadDrainPromise = null; });
+  }
+  return _loadDrainPromise;
+}
+
+async function _loadOnce(seq) {
   _loadStart();
   const p = new URLSearchParams();
   if (st.source !== "all") p.set("source", st.source);
@@ -2820,6 +2835,11 @@ async function load() {
   const segParams = new URLSearchParams(p);
   segParams.set("since", String(Math.floor(segFrom)));
   segParams.set("until", String(Math.ceil(segTo)));
+  const classParams = new URLSearchParams(p);
+  // Class chips are discovery controls. Exact zone counts come from the
+  // bounded activity summary; discovering names must remain an indexed SQL
+  // aggregate instead of decoding every historical boxes_json row.
+  classParams.set("discovery", "1");
   const _loadCheckTo = Math.min(st.window.to, Date.now() / 1000);
   const needsEventsLoad = _loadCheckTo > st.window.from && !_eventsRangesCovers(st.window.from, _loadCheckTo);
   if (needsEventsLoad) timeline.setFetchingRange(evFrom, evTo);
@@ -2829,7 +2849,7 @@ async function load() {
     needsEventsLoad
       ? fetch(`/api/video/events?since=${Math.floor(evFrom)}&until=${Math.ceil(evTo)}&${p}`, { cache:"no-store" }).then(r=>r.json()).catch(()=>({}))
       : Promise.resolve(null),
-    fetch(`/api/video/classes?${p}`, { cache:"no-store" }).then(r=>r.json()).catch(()=>({})),
+    fetch(`/api/video/classes?${classParams}`, { cache:"no-store" }).then(r=>r.json()).catch(()=>({})),
     fetchZonesForSource(),
   ]);
   if (seq !== _loadSeq) {

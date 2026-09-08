@@ -1923,6 +1923,12 @@ def make_app(
             return JSONResponse({"classes": {}})
         source_id = request.query_params.get("source") or None
         zone_id = request.query_params.get("zone") or None
+        if request.query_params.get("discovery", "").lower() in {"1", "true", "yes"}:
+            # The viewer uses this response to discover available class names.
+            # Zone-specific counts are supplied separately by the bounded
+            # activity summary. Avoid an unbounded Python geometry scan over
+            # every historical event whenever a notification selects a zone.
+            zone_id = "none"
         counts = await asyncio.to_thread(video_db.class_counts, source_id, True, zone_id)
         return JSONResponse({"classes": counts})
 

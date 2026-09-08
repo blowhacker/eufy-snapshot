@@ -155,7 +155,11 @@ body {
 .ab-status {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 7px;
+  width: 112px;
+  min-width: 112px;
+  flex: 0 0 112px;
   min-height: 26px;
   padding: 4px 10px;
   border: 1px solid var(--line);
@@ -1724,6 +1728,9 @@ body {
     display: none;
   }
   .ab-status {
+    width: 28px;
+    min-width: 28px;
+    flex-basis: 28px;
     padding: 4px 7px;
   }
 }
