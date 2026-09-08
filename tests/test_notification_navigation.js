@@ -26,6 +26,7 @@ test("notification navigation lands media before loading the historical timeline
 
   assert.ok(seek >= 0, "notification path should seek to its timestamp");
   assert.ok(load > seek, "historical loading must start after the media seek");
+  assert.match(openNotification, /st\.timelineAutoFollow = false/);
   assert.match(openNotification, /centerWindowOn\(ts, \{ scheduleLoad: false \}\)/);
   assert.match(openNotification, /frameClock: "lazy"/);
 });

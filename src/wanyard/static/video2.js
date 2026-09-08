@@ -2376,7 +2376,10 @@ async function openNotification(notification) {
     // The seek must get first access to the selected MP4. Loading a wide,
     // polygon-filtered timeline at the same time can saturate the server on a
     // mature database and make the whole viewer appear frozen.
-    if (ts != null) centerWindowOn(ts, { scheduleLoad: false });
+    if (ts != null) {
+      st.timelineAutoFollow = false;
+      centerWindowOn(ts, { scheduleLoad: false });
+    }
     if (live && ts == null) {
       load();
       startLiveTail(st.source !== "all" ? st.source : null);
